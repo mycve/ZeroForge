@@ -259,7 +259,7 @@ def main():
     
     # serve 命令
     serve_parser = subparsers.add_parser('serve', help='启动 Web 服务')
-    serve_parser.add_argument('--host', default='0.0.0.0', help='监听地址')
+    serve_parser.add_argument('--host', default='127.0.0.1', help='监听地址')
     serve_parser.add_argument('--port', type=int, default=8000, help='监听端口')
     
     # train 命令
