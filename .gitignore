@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.cursor/
+.idea
+pikafish
+pikafish.nnue
+.venv
+node_modules/
+checkpoints/
+config.json
