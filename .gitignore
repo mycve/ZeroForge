@@ -213,3 +213,4 @@ pikafish.nnue
 node_modules/
 checkpoints/
 config.json
+uv.lock
