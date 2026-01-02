@@ -53,11 +53,14 @@ npm run dev
 ### 命令行训练
 
 ```bash
-# 训练井字棋（简单游戏，快速验证）
-uv run python main.py train --game tictactoe --epochs 100
+# 训练井字棋（简单游戏，快速验证，默认配置）
+uv run python main.py train
 
-# 训练中国象棋（复杂游戏）
-uv run python main.py train --game chinese_chess --epochs 1000
+# 训练井字棋（指定参数）
+uv run python main.py train --game tictactoe --algorithm alphazero --epochs 100
+
+# 训练中国象棋（复杂游戏，使用 MuZero）
+uv run python main.py train --game chinese_chess --algorithm muzero --network-size large --epochs 1000
 ```
 
 ## 项目结构
