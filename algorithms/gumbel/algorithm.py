@@ -24,6 +24,7 @@ import logging
 
 from core.algorithm import Algorithm, AlgorithmConfig, Trajectory, TrainingTargets
 from algorithms import register_algorithm
+from core.mcts import GumbelMCTSSearch, MCTSConfig
 from .search import GumbelSearch, GumbelConfig
 
 if TYPE_CHECKING:
@@ -81,17 +82,15 @@ class GumbelMuZeroConfig(AlgorithmConfig):
             return self.temperature_explore
         return self.temperature_exploit
     
-    def to_gumbel_config(self) -> GumbelConfig:
-        """转换为 GumbelConfig"""
-        return GumbelConfig(
+    def to_mcts_config(self) -> MCTSConfig:
+        """转换为 MCTSConfig（用于 Gumbel MCTS）"""
+        return MCTSConfig(
             num_simulations=self.num_simulations,
-            max_num_considered_actions=self.max_num_considered_actions,
-            gumbel_scale=self.gumbel_scale,
+            c_puct=self.c_scale,
             c_visit=self.c_visit,
-            c_scale=self.c_scale,
-            discount=self.discount,
-            temperature=self.temperature_explore,
-            device=self.device,
+            temperature_init=self.temperature_explore,
+            temperature_final=self.temperature_exploit,
+            temperature_threshold=self.temperature_threshold,
         )
 
 
@@ -159,17 +158,15 @@ class GumbelAlphaZeroConfig(AlgorithmConfig):
         else:
             return "large"
     
-    def to_gumbel_config(self) -> GumbelConfig:
-        """转换为 GumbelConfig（num_halving_rounds 自动计算）"""
-        return GumbelConfig(
+    def to_mcts_config(self) -> MCTSConfig:
+        """转换为 MCTSConfig（用于 Gumbel MCTS）"""
+        return MCTSConfig(
             num_simulations=self.num_simulations,
-            max_num_considered_actions=self.max_num_considered_actions,
-            gumbel_scale=self.gumbel_scale,
+            c_puct=self.c_scale,
             c_visit=self.c_visit,
-            c_scale=self.c_scale,
-            discount=self.discount,
-            temperature=self.temperature_explore,
-            device=self.device,
+            temperature_init=self.temperature_explore,
+            temperature_final=self.temperature_exploit,
+            temperature_threshold=self.temperature_threshold,
         )
 
 
@@ -236,20 +233,62 @@ class GumbelMuZeroAlgorithm(Algorithm):
                 num_layers=2,
             )
     
-    def create_search(self, game: "Game", network: nn.Module) -> GumbelSearch:
+    def create_search(self, game: "Game", network: nn.Module):
         """创建 Gumbel 搜索
         
-        使用 Gumbel-Top-k + Sequential Halving，不需要环境克隆。
+        MuZero 模式使用 dynamics network，无需 clone:
+        - 支持 clone: 使用 GumbelMCTSSearch（官方实现）
+        - 不支持 clone: 使用 GumbelSearch + dynamics（适用于 Gymnasium）
         """
-        gumbel_config = self.config.to_gumbel_config()
-        action_space = game.action_space.n
+        # 检测游戏是否支持 clone
+        supports_clone = self._check_clone_support(game)
         
-        return GumbelSearch(
-            network=network,
-            config=gumbel_config,
-            action_space=action_space,
-            use_dynamics=True,  # MuZero 模式
-        )
+        if supports_clone:
+            # 官方实现: Gumbel + MCTS 树搜索
+            from core.mcts import LeafBatcher
+            from core.config import BatcherConfig
+            
+            mcts_config = self.config.to_mcts_config()
+            batcher_config = BatcherConfig(device=self.config.device)
+            batcher = LeafBatcher(network, batcher_config)
+            
+            logger.info("Gumbel MuZero: 使用 GumbelMCTSSearch（官方实现）")
+            return GumbelMCTSSearch(
+                game=game,
+                config=mcts_config,
+                batcher=batcher,
+                mode="muzero",
+                max_considered_actions=self.config.max_num_considered_actions,
+                gumbel_scale=self.config.gumbel_scale,
+            )
+        else:
+            # 简化版: 使用 dynamics network（适用于 Gymnasium）
+            gumbel_config = GumbelConfig(
+                num_simulations=self.config.num_simulations,
+                max_num_considered_actions=self.config.max_num_considered_actions,
+                gumbel_scale=self.config.gumbel_scale,
+                c_visit=self.config.c_visit,
+                c_scale=self.config.c_scale,
+                discount=self.config.discount,
+                temperature=self.config.temperature_explore,
+                device=self.config.device,
+            )
+            
+            logger.info("Gumbel MuZero: 游戏不支持 clone，使用 GumbelSearch + dynamics")
+            return GumbelSearch(
+                network=network,
+                config=gumbel_config,
+                action_space=game.action_space.n,
+                use_dynamics=True,  # 使用 dynamics network
+            )
+    
+    def _check_clone_support(self, game: "Game") -> bool:
+        """检测游戏是否支持 clone()"""
+        try:
+            cloned = game.clone()
+            return cloned is not None
+        except Exception:
+            return False
     
     def compute_targets(
         self,
@@ -443,21 +482,62 @@ class GumbelAlphaZeroAlgorithm(Algorithm):
                 num_blocks=self.config.num_blocks,
             )
     
-    def create_search(self, game: "Game", network: nn.Module) -> GumbelSearch:
+    def create_search(self, game: "Game", network: nn.Module):
         """创建 Gumbel 搜索
         
-        使用 Gumbel-Top-k + Sequential Halving。
-        如果游戏支持 clone()，使用真实游戏模拟；否则使用单步评估。
+        自动检测游戏是否支持 clone():
+        - 支持 clone: 使用 GumbelMCTSSearch（官方实现，更强）
+        - 不支持 clone: 使用 GumbelSearch（简化版，用于 Gymnasium）
         """
-        gumbel_config = self.config.to_gumbel_config()
-        action_space = game.action_space.n
+        # 检测游戏是否支持 clone
+        supports_clone = self._check_clone_support(game)
         
-        return GumbelSearch(
-            network=network,
-            config=gumbel_config,
-            action_space=action_space,
-            use_dynamics=False,  # AlphaZero 模式
-        )
+        if supports_clone:
+            # 官方实现: Gumbel + MCTS 树搜索
+            from core.mcts import LeafBatcher
+            from core.config import BatcherConfig
+            
+            mcts_config = self.config.to_mcts_config()
+            batcher_config = BatcherConfig(device=self.config.device)
+            batcher = LeafBatcher(network, batcher_config)
+            
+            logger.info("Gumbel AlphaZero: 使用 GumbelMCTSSearch（官方实现）")
+            return GumbelMCTSSearch(
+                game=game,
+                config=mcts_config,
+                batcher=batcher,
+                mode="alphazero",
+                max_considered_actions=self.config.max_num_considered_actions,
+                gumbel_scale=self.config.gumbel_scale,
+            )
+        else:
+            # 简化版: 仅用网络评估（适用于 Gymnasium）
+            gumbel_config = GumbelConfig(
+                num_simulations=self.config.num_simulations,
+                max_num_considered_actions=self.config.max_num_considered_actions,
+                gumbel_scale=self.config.gumbel_scale,
+                c_visit=self.config.c_visit,
+                c_scale=self.config.c_scale,
+                discount=self.config.discount,
+                temperature=self.config.temperature_explore,
+                device=self.config.device,
+            )
+            
+            logger.warning("Gumbel AlphaZero: 游戏不支持 clone，使用 GumbelSearch（简化版）")
+            return GumbelSearch(
+                network=network,
+                config=gumbel_config,
+                action_space=game.action_space.n,
+                use_dynamics=False,
+            )
+    
+    def _check_clone_support(self, game: "Game") -> bool:
+        """检测游戏是否支持 clone()"""
+        try:
+            cloned = game.clone()
+            return cloned is not None
+        except Exception:
+            return False
     
     def compute_targets(
         self,

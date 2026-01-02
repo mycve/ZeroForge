@@ -452,21 +452,27 @@ while not game.is_terminal():
 
 ### 算法选择
 
-部分环境不支持状态克隆（MCTS 需要），推荐使用 **Gumbel 系列算法**：
+**Gumbel 系列算法**会自动检测环境是否支持 clone，选择最佳搜索实现：
 
 ```python
 game = make_game("atari_breakout")
 
-# 检查兼容性
+# 检查环境兼容性
 print(game.supports_mcts)           # 是否支持传统 MCTS
-print(game.recommended_algorithm)   # "alphazero" 或 "gumbel_muzero"
+print(game.recommended_algorithm)   # 推荐的算法
+
+# 使用 Gumbel 算法（自动选择搜索实现）
+algo = make_algorithm("gumbel_alphazero")
 ```
 
-| 算法 | 需要 clone | 适用场景 |
-|------|-----------|---------|
-| AlphaZero | ✅ 是 | 棋类游戏 |
-| **Gumbel MuZero** | ❌ 否 | 所有环境 |
-| **Gumbel AlphaZero** | ❌ 否 | 所有环境 |
+| 算法 | 搜索实现 | 说明 |
+|------|---------|------|
+| AlphaZero | MCTS | 需要 clone，棋类游戏推荐 |
+| MuZero | MCTS | 需要 clone，使用 dynamics network |
+| **Gumbel AlphaZero** | 自动选择 | 支持 clone → Gumbel+MCTS，否则简化版 |
+| **Gumbel MuZero** | 自动选择 | 支持 clone → Gumbel+MCTS，否则 dynamics |
+
+> **注意**: 大多数 Gymnasium 环境（包括 Atari）都支持 clone，Gumbel 算法会自动使用官方的 Gumbel+MCTS 实现。
 
 ## 路线图
 
