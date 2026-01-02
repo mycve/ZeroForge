@@ -202,25 +202,47 @@ class DistributedTrainer:
                    f"concurrency={self.config.concurrency}")
     
     def _setup_distributed(self) -> None:
-        """设置分布式环境"""
-        # 检查环境变量
+        """设置分布式环境
+        
+        支持两种 DDP 启动方式：
+        1. torchrun 启动：自动设置环境变量
+        2. 手动配置：use_ddp=True，自动检测可用 GPU
+        """
+        # 方式 1：通过 torchrun 启动（环境变量已设置）
         if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             self._local_rank = int(os.environ.get("LOCAL_RANK", 0))
             self._world_size = int(os.environ["WORLD_SIZE"])
             self._is_distributed = self._world_size > 1
             
             if self._is_distributed:
-                dist.init_process_group(backend="nccl")
+                dist.init_process_group(backend=self.config.ddp_backend)
                 torch.cuda.set_device(self._local_rank)
                 self._device = torch.device(f"cuda:{self._local_rank}")
-                logger.info(f"DDP 初始化: rank={self._local_rank}, world_size={self._world_size}")
+                logger.info(f"DDP 初始化 (torchrun): rank={self._local_rank}, "
+                           f"world_size={self._world_size}, backend={self.config.ddp_backend}")
             else:
                 self._device = torch.device(resolve_device(self.config.device))
+        
+        # 方式 2：手动配置 use_ddp=True（单机多卡）
+        elif self.config.use_ddp and torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            if num_gpus > 1:
+                # 单机多卡：主进程初始化
+                logger.warning(f"检测到 {num_gpus} 个 GPU，但单进程无法使用 DDP。")
+                logger.warning(f"请使用 torchrun 启动: torchrun --nproc_per_node={num_gpus} main.py train")
+                logger.warning(f"当前将使用单卡训练 (GPU:0)")
+            
+            self._device = torch.device("cuda:0")
+            self._local_rank = 0
+            self._world_size = 1
+            self._is_distributed = False
+        
         else:
             # 单卡模式
             self._device = torch.device(resolve_device(self.config.device))
             self._local_rank = 0
             self._world_size = 1
+            self._is_distributed = False
         
         self.state.rank = self._local_rank
         self.state.world_size = self._world_size

@@ -263,17 +263,19 @@ class BatcherConfig:
 
 @dataclass
 class ThreadedEnvConfig:
-    """多线程环境配置
+    """多线程持续自玩配置（旧版，用于 ThreadedSelfPlay）
     
-    控制 nogil 多线程自玩的行为。
+    注意：当前 DistributedTrainer 使用 TrainingConfig 中的配置：
+    - TrainingConfig.num_envs: 每 epoch 完成的游戏总数
+    - TrainingConfig.concurrency: 同时并发运行的游戏数
     
-    Attributes:
-        num_envs: 环境/线程数量
-        games_per_env: 每个环境运行的游戏数
-        use_nogil: 是否利用 nogil（Python 3.13+）
+    此配置类用于 ThreadedSelfPlay（持续自玩模式），其中：
+    - num_envs: 持续运行的环境数量（每个环境一个线程）
+    - games_per_env: 每个环境运行的游戏数（-1=无限）
+    - use_nogil: 是否利用 nogil（Python 3.13+）
     """
     
-    num_envs: int = 128
+    num_envs: int = 128  # 持续运行的环境/线程数量
     games_per_env: int = -1  # -1 表示无限
     use_nogil: bool = True
     

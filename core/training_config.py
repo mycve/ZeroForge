@@ -101,14 +101,14 @@ class TrainingConfig:
     
     # === 自玩配置 ===
     num_envs: int = 256                     # 每个 epoch 需要完成的游戏数量
-    concurrency: int = 16                   # 同时并发运行的游戏数（实际并行线程数）
+    concurrency: int = 64                   # 同时并发运行的游戏数（推荐 64-128 以提高 GPU 利用率）
     train_batches_per_epoch: int = 10      # 每 epoch 训练批次数
     new_data_ratio: float = 0.8            # 新数据占比（80%新数据 + 20%经验池）
     
     # === 批处理 ===
     batch_size: int = 256              # 训练批大小
-    inference_batch_size: int = 8      # 叶节点推理批大小（推荐 num_envs/2，形成流水线）
-    inference_timeout_ms: float = 10.0  # 推理超时（毫秒），超时后强制推理
+    inference_batch_size: int = 32     # 叶节点推理批大小（推荐 concurrency/2，GPU 利用率关键参数）
+    inference_timeout_ms: float = 2.0  # 推理超时（毫秒），更短的超时减少 GPU 空闲
     
     # === 训练超参 ===
     num_epochs: int = 1000
@@ -283,11 +283,11 @@ FIELD_METADATA = {
     "gumbel_c_visit": {"type": "float", "min": 1.0, "max": 200.0, "step": 1.0, "label": "访问权重", "description": "Q 值计算中的访问计数权重"},
     "gumbel_discount": {"type": "float", "min": 0.9, "max": 1.0, "step": 0.001, "label": "折扣因子", "description": "奖励折扣因子（Gymnasium 环境使用）"},
     "num_envs": {"type": "int", "min": 1, "max": 1000, "label": "游戏数量", "description": "每个 epoch 需要完成的游戏数量"},
-    "concurrency": {"type": "int", "min": 1, "max": 256, "label": "并发数", "description": "同时并行运行的游戏数（推荐 inference_batch_size 的 2 倍）"},
+    "concurrency": {"type": "int", "min": 1, "max": 512, "label": "并发数", "description": "同时并行运行的游戏数（GPU 利用率关键参数，推荐 64-128）"},
     "train_batches_per_epoch": {"type": "int", "min": 1, "max": 1000, "label": "每epoch训练批次", "description": "每个 epoch 从缓冲区采样训练的批次数"},
     "new_data_ratio": {"type": "float", "min": 0.0, "max": 1.0, "step": 0.1, "label": "新数据占比", "description": "训练时新数据占比（如 0.8 表示 80% 新数据 + 20% 经验池）"},
-    "inference_batch_size": {"type": "int", "min": 1, "max": 512, "label": "推理批大小", "description": "叶节点批量推理（≤num_envs，推荐 num_envs/2 形成流水线）"},
-    "inference_timeout_ms": {"type": "float", "min": 1.0, "max": 100.0, "step": 1.0, "label": "推理超时(ms)", "description": "超时后强制执行批推理"},
+    "inference_batch_size": {"type": "int", "min": 1, "max": 512, "label": "推理批大小", "description": "叶节点批量推理（≤concurrency，推荐 concurrency/2 形成流水线）"},
+    "inference_timeout_ms": {"type": "float", "min": 0.5, "max": 100.0, "step": 0.5, "label": "推理超时(ms)", "description": "超时后强制执行批推理（更小=GPU更忙但延迟更低）"},
     "replay_buffer_size": {"type": "int", "min": 1000, "max": 10000000, "label": "缓冲区大小"},
     "min_buffer_size": {"type": "int", "min": 10, "max": 100000, "label": "最小缓冲量", "description": "低于此值不开始训练"},
     "eval_games": {"type": "int", "min": 0, "max": 100, "label": "评估局数", "description": "每 epoch 新旧版本对弈局数（0=禁用）"},

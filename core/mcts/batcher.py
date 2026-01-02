@@ -266,9 +266,10 @@ class LeafBatcher:
     def _collect_batch(self) -> List[LeafRequest]:
         """收集请求批次
         
-        满足以下任一条件触发返回:
-        1. 收集到 batch_size 个请求
-        2. 等待超过 timeout_ms
+        优化策略：
+        1. 先一次性取出队列中所有可用请求（不等待）
+        2. 如果不够 batch_size，等待更多请求到来
+        3. 达到 batch_size 或超时后返回
         
         Returns:
             请求列表
@@ -277,21 +278,44 @@ class LeafBatcher:
         timeout_sec = self.config.timeout_ms / 1000.0
         deadline = time.time() + timeout_sec
         
+        # 第一步：立即取出队列中所有可用请求（非阻塞）
+        while len(batch) < self.config.batch_size:
+            try:
+                request = self._queue.get_nowait()
+                batch.append(request)
+            except Empty:
+                break
+        
+        # 如果已经收集够了，直接返回
+        if len(batch) >= self.config.batch_size:
+            return batch
+        
+        # 第二步：如果还不够，等待更多请求
         while len(batch) < self.config.batch_size:
             remaining = deadline - time.time()
             
             if remaining <= 0:
-                # 超时，返回已收集的
+                # 超时，返回已收集的（即使不够 batch_size）
                 break
             
             try:
-                request = self._queue.get(timeout=min(remaining, 0.001))
+                # 等待下一个请求，但不要等太久
+                request = self._queue.get(timeout=min(remaining, 0.005))
                 batch.append(request)
+                
+                # 取到一个后，再尝试非阻塞取更多
+                while len(batch) < self.config.batch_size:
+                    try:
+                        request = self._queue.get_nowait()
+                        batch.append(request)
+                    except Empty:
+                        break
+                        
             except Empty:
-                # 队列空，检查是否已有数据
+                # 队列空，如果已有数据就返回（不再等待）
                 if batch:
                     break
-                # 没有数据，继续等待
+                # 完全没数据，继续等待
                 continue
         
         return batch
