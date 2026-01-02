@@ -289,12 +289,26 @@ class CheckpointManager:
             if not run_dir.is_dir():
                 continue
             
-            # 解析目录名
-            parts = run_dir.name.rsplit("_", 1)
-            if len(parts) != 2:
+            # 直接读取 meta.json 获取信息（避免解析目录名的问题）
+            meta_path = run_dir / "meta.json"
+            if not meta_path.exists():
                 continue
             
-            gt, algo = parts
+            try:
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+            except Exception:
+                continue
+            
+            # 从检查点数据中获取 game_type 和 algorithm
+            checkpoints = meta.get("checkpoints", [])
+            if not checkpoints:
+                continue
+            
+            # 从第一个检查点获取元信息
+            first_cp = checkpoints[0]
+            gt = first_cp.get("game_type", "")
+            algo = first_cp.get("algorithm", "")
             
             # 过滤
             if game_type and gt != game_type:
@@ -302,11 +316,9 @@ class CheckpointManager:
             if algorithm and algo != algorithm:
                 continue
             
-            # 加载元数据
-            meta = self._load_meta(gt, algo)
             best_epoch = meta.get("best_epoch")
             
-            for cp in meta.get("checkpoints", []):
+            for cp in checkpoints:
                 info = CheckpointInfo.from_dict(cp)
                 info.is_best = (info.epoch == best_epoch)
                 results.append(info)
