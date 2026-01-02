@@ -158,6 +158,153 @@ export async function sendTrainingCommand(
   })
 }
 
+// ============================================================
+// 调试 API
+// ============================================================
+
+export interface DebugSession {
+  session_id: string
+  game_type: string
+  algorithm: string
+  step: number
+  game_count: number
+  is_terminal: boolean
+}
+
+export interface DebugSessionState {
+  current_player: number | null
+  legal_actions: number[]
+  is_terminal: boolean
+  winner: number | null
+  game_render: string
+  observation_shape: number[]
+  action_space: number
+}
+
+export interface DebugSessionDetail {
+  session_id: string
+  game_type: string
+  algorithm: string
+  step: number
+  game_count: number
+  is_terminal: boolean
+  state: DebugSessionState
+  history: Array<{ type: string; step: number; [key: string]: unknown }>
+}
+
+export interface CreateDebugSessionRequest {
+  game_type: string
+  algorithm: string
+  device: string
+  checkpoint_path?: string
+}
+
+export async function listDebugSessions(): Promise<{ sessions: DebugSession[] }> {
+  return request('/debug/sessions')
+}
+
+export async function createDebugSession(
+  req: CreateDebugSessionRequest
+): Promise<{ session_id: string; state: DebugSessionState }> {
+  return request('/debug/sessions', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+}
+
+export async function getDebugSession(sessionId: string): Promise<DebugSessionDetail> {
+  return request(`/debug/sessions/${sessionId}`)
+}
+
+export async function deleteDebugSession(sessionId: string): Promise<{ success: boolean }> {
+  return request(`/debug/sessions/${sessionId}`, { method: 'DELETE' })
+}
+
+export async function debugStepGame(
+  sessionId: string,
+  action?: number
+): Promise<unknown> {
+  return request(`/debug/sessions/${sessionId}/step`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  })
+}
+
+export async function debugStepMcts(
+  sessionId: string,
+  numSimulations: number = 50
+): Promise<unknown> {
+  return request(`/debug/sessions/${sessionId}/mcts?num_simulations=${numSimulations}`, {
+    method: 'POST',
+  })
+}
+
+export async function debugResetGame(sessionId: string): Promise<unknown> {
+  return request(`/debug/sessions/${sessionId}/reset`, { method: 'POST' })
+}
+
+export async function debugRunFullGame(sessionId: string): Promise<unknown> {
+  return request(`/debug/sessions/${sessionId}/run`, { method: 'POST' })
+}
+
+// === 训练过程调试数据（已有训练时收集） ===
+
+export interface TrainingDebugData {
+  mcts: Array<{
+    timestamp: number
+    game_idx: number
+    step: number
+    player: number
+    legal_actions: number
+    selected_action: number
+    root_value: number
+    root_visits: number
+    top_actions: [number, number][]
+  }>
+  trajectories: Array<{
+    timestamp: number
+    game_idx: number
+    length: number
+    actions: number[]
+    rewards: number[]
+    players: number[]
+    winner: number | null
+    values: number[]
+  }>
+  training: Array<{
+    timestamp: number
+    epoch: number
+    num_batches: number
+    batch_size: number
+    buffer_size: number
+    total_loss: number
+    policy_loss: number
+    value_loss: number
+    target_value_range: [number, number] | null
+    pred_value_range: [number, number] | null
+  }>
+  selfplay: Array<{
+    timestamp: number
+    game_idx: number
+    length: number
+    winner: number | null
+  }>
+}
+
+export async function getTrainingDebug(
+  category?: string,
+  limit: number = 50
+): Promise<TrainingDebugData> {
+  const params = new URLSearchParams()
+  if (category) params.set('category', category)
+  params.set('limit', limit.toString())
+  return request(`/training/debug?${params}`)
+}
+
+export async function clearTrainingDebug(): Promise<{ success: boolean }> {
+  return request('/training/debug', { method: 'DELETE' })
+}
+
 export async function saveCheckpoint(): Promise<{ success: boolean; epoch?: number; error?: string }> {
   return request('/training/save', { method: 'POST' })
 }

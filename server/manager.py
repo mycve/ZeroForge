@@ -7,13 +7,30 @@ Managers - 服务管理器
 import asyncio
 import time
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Callable, Set
 from pathlib import Path
 import json
 import threading
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _to_python(obj):
+    """将 numpy 类型转换为 Python 原生类型，用于 JSON 序列化"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {_to_python(k): _to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_to_python(v) for v in obj]
+    return obj
 
 
 # ============================================================
@@ -70,6 +87,15 @@ class TrainingManager:
         self._network = None
         self._optimizer = None
         self._checkpoint_manager = None
+        
+        # 调试数据（用于前端展示）
+        self._debug_data = {
+            "selfplay": [],      # 最近的自玩调试信息
+            "training": [],      # 最近的训练调试信息
+            "trajectories": [],  # 最近的轨迹样本
+            "mcts": [],          # 最近的 MCTS 搜索信息
+        }
+        self._debug_max_items = 100  # 每类保留最多条目
     
     def get_status(self) -> Dict[str, Any]:
         """获取训练状态"""
@@ -93,6 +119,34 @@ class TrainingManager:
                 "games_per_second": self.status.games_per_second,
                 "steps_per_second": self.status.steps_per_second,
             }
+    
+    def _add_debug(self, category: str, data: Dict[str, Any]):
+        """添加调试数据"""
+        with self._lock:
+            import time
+            data["timestamp"] = time.time()
+            self._debug_data[category].append(data)
+            # 限制数量
+            if len(self._debug_data[category]) > self._debug_max_items:
+                self._debug_data[category] = self._debug_data[category][-self._debug_max_items:]
+    
+    def get_debug_data(self, category: str = None, limit: int = 50) -> Dict[str, Any]:
+        """获取调试数据
+        
+        Args:
+            category: 类别 (selfplay/training/trajectories/mcts)，None 返回全部
+            limit: 每类返回条数
+        """
+        with self._lock:
+            if category:
+                return {category: self._debug_data.get(category, [])[-limit:]}
+            return {k: v[-limit:] for k, v in self._debug_data.items()}
+    
+    def clear_debug_data(self):
+        """清空调试数据"""
+        with self._lock:
+            for k in self._debug_data:
+                self._debug_data[k] = []
     
     def update_status(self, **kwargs):
         """更新训练状态"""
@@ -212,14 +266,28 @@ class TrainingManager:
                 # 添加到回放缓冲区
                 replay_buffer.add_batch(trajectories)
                 
+                # 调试：经验池状态
+                if epoch == 0:
+                    logger.debug(f"[调试] === 经验池状态 ===")
+                    logger.debug(f"[调试] 轨迹数: {len(replay_buffer)}, 最小要求: {config.min_buffer_size}")
+                    if trajectories:
+                        traj = trajectories[0]
+                        logger.debug(f"[调试] 第一条轨迹: 长度={len(traj)}, "
+                                   f"obs_shape={traj.observations[0].shape if traj.observations else 'N/A'}")
+                
                 # === 训练阶段 ===
                 train_losses = {"total": 0, "value": 0, "policy": 0}
+                debug_first_batch = (epoch == 0)
                 
                 if len(replay_buffer) >= config.min_buffer_size:
                     network.train()
                     num_batches = max(1, len(trajectories) * 5 // config.batch_size)
                     
-                    for _ in range(num_batches):
+                    if debug_first_batch:
+                        logger.debug(f"[调试] === 训练阶段 ===")
+                        logger.debug(f"[调试] 批次数: {num_batches}, 批大小: {config.batch_size}")
+                    
+                    for batch_idx in range(num_batches):
                         if self._stop_event.is_set():
                             break
                         
@@ -233,6 +301,13 @@ class TrainingManager:
                         target_policy = torch.from_numpy(batch.target_policies[:, 0, :]).to(device)
                         target_value = torch.from_numpy(batch.target_values[:, 0]).to(device)
                         
+                        # 调试：第一个批次详细信息
+                        if debug_first_batch and batch_idx == 0:
+                            logger.debug(f"[调试] 采样批次: obs={obs.shape}, "
+                                       f"policy={target_policy.shape}, value={target_value.shape}")
+                            logger.debug(f"[调试] 目标价值范围: [{target_value.min():.2f}, {target_value.max():.2f}]")
+                            logger.debug(f"[调试] 目标策略示例: {target_policy[0].cpu().numpy()[:9]}")
+                        
                         # 前向传播
                         policy_logits, value = network(obs)
                         
@@ -240,6 +315,12 @@ class TrainingManager:
                         policy_loss = F.cross_entropy(policy_logits, target_policy)
                         value_loss = F.mse_loss(value.squeeze(), target_value)
                         total_loss = policy_loss + value_loss
+                        
+                        # 调试：第一个批次损失
+                        if debug_first_batch and batch_idx == 0:
+                            logger.debug(f"[调试] 预测价值范围: [{value.min():.2f}, {value.max():.2f}]")
+                            logger.debug(f"[调试] 初始损失: total={total_loss.item():.4f}, "
+                                       f"policy={policy_loss.item():.4f}, value={value_loss.item():.4f}")
                         
                         # 反向传播
                         optimizer.zero_grad()
@@ -257,6 +338,32 @@ class TrainingManager:
                     # 平均损失
                     for k in train_losses:
                         train_losses[k] /= num_batches
+                    
+                    # 调试：记录训练信息
+                    self._add_debug("training", {
+                        "epoch": epoch + 1,
+                        "num_batches": num_batches,
+                        "batch_size": config.batch_size,
+                        "buffer_size": len(replay_buffer),
+                        "total_loss": round(train_losses["total"], 4),
+                        "policy_loss": round(train_losses["policy"], 4),
+                        "value_loss": round(train_losses["value"], 4),
+                        "target_value_range": [
+                            round(float(target_value.min()), 2),
+                            round(float(target_value.max()), 2)
+                        ] if 'target_value' in dir() else None,
+                        "pred_value_range": [
+                            round(float(value.min()), 2),
+                            round(float(value.max()), 2)
+                        ] if 'value' in dir() else None,
+                    })
+                    
+                    if debug_first_batch:
+                        logger.debug(f"[调试] 平均损失: total={train_losses['total']:.4f}, "
+                                   f"policy={train_losses['policy']:.4f}, value={train_losses['value']:.4f}")
+                else:
+                    if epoch == 0:
+                        logger.debug(f"[调试] 跳过训练: 经验池 {len(replay_buffer)} < {config.min_buffer_size}")
                 
                 # 更新状态
                 with self._lock:
@@ -370,6 +477,9 @@ class TrainingManager:
             temperature_threshold=temperature_threshold,
         )
         
+        # 调试：第一局详细输出
+        debug_first_game = (num_games > 0)
+        
         for game_idx in range(num_games):
             if self._stop_event.is_set():
                 break
@@ -383,9 +493,15 @@ class TrainingManager:
             # 创建 MCTS 树
             mcts_tree = LocalMCTSTree(game, mcts_config, mode="alphazero")
             
+            # 调试：第一局输出游戏初始状态
+            if debug_first_game and game_idx == 0:
+                logger.debug(f"[调试] === 自玩第 1 局开始 ===")
+                logger.debug(f"[调试] 游戏: {game_type}, MCTS模拟: {num_simulations}")
+            
             while not game.is_terminal():
                 current_player = game.current_player()
                 obs = game.get_observation()
+                legal_actions = game.legal_actions()
                 
                 # === 使用 MCTS 搜索 ===
                 add_noise = (move_count == 0)  # 只在根节点添加噪声
@@ -394,6 +510,26 @@ class TrainingManager:
                     num_simulations=num_simulations,
                     add_noise=add_noise,
                 )
+                
+                # 调试：记录 MCTS 搜索结果（每局前3步）
+                if game_idx < 3 and move_count < 5:
+                    top_actions = sorted(policy_dict.items(), key=lambda x: -x[1])[:5]
+                    self._add_debug("mcts", {
+                        "game_idx": game_idx,
+                        "step": move_count,
+                        "player": current_player,
+                        "legal_actions": len(legal_actions),
+                        "selected_action": action,
+                        "root_value": round(root_value, 4),
+                        "root_visits": mcts_tree.root.visit_count,
+                        "top_actions": [(a, round(p, 4)) for a, p in top_actions],
+                    })
+                
+                # 日志输出
+                if debug_first_game and game_idx == 0 and move_count < 3:
+                    logger.debug(f"[调试] Step {move_count}: player={current_player}, "
+                               f"legal_actions={len(legal_actions)}, "
+                               f"selected={action}, value={root_value:.3f}")
                 
                 # 记录轨迹（使用 MCTS 搜索得到的策略）
                 trajectory.append(
@@ -416,6 +552,10 @@ class TrainingManager:
             # === 游戏结束：回传所有步骤的奖励 ===
             winner = game.get_winner()
             
+            # 调试：第一局输出游戏结果
+            if debug_first_game and game_idx == 0:
+                logger.debug(f"[调试] 游戏结束: steps={move_count}, winner={winner}")
+            
             # 设置每一步的奖励（基于最终游戏结果）
             for i, player in enumerate(trajectory.to_play):
                 if winner is None:
@@ -424,6 +564,29 @@ class TrainingManager:
                     trajectory.rewards[i] = 1.0  # 胜
                 else:
                     trajectory.rewards[i] = -1.0  # 负
+            
+            # 调试：记录轨迹信息（前几局）
+            if game_idx < 5:
+                self._add_debug("trajectories", {
+                    "game_idx": game_idx,
+                    "length": len(trajectory),
+                    "actions": trajectory.actions,
+                    "rewards": trajectory.rewards,
+                    "players": trajectory.to_play,
+                    "winner": winner,
+                    "values": [round(v, 3) for v in trajectory.values],
+                })
+                self._add_debug("selfplay", {
+                    "game_idx": game_idx,
+                    "length": move_count,
+                    "winner": winner,
+                })
+            
+            # 日志输出
+            if debug_first_game and game_idx == 0:
+                logger.debug(f"[调试] 轨迹长度: {len(trajectory)}")
+                logger.debug(f"[调试] 动作序列: {trajectory.actions}")
+                logger.debug(f"[调试] 奖励序列: {trajectory.rewards}")
             
             trajectories.append(trajectory)
             total_length += move_count
@@ -1163,4 +1326,497 @@ class SystemManager:
         except Exception as e:
             logger.error(f"获取算法列表失败: {e}")
             return []
+
+
+# ============================================================
+# 调试管理器 - 逐步调试训练流程
+# ============================================================
+
+@dataclass
+class DebugSession:
+    """调试会话"""
+    session_id: str
+    game_type: str
+    algorithm: str
+    device: str
+    
+    # 游戏实例
+    game: Any = None
+    # 网络
+    network: Any = None
+    # MCTS 树
+    mcts_tree: Any = None
+    # 当前轨迹
+    trajectory: Any = None
+    
+    # 历史记录
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # 状态
+    step: int = 0
+    game_count: int = 0
+    is_terminal: bool = False
+    
+    # 最后 MCTS 搜索结果（用于 step_game 使用）
+    last_mcts_action: Optional[int] = None
+    last_mcts_policy: Optional[Dict[int, float]] = None
+    last_mcts_value: Optional[float] = None
+
+
+class DebugManager:
+    """调试管理器 - 支持逐步调试训练流程"""
+    
+    def __init__(self):
+        self._sessions: Dict[str, DebugSession] = {}
+        self._lock = threading.Lock()
+    
+    def create_session(
+        self,
+        game_type: str,
+        algorithm: str = "alphazero",
+        device: str = "cpu",
+        checkpoint_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """创建调试会话
+        
+        Args:
+            game_type: 游戏类型
+            algorithm: 算法名称
+            device: 计算设备
+            checkpoint_path: 可选的检查点路径
+        """
+        import torch
+        from games import make_game
+        from algorithms import make_algorithm
+        from core.replay_buffer import Trajectory
+        from core.mcts import MCTSConfig, LocalMCTSTree
+        
+        session_id = str(uuid.uuid4())[:8]
+        
+        try:
+            # 创建游戏
+            game = make_game(game_type)
+            game.reset()
+            
+            # 创建算法和网络
+            algo = make_algorithm(algorithm)
+            network = algo.create_network(game)
+            
+            # 加载检查点
+            if checkpoint_path:
+                checkpoint = torch.load(checkpoint_path, map_location=device)
+                network.load_state_dict(checkpoint.get("network", checkpoint))
+                logger.info(f"加载检查点: {checkpoint_path}")
+            
+            network = network.to(device)
+            network.eval()
+            
+            # 创建 MCTS 配置和树
+            mcts_config = MCTSConfig(
+                num_simulations=50,
+                c_puct=1.5,
+                dirichlet_alpha=0.3,
+                dirichlet_epsilon=0.25,
+            )
+            mcts_tree = LocalMCTSTree(game, mcts_config, mode="alphazero")
+            
+            # 创建轨迹
+            trajectory = Trajectory()
+            
+            # 创建会话
+            session = DebugSession(
+                session_id=session_id,
+                game_type=game_type,
+                algorithm=algorithm,
+                device=device,
+                game=game,
+                network=network,
+                mcts_tree=mcts_tree,
+                trajectory=trajectory,
+            )
+            
+            with self._lock:
+                self._sessions[session_id] = session
+            
+            logger.info(f"创建调试会话: {session_id}, game={game_type}, algo={algorithm}")
+            
+            return {
+                "session_id": session_id,
+                "game_type": game_type,
+                "algorithm": algorithm,
+                "device": device,
+                "state": self._get_session_state(session),
+            }
+            
+        except Exception as e:
+            logger.error(f"创建调试会话失败: {e}")
+            raise
+    
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取会话状态"""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            return {
+                "session_id": session_id,
+                "game_type": session.game_type,
+                "algorithm": session.algorithm,
+                "step": session.step,
+                "game_count": session.game_count,
+                "is_terminal": session.is_terminal,
+                "state": self._get_session_state(session),
+                "history": session.history[-20:],  # 最近 20 条
+            }
+    
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """列出所有会话"""
+        with self._lock:
+            return [
+                {
+                    "session_id": s.session_id,
+                    "game_type": s.game_type,
+                    "algorithm": s.algorithm,
+                    "step": s.step,
+                    "game_count": s.game_count,
+                    "is_terminal": s.is_terminal,
+                }
+                for s in self._sessions.values()
+            ]
+    
+    def delete_session(self, session_id: str) -> bool:
+        """删除会话"""
+        with self._lock:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+                logger.info(f"删除调试会话: {session_id}")
+                return True
+            return False
+    
+    def step_mcts(self, session_id: str, num_simulations: int = 1) -> Dict[str, Any]:
+        """执行 MCTS 搜索步骤
+        
+        Args:
+            session_id: 会话 ID
+            num_simulations: 模拟次数
+        
+        Returns:
+            MCTS 搜索结果详情
+        """
+        import torch
+        
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"会话不存在: {session_id}")
+            
+            if session.is_terminal:
+                return {"error": "游戏已结束", "is_terminal": True}
+            
+            game = session.game
+            network = session.network
+            mcts_tree = session.mcts_tree
+            device = session.device
+            
+            # 评估函数
+            def evaluate_fn(obs, legal_mask):
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+                    mask = np.array(legal_mask, dtype=np.float32)
+                    
+                    policy_logits, value = network(obs_t)
+                    policy = torch.softmax(policy_logits, dim=-1)[0].cpu().numpy()
+                    
+                    policy = policy * mask
+                    policy_sum = policy.sum()
+                    if policy_sum > 1e-8:
+                        policy = policy / policy_sum
+                    else:
+                        policy = mask / mask.sum()
+                    
+                    return policy, value[0].item()
+            
+            # 执行 MCTS 搜索
+            _, policy_dict, root_value = mcts_tree.search(
+                evaluate_fn=evaluate_fn,
+                num_simulations=num_simulations,
+                add_noise=(session.step == 0),
+            )
+            
+            # 获取根节点详情
+            import math
+            root = mcts_tree.root
+            
+            # 调试模式：使用确定性选择（访问次数最多的动作）
+            action = root.get_best_action()
+            sqrt_parent_visits = math.sqrt(root.visit_count + 1)
+            c_puct = mcts_tree.config.c_puct
+            
+            children_info = []
+            for a, child in root.children.items():
+                # 计算 UCB score
+                q_value = -child.q_value if child.visit_count > 0 else 0
+                prior_score = c_puct * child.prior * sqrt_parent_visits / (1 + child.visit_count)
+                ucb = q_value + prior_score
+                
+                children_info.append({
+                    "action": a,
+                    "visit_count": child.visit_count,
+                    "value": round(child.q_value, 4) if child.visit_count > 0 else 0,
+                    "prior": round(child.prior, 4),
+                    "ucb": round(ucb, 4),
+                })
+            children_info.sort(key=lambda x: -x["visit_count"])
+            
+            result = _to_python({
+                "step": session.step,
+                "current_player": game.current_player(),
+                "legal_actions": game.legal_actions(),
+                "selected_action": action,
+                "root_value": round(root_value, 4),
+                "root_visits": root.visit_count,
+                "policy": {a: round(p, 4) for a, p in sorted(policy_dict.items(), key=lambda x: -x[1])[:10]},
+                "children": children_info[:10],
+                "game_render": game.render("text"),
+            })
+            
+            # 保存 MCTS 搜索结果，供 step_game 使用
+            session.last_mcts_action = action
+            session.last_mcts_policy = policy_dict
+            session.last_mcts_value = root_value
+            
+            # 记录历史
+            session.history.append({
+                "type": "mcts",
+                "step": session.step,
+                **result,
+            })
+            
+            return result
+    
+    def step_game(self, session_id: str, action: Optional[int] = None) -> Dict[str, Any]:
+        """执行一步游戏
+        
+        Args:
+            session_id: 会话 ID
+            action: 动作（None 则使用 MCTS 选择）
+        
+        Returns:
+            执行结果
+        """
+        import torch
+        
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"会话不存在: {session_id}")
+            
+            if session.is_terminal:
+                return {"error": "游戏已结束", "is_terminal": True}
+            
+            game = session.game
+            mcts_tree = session.mcts_tree
+            trajectory = session.trajectory
+            
+            current_player = game.current_player()
+            obs = game.get_observation()
+            legal_actions = game.legal_actions()
+            
+            # 如果没有指定动作
+            if action is None:
+                # 优先使用之前 MCTS 搜索的结果
+                if session.last_mcts_action is not None:
+                    action = session.last_mcts_action
+                    policy_dict = session.last_mcts_policy or {action: 1.0}
+                    root_value = session.last_mcts_value or 0.0
+                    logger.debug(f"使用缓存的 MCTS 结果: action={action}")
+                else:
+                    # 否则执行新的 MCTS 搜索
+                    network = session.network
+                    device = session.device
+                    
+                    def evaluate_fn(obs, legal_mask):
+                        with torch.no_grad():
+                            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+                            mask = np.array(legal_mask, dtype=np.float32)
+                            
+                            policy_logits, value = network(obs_t)
+                            policy = torch.softmax(policy_logits, dim=-1)[0].cpu().numpy()
+                            
+                            policy = policy * mask
+                            policy_sum = policy.sum()
+                            if policy_sum > 1e-8:
+                                policy = policy / policy_sum
+                            else:
+                                policy = mask / mask.sum()
+                            
+                            return policy, value[0].item()
+                    
+                    action, policy_dict, root_value = mcts_tree.search(
+                        evaluate_fn=evaluate_fn,
+                        num_simulations=50,
+                        add_noise=(session.step == 0),
+                    )
+            else:
+                if action not in legal_actions:
+                    return {"error": f"非法动作: {action}", "legal_actions": legal_actions}
+                policy_dict = {action: 1.0}
+                root_value = 0.0
+            
+            # 记录轨迹
+            trajectory.append(
+                observation=obs,
+                action=action,
+                reward=0.0,
+                policy=policy_dict,
+                value=root_value,
+                to_play=current_player,
+            )
+            
+            # 执行动作
+            game.step(action)
+            session.step += 1
+            
+            # 更新 MCTS 树
+            mcts_tree.game = game
+            mcts_tree.advance(action)
+            
+            # 清除缓存的 MCTS 结果（下一步需要重新搜索）
+            session.last_mcts_action = None
+            session.last_mcts_policy = None
+            session.last_mcts_value = None
+            
+            # 检查游戏是否结束
+            is_terminal = game.is_terminal()
+            session.is_terminal = is_terminal
+            
+            result = {
+                "step": session.step,
+                "action": action,
+                "previous_player": current_player,
+                "current_player": game.current_player() if not is_terminal else None,
+                "is_terminal": is_terminal,
+                "winner": game.get_winner() if is_terminal else None,
+                "game_render": game.render("text"),
+                "policy": {a: round(p, 4) for a, p in sorted(policy_dict.items(), key=lambda x: -x[1])[:5]},
+                "value": round(root_value, 4),
+            }
+            
+            # 如果游戏结束，更新轨迹奖励
+            if is_terminal:
+                winner = game.get_winner()
+                for i, player in enumerate(trajectory.to_play):
+                    if winner is None:
+                        trajectory.rewards[i] = 0.0
+                    elif player == winner:
+                        trajectory.rewards[i] = 1.0
+                    else:
+                        trajectory.rewards[i] = -1.0
+                
+                result["trajectory_summary"] = {
+                    "length": len(trajectory),
+                    "actions": trajectory.actions,
+                    "rewards": trajectory.rewards,
+                    "values": [round(v, 3) for v in trajectory.values],
+                }
+            
+            result = _to_python(result)
+            
+            # 记录历史
+            session.history.append({
+                "type": "step",
+                **result,
+            })
+            
+            return result
+    
+    def reset_game(self, session_id: str) -> Dict[str, Any]:
+        """重置游戏
+        
+        Args:
+            session_id: 会话 ID
+        """
+        from core.mcts import MCTSConfig, LocalMCTSTree
+        from core.replay_buffer import Trajectory
+        
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                raise ValueError(f"会话不存在: {session_id}")
+            
+            # 重置游戏
+            session.game.reset()
+            session.step = 0
+            session.game_count += 1
+            session.is_terminal = False
+            
+            # 重置 MCTS 树
+            mcts_config = MCTSConfig(
+                num_simulations=50,
+                c_puct=1.5,
+                dirichlet_alpha=0.3,
+                dirichlet_epsilon=0.25,
+            )
+            session.mcts_tree = LocalMCTSTree(session.game, mcts_config, mode="alphazero")
+            
+            # 重置轨迹
+            session.trajectory = Trajectory()
+            
+            # 清空历史
+            session.history = []
+            
+            # 清除 MCTS 缓存
+            session.last_mcts_action = None
+            session.last_mcts_policy = None
+            session.last_mcts_value = None
+            
+            logger.info(f"重置调试会话: {session_id}, game_count={session.game_count}")
+            
+            return {
+                "session_id": session_id,
+                "game_count": session.game_count,
+                "state": self._get_session_state(session),
+            }
+    
+    def run_full_game(self, session_id: str) -> Dict[str, Any]:
+        """运行完整一局游戏
+        
+        Args:
+            session_id: 会话 ID
+        """
+        results = []
+        
+        # 先重置
+        self.reset_game(session_id)
+        
+        # 运行直到结束
+        while True:
+            result = self.step_game(session_id)
+            results.append(result)
+            
+            if result.get("is_terminal") or result.get("error"):
+                break
+            
+            if len(results) > 1000:  # 防止死循环
+                break
+        
+        return {
+            "steps": len(results),
+            "final_result": results[-1] if results else None,
+            "all_actions": [r.get("action") for r in results],
+        }
+    
+    def _get_session_state(self, session: DebugSession) -> Dict[str, Any]:
+        """获取会话的游戏状态"""
+        game = session.game
+        
+        return _to_python({
+            "current_player": game.current_player() if not session.is_terminal else None,
+            "legal_actions": game.legal_actions() if not session.is_terminal else [],
+            "is_terminal": session.is_terminal,
+            "winner": game.get_winner() if session.is_terminal else None,
+            "game_render": game.render("text"),
+            "observation_shape": list(game.observation_space.shape),
+            "action_space": game.action_space.n,
+        })
 

@@ -6,13 +6,15 @@ import {
   Gamepad2, 
   Swords,
   Activity,
-  Server
+  Server,
+  Bug
 } from 'lucide-react'
 import { clsx } from 'clsx'
 import Dashboard from './pages/Dashboard'
 import ConfigPage from './pages/ConfigPage'
 import GamesPage from './pages/GamesPage'
 import ArenaPage from './pages/ArenaPage'
+import DebugPage from './pages/DebugPage'
 
 // 导航项
 const navItems = [
@@ -20,6 +22,7 @@ const navItems = [
   { path: '/config', icon: Settings, label: '配置' },
   { path: '/games', icon: Gamepad2, label: '游戏可视化' },
   { path: '/arena', icon: Swords, label: '对弈竞技场' },
+  { path: '/debug', icon: Bug, label: '训练调试' },
 ]
 
 function App() {
@@ -82,6 +85,7 @@ function App() {
             <Route path="/config" element={<ConfigPage />} />
             <Route path="/games" element={<GamesPage />} />
             <Route path="/arena" element={<ArenaPage />} />
+            <Route path="/debug" element={<DebugPage />} />
           </Routes>
         </motion.div>
       </main>

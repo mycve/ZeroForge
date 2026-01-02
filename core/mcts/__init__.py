@@ -29,6 +29,7 @@ from .node import MCTSNode
 from .tree import LocalMCTSTree
 from .batcher import LeafBatcher, LeafRequest
 from .search import MCTSSearch
+from ..config import MCTSConfig
 
 __all__ = [
     "MCTSNode",
@@ -36,4 +37,5 @@ __all__ = [
     "LeafBatcher",
     "LeafRequest",
     "MCTSSearch",
+    "MCTSConfig",
 ]

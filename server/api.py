@@ -55,6 +55,20 @@ class ActionRequest(BaseModel):
     action: int  # 动作索引
 
 
+class DebugSessionCreate(BaseModel):
+    """创建调试会话请求"""
+    game_type: str = "tictactoe"
+    algorithm: str = "alphazero"
+    device: str = "cpu"
+    checkpoint_path: Optional[str] = None
+
+
+class DebugStepRequest(BaseModel):
+    """调试步骤请求"""
+    action: Optional[int] = None  # 指定动作，None 则使用 MCTS
+    num_simulations: int = 50  # MCTS 模拟次数
+
+
 # ============================================================
 # 全局管理器
 # ============================================================
@@ -62,6 +76,7 @@ class ActionRequest(BaseModel):
 training_manager: Optional[TrainingManager] = None
 game_manager: Optional[GameManager] = None
 system_manager: Optional[SystemManager] = None
+debug_manager: Optional["DebugManager"] = None
 
 
 # ============================================================
@@ -134,12 +149,15 @@ ws_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期"""
-    global training_manager, game_manager, system_manager
+    global training_manager, game_manager, system_manager, debug_manager
+    
+    from .manager import DebugManager
     
     # 启动
     training_manager = TrainingManager()
     game_manager = GameManager()
     system_manager = SystemManager()
+    debug_manager = DebugManager()
     
     # 获取主事件循环（用于线程安全调度）
     main_loop = asyncio.get_running_loop()
@@ -244,6 +262,27 @@ def _register_routes(app: FastAPI):
         """获取训练状态"""
         return training_manager.get_status()
     
+    @app.get("/api/training/debug")
+    async def get_training_debug(
+        category: Optional[str] = Query(None, description="类别: selfplay/training/trajectories/mcts"),
+        limit: int = Query(50, description="返回条数")
+    ):
+        """获取训练调试数据
+        
+        返回训练过程中的详细调试信息，包括：
+        - selfplay: 自玩游戏信息
+        - training: 训练批次信息
+        - trajectories: 轨迹数据
+        - mcts: MCTS 搜索详情
+        """
+        return training_manager.get_debug_data(category, limit)
+    
+    @app.delete("/api/training/debug")
+    async def clear_training_debug():
+        """清空调试数据"""
+        training_manager.clear_debug_data()
+        return {"success": True}
+    
     @app.post("/api/training/command")
     async def training_command(cmd: TrainingCommand):
         """训练控制命令"""
@@ -299,6 +338,88 @@ def _register_routes(app: FastAPI):
         if not success:
             raise HTTPException(status_code=404, detail="检查点不存在或删除失败")
         return {"success": True}
+    
+    # === 调试 API ===
+    
+    @app.get("/api/debug/sessions")
+    async def list_debug_sessions():
+        """列出所有调试会话"""
+        return {"sessions": debug_manager.list_sessions()}
+    
+    @app.post("/api/debug/sessions")
+    async def create_debug_session(req: DebugSessionCreate):
+        """创建调试会话"""
+        try:
+            result = debug_manager.create_session(
+                game_type=req.game_type,
+                algorithm=req.algorithm,
+                device=req.device,
+                checkpoint_path=req.checkpoint_path,
+            )
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    @app.get("/api/debug/sessions/{session_id}")
+    async def get_debug_session(session_id: str):
+        """获取调试会话状态"""
+        result = debug_manager.get_session(session_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return result
+    
+    @app.delete("/api/debug/sessions/{session_id}")
+    async def delete_debug_session(session_id: str):
+        """删除调试会话"""
+        success = debug_manager.delete_session(session_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {"success": True}
+    
+    @app.post("/api/debug/sessions/{session_id}/step")
+    async def debug_step_game(session_id: str, req: DebugStepRequest = None):
+        """执行一步游戏（使用 MCTS 或指定动作）"""
+        try:
+            action = req.action if req else None
+            result = debug_manager.step_game(session_id, action)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    @app.post("/api/debug/sessions/{session_id}/mcts")
+    async def debug_step_mcts(session_id: str, num_simulations: int = Query(50)):
+        """执行 MCTS 搜索（不执行动作，只查看搜索结果）"""
+        try:
+            result = debug_manager.step_mcts(session_id, num_simulations)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    @app.post("/api/debug/sessions/{session_id}/reset")
+    async def debug_reset_game(session_id: str):
+        """重置游戏"""
+        try:
+            result = debug_manager.reset_game(session_id)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    @app.post("/api/debug/sessions/{session_id}/run")
+    async def debug_run_full_game(session_id: str):
+        """运行完整一局游戏"""
+        try:
+            result = debug_manager.run_full_game(session_id)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
     
     # === 游戏 API ===
     
