@@ -272,3 +272,114 @@ class MuZeroNetwork(nn.Module):
             "parameters": sum(p.numel() for p in self.parameters()),
         }
 
+
+# ============================================================
+# 简单 MuZero 网络（用于低维状态观测，如 Gymnasium）
+# ============================================================
+
+class SimpleMuZeroNetwork(nn.Module):
+    """简单 MuZero 网络（MLP）
+    
+    用于低维状态观测（如 CartPole 的 4 维状态）。
+    不使用卷积，适合 Gymnasium 等环境。
+    
+    Args:
+        obs_shape: 观测形状（可以是任意维度，会被展平）
+        action_space: 动作空间大小
+        hidden_dim: 隐藏层维度
+        num_layers: 隐藏层数量
+    """
+    
+    def __init__(
+        self,
+        obs_shape: Tuple[int, ...],
+        action_space: int,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+        
+        # 计算输入维度
+        obs_size = 1
+        for d in obs_shape:
+            obs_size *= d
+        
+        self.obs_shape = obs_shape
+        self.obs_size = obs_size
+        self.action_space = action_space
+        self.hidden_dim = hidden_dim
+        
+        # Representation Network: obs -> hidden
+        repr_layers = [nn.Linear(obs_size, hidden_dim), nn.ReLU()]
+        for _ in range(num_layers - 1):
+            repr_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        self.representation = nn.Sequential(*repr_layers)
+        
+        # Dynamics Network: (hidden, action) -> (next_hidden, reward)
+        self.dynamics_hidden = nn.Sequential(
+            nn.Linear(hidden_dim + action_space, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.dynamics_reward = nn.Linear(hidden_dim, 1)
+        
+        # Prediction Network: hidden -> (policy, value)
+        self.prediction_policy = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_space),
+        )
+        self.prediction_value = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh(),
+        )
+    
+    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """前向传播: 观测 -> (策略 logits, 价值)"""
+        obs_flat = obs.view(obs.shape[0], -1)
+        hidden = self.representation(obs_flat)
+        policy = self.prediction_policy(hidden)
+        value = self.prediction_value(hidden)
+        return policy, value
+    
+    def initial_inference(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """初始推理: 观测 -> (隐藏状态, 策略, 价值)"""
+        obs_flat = obs.view(obs.shape[0], -1)
+        hidden = self.representation(obs_flat)
+        policy = self.prediction_policy(hidden)
+        value = self.prediction_value(hidden)
+        return hidden, policy, value
+    
+    def recurrent_inference(
+        self, hidden: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """循环推理: (隐藏状态, 动作) -> (下一状态, 奖励, 策略, 价值)"""
+        batch_size = hidden.shape[0]
+        
+        # One-hot 编码动作
+        action_one_hot = torch.zeros(batch_size, self.action_space, device=hidden.device)
+        action_one_hot.scatter_(1, action.unsqueeze(-1), 1)
+        
+        # Dynamics
+        dynamics_input = torch.cat([hidden, action_one_hot], dim=-1)
+        next_hidden = self.dynamics_hidden(dynamics_input)
+        reward = self.dynamics_reward(next_hidden)
+        
+        # Prediction
+        policy = self.prediction_policy(next_hidden)
+        value = self.prediction_value(next_hidden)
+        
+        return next_hidden, reward, policy, value
+    
+    def get_info(self) -> dict:
+        """获取网络信息"""
+        return {
+            "obs_shape": self.obs_shape,
+            "action_space": self.action_space,
+            "hidden_dim": self.hidden_dim,
+            "parameters": sum(p.numel() for p in self.parameters()),
+        }
+

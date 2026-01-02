@@ -6,10 +6,13 @@ Algorithms - 算法实现模块
 算法列表:
 - MuZero: 学习环境模型，需要 dynamics network
 - AlphaZero: 使用真实环境，无需 dynamics network
+- Gumbel MuZero: 使用 Gumbel 搜索，不需要环境克隆
+- Gumbel AlphaZero: 使用 Gumbel 搜索，对克隆依赖较少
 
 使用方法:
     >>> from algorithms import make_algorithm
     >>> algo = make_algorithm("muzero", config)
+    >>> algo = make_algorithm("gumbel_muzero", config)  # 适用于 Gymnasium
     >>> network = algo.create_network(game)
 """
 
@@ -70,13 +73,19 @@ def list_algorithms() -> list:
 
 from .muzero import MuZeroAlgorithm
 from .alphazero import AlphaZeroAlgorithm
+from .gumbel import GumbelMuZeroAlgorithm, GumbelAlphaZeroAlgorithm
 
 __all__ = [
+    # 注册系统
     "register_algorithm",
     "make_algorithm",
     "list_algorithms",
     "ALGORITHM_REGISTRY",
+    # 标准算法
     "MuZeroAlgorithm",
     "AlphaZeroAlgorithm",
+    # Gumbel 算法（适用于 Gymnasium 等不支持克隆的环境）
+    "GumbelMuZeroAlgorithm",
+    "GumbelAlphaZeroAlgorithm",
 ]
 

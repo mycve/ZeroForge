@@ -484,7 +484,7 @@ print(game.recommended_algorithm)   # "alphazero" 或 "gumbel_muzero"
 - [x] 多线程异步自玩
 - [x] 叶节点批量推理
 - [x] DDP 分布式训练
-- [ ] Gumbel MuZero/AlphaZero 算法
+- [x] **Gumbel MuZero/AlphaZero 算法**
 - [ ] 更多游戏（围棋、国际象棋）
 - [ ] 混合精度训练 (AMP)
 - [ ] 模型量化推理

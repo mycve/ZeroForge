@@ -12,6 +12,7 @@ const tabs = [
   { id: 'training', label: '训练', icon: Brain },
   { id: 'network', label: '网络', icon: Zap },
   { id: 'mcts', label: 'MCTS', icon: Settings },
+  { id: 'gumbel', label: 'Gumbel', icon: Zap },  // Gumbel 搜索配置
   { id: 'selfplay', label: '自玩', icon: Cpu },
   { id: 'buffer', label: '缓冲区', icon: Database },
   { id: 'checkpoint', label: '检查点', icon: FolderOpen },

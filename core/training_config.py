@@ -131,6 +131,13 @@ class TrainingConfig:
     dirichlet_epsilon: float = 0.25
     temperature_threshold: int = 15
     
+    # === Gumbel 搜索（用于 gumbel_muzero / gumbel_alphazero）===
+    gumbel_max_actions: int = 16        # Gumbel Top-k 考虑的最大动作数
+    # halving 轮数自动计算: ceil(log2(gumbel_max_actions))
+    gumbel_scale: float = 1.0           # Gumbel 噪声缩放
+    gumbel_c_visit: float = 50.0        # Q 值访问计数权重
+    gumbel_discount: float = 0.997      # 折扣因子（Gymnasium 环境）
+    
     # === 检查点 ===
     checkpoint_dir: str = "./checkpoints"
     save_interval: int = 10
@@ -209,6 +216,11 @@ CONFIG_GROUPS = {
         "label": "MCTS 设置",
         "fields": ["num_simulations", "c_puct", "dirichlet_alpha", "dirichlet_epsilon", "temperature_threshold"],
     },
+    "gumbel": {
+        "label": "Gumbel 搜索",
+        "description": "用于 gumbel_muzero / gumbel_alphazero 算法（Halving 轮数自动计算）",
+        "fields": ["gumbel_max_actions", "gumbel_scale", "gumbel_c_visit", "gumbel_discount"],
+    },
     "selfplay": {
         "label": "自玩设置",
         "fields": ["num_envs", "inference_batch_size", "inference_timeout_ms", "train_batches_per_epoch"],
@@ -235,7 +247,7 @@ CONFIG_GROUPS = {
 # 字段元数据（类型、范围、描述）
 FIELD_METADATA = {
     "game_type": {"type": "select", "options": ["tictactoe", "chinese_chess"], "label": "游戏类型"},
-    "algorithm": {"type": "select", "options": ["alphazero", "muzero"], "label": "算法"},
+    "algorithm": {"type": "select", "options": ["alphazero", "muzero", "gumbel_alphazero", "gumbel_muzero"], "label": "算法", "description": "gumbel 系列适用于 Gymnasium 等不支持克隆的环境"},
     "num_epochs": {"type": "int", "min": 1, "max": 100000, "label": "训练轮数"},
     "batch_size": {"type": "int", "min": 1, "max": 4096, "label": "训练批大小"},
     "lr": {"type": "float", "min": 1e-6, "max": 1.0, "step": 1e-4, "label": "学习率"},
@@ -250,6 +262,11 @@ FIELD_METADATA = {
     "dirichlet_alpha": {"type": "float", "min": 0.01, "max": 1.0, "step": 0.01, "label": "Dirichlet Alpha"},
     "dirichlet_epsilon": {"type": "float", "min": 0, "max": 1.0, "step": 0.05, "label": "噪声比例"},
     "temperature_threshold": {"type": "int", "min": 0, "max": 100, "label": "温度阈值步数"},
+    # Gumbel 搜索配置
+    "gumbel_max_actions": {"type": "int", "min": 2, "max": 64, "label": "Top-k 动作数", "description": "Gumbel-Top-k 采样考虑的最大动作数（Halving 轮数 = ceil(log2(k)) 自动计算）"},
+    "gumbel_scale": {"type": "float", "min": 0.1, "max": 5.0, "step": 0.1, "label": "Gumbel 缩放", "description": "Gumbel 噪声缩放因子"},
+    "gumbel_c_visit": {"type": "float", "min": 1.0, "max": 200.0, "step": 1.0, "label": "访问权重", "description": "Q 值计算中的访问计数权重"},
+    "gumbel_discount": {"type": "float", "min": 0.9, "max": 1.0, "step": 0.001, "label": "折扣因子", "description": "奖励折扣因子（Gymnasium 环境使用）"},
     "num_envs": {"type": "int", "min": 1, "max": 256, "label": "环境数量", "description": "并行环境数（每个 env 自动开启线程持续自玩）"},
     "train_batches_per_epoch": {"type": "int", "min": 1, "max": 1000, "label": "每epoch训练批次", "description": "每个 epoch 从缓冲区采样训练的批次数"},
     "inference_batch_size": {"type": "int", "min": 1, "max": 512, "label": "推理批大小", "description": "叶节点批量推理（≤num_envs，推荐 num_envs/2 形成流水线）"},
