@@ -64,9 +64,9 @@ interface AppState {
   connected: boolean
   setConnected: (connected: boolean) => void
   
-  // 历史数据（用于图表）
-  lossHistory: { step: number; loss: number }[]
-  addLossHistory: (step: number, loss: number) => void
+  // 历史数据（用于图表，以 epoch 为 X 轴）
+  lossHistory: { epoch: number; loss: number }[]
+  addLossHistory: (epoch: number, loss: number) => void
   clearLossHistory: () => void
 }
 
@@ -119,12 +119,23 @@ export const useAppStore = create<AppState>((set) => ({
   connected: false,
   setConnected: (connected) => set({ connected }),
   
-  // 历史数据
+  // 历史数据（以 epoch 为 X 轴）
   lossHistory: [],
-  addLossHistory: (step, loss) =>
-    set((state) => ({
-      lossHistory: [...state.lossHistory.slice(-100), { step, loss }],
-    })),
+  addLossHistory: (epoch, loss) =>
+    set((state) => {
+      // 避免重复添加相同 epoch 的数据
+      const lastEntry = state.lossHistory[state.lossHistory.length - 1]
+      if (lastEntry && lastEntry.epoch === epoch) {
+        // 更新最后一个点的 loss 值
+        const updated = [...state.lossHistory]
+        updated[updated.length - 1] = { epoch, loss }
+        return { lossHistory: updated }
+      }
+      // 添加新数据点，保留最近 200 个 epoch
+      return {
+        lossHistory: [...state.lossHistory.slice(-200), { epoch, loss }],
+      }
+    }),
   clearLossHistory: () => set({ lossHistory: [] }),
 }))
 

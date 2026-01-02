@@ -27,9 +27,9 @@ export function useTrainingWebSocket() {
           const status = message.data
           setTrainingStatus(status)
           
-          // 添加到历史
-          if (status.step > 0 && status.loss > 0) {
-            addLossHistory(status.step, status.loss)
+          // 添加到历史（以 epoch 为 X 轴）
+          if (status.epoch > 0 && status.loss > 0) {
+            addLossHistory(status.epoch, status.loss)
           }
         }
       } catch (e) {

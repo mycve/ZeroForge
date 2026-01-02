@@ -116,6 +116,7 @@ npm run dev
 
 ### 后端Ui功能截图
 ![训练流程](assets/train_game.png)
+![PK竞技](assets/pk.png)
 ![debug流程](assets/debug.png)
 ![debug mcts访问分布流程](assets/debug_mcts.png)
 ![debug mcts访问分布流程](assets/cchess.png)

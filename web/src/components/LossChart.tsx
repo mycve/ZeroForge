@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { 
   LineChart, 
   Line, 
@@ -20,7 +21,17 @@ export function LossChart({ height = 300 }: LossChartProps) {
   // 构建图表数据
   const chartData = lossHistory.length > 0 
     ? lossHistory 
-    : [{ step: 0, loss: 0 }]
+    : [{ epoch: 0, loss: 0 }]
+  
+  // 计算 Y 轴范围：从 0 开始，最大值取数据最大值的 1.1 倍（留出空间）
+  const yDomain = useMemo(() => {
+    if (lossHistory.length === 0) return [0, 1]
+    const maxLoss = Math.max(...lossHistory.map(d => d.loss))
+    const minLoss = Math.min(...lossHistory.map(d => d.loss))
+    // 如果最大值很小，设置一个最小范围
+    const upperBound = Math.max(maxLoss * 1.1, 0.1)
+    return [0, upperBound]
+  }, [lossHistory])
 
   return (
     <div className="bg-bg-card border border-bg-elevated rounded-xl p-6">
@@ -41,15 +52,16 @@ export function LossChart({ height = 300 }: LossChartProps) {
             vertical={false}
           />
           <XAxis 
-            dataKey="step" 
+            dataKey="epoch" 
             stroke="#666"
             tick={{ fill: '#666', fontSize: 12 }}
-            tickFormatter={(value) => value >= 1000 ? `${(value/1000).toFixed(0)}k` : value}
+            tickFormatter={(value) => `E${value}`}
           />
           <YAxis 
             stroke="#666"
             tick={{ fill: '#666', fontSize: 12 }}
             tickFormatter={(value) => value.toFixed(2)}
+            domain={yDomain}
           />
           <Tooltip
             contentStyle={{
@@ -61,7 +73,7 @@ export function LossChart({ height = 300 }: LossChartProps) {
             labelStyle={{ color: '#888' }}
             itemStyle={{ color: '#00d4aa' }}
             formatter={(value: number) => [value.toFixed(4), '损失']}
-            labelFormatter={(label) => `步数: ${label}`}
+            labelFormatter={(label) => `Epoch ${label}`}
           />
           <Legend 
             wrapperStyle={{ paddingTop: '20px' }}
