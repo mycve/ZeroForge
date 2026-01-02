@@ -297,16 +297,16 @@ ZeroForge 支持所有 Gymnasium 兼容环境，包括 Atari、经典控制、Mu
 
 ```bash
 # 基础 Gymnasium（经典控制游戏）
-pip install gymnasium
+uv pip install gymnasium
 
 # Atari 游戏
-pip install gymnasium[atari] ale-py
+uv pip install "gymnasium[atari]" ale-py
 
 # MuJoCo 物理仿真
-pip install gymnasium[mujoco]
+uv pip install "gymnasium[mujoco]"
 
 # 一次性安装所有
-pip install gymnasium[atari,mujoco] ale-py
+uv pip install "gymnasium[atari,mujoco]" ale-py
 ```
 
 ### 使用方式
