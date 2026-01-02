@@ -55,21 +55,47 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 核心数据流
+### 核心数据流（周期模式）
 
 ```
-Self-Play Loop:
-┌──────────┐    action    ┌──────────┐    transition    ┌──────────┐
-│   MCTS   │─────────────►│   Env    │─────────────────►│  Replay  │
-│  Search  │              │   Step   │                  │  Buffer  │
-└────▲─────┘              └──────────┘                  └────┬─────┘
-     │                                                       │
-     │  policy, value                              batch     │
-     │                                                       ▼
-┌────┴─────┐                                        ┌──────────┐
-│  Network │◄───────────────────────────────────────│ Training │
-│ Inference│            gradient update             │   Loop   │
-└──────────┘                                        └──────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                          每个 Epoch                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                   Phase 1: 自玩阶段                           │   │
+│  │                                                               │   │
+│  │  ┌────────┐    action    ┌────────┐   trajectory  ┌────────┐ │   │
+│  │  │  MCTS  │─────────────►│  Env   │──────────────►│ 新数据 │ │   │
+│  │  │ Search │              │  Step  │               │  缓冲  │ │   │
+│  │  └───▲────┘              └────────┘               └───┬────┘ │   │
+│  │      │ policy, value                                  │      │   │
+│  │  ┌───┴────┐                                           │      │   │
+│  │  │ Leaf   │  ← 批量 GPU 推理                          │      │   │
+│  │  │Batcher │                                           │      │   │
+│  │  └────────┘                                           │      │   │
+│  └───────────────────────────────────────────────────────│──────┘   │
+│                                                          ↓          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                   Phase 2: 训练阶段                           │   │
+│  │                                                               │   │
+│  │  ┌────────────┐   80%    ┌──────────┐                        │   │
+│  │  │   新数据   │─────────►│          │                        │   │
+│  │  └────────────┘          │  混合    │    ┌──────────┐        │   │
+│  │  ┌────────────┐   20%    │  采样    │───►│ 训练循环 │        │   │
+│  │  │  经验池    │─────────►│          │    └──────────┘        │   │
+│  │  └────────────┘          └──────────┘                        │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                   Phase 3: 评估阶段                           │   │
+│  │                                                               │   │
+│  │  ┌────────────┐                      ┌─────────────┐         │   │
+│  │  │ 新版本模型 │  vs  旧版本模型  ───►│ 胜率 + ELO  │         │   │
+│  │  └────────────┘                      └─────────────┘         │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1224,57 +1250,56 @@ class MCTSNode:
 
 ---
 
-## NoGIL MCTS 架构 ⭐ 新增
+## 周期训练架构 ⭐ 更新
 
 ### 架构概览
 
-利用 Python 3.13+ free-threading (nogil) 特性实现真正的多核并行自玩。
+采用"自玩 → 训练 → 评估"的周期模式，清晰分离推理和训练阶段。
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    GPU InferenceBatcher                      │
-│              收集叶子请求 → 批量推理 → 返回结果              │
-└─────────────────────────────────────────────────────────────┘
-                              ↑↓
-                        LeafRequest Queue
-                              ↑↓
-        ┌─────────────────────┼─────────────────────┐
-        ↓                     ↓                     ↓
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│   Env线程 1   │    │   Env线程 2   │    │   Env线程 N   │
-│ ┌───────────┐ │    │ ┌───────────┐ │    │ ┌───────────┐ │
-│ │ CPU MCTS  │ │    │ │ CPU MCTS  │ │    │ │ CPU MCTS  │ │
-│ │   Tree    │ │    │ │   Tree    │ │    │ │   Tree    │ │
-│ └───────────┘ │    │ └───────────┘ │    │ └───────────┘ │
-│     Game      │    │     Game      │    │     Game      │
-└───────────────┘    └───────────────┘    └───────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              每个 Epoch                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Phase 1: 自玩阶段                                                       │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    GPU InferenceBatcher                            │  │
+│  │              收集叶子请求 → 批量推理 → 返回结果                     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              ↑↓                                          │
+│        ┌─────────────────────┼─────────────────────┐                    │
+│        ↓                     ↓                     ↓                    │
+│  ┌───────────┐    ┌───────────┐    ┌───────────┐                        │
+│  │  Game 1   │    │  Game 2   │    │  Game N   │  ← 最多 concurrency 个 │
+│  │   MCTS    │    │   MCTS    │    │   MCTS    │    并发运行            │
+│  └───────────┘    └───────────┘    └───────────┘                        │
+│                                                                          │
+│  完成 num_envs 局后 → 收集轨迹 → 释放推理资源                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Phase 2: 训练阶段                                                       │
+│  - 采样 80% 新数据 + 20% 经验池                                          │
+│  - 执行 train_batches_per_epoch 批次训练                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Phase 3: 评估阶段（Epoch 2+ 可选）                                       │
+│  - 新版本 vs 旧版本对弈 eval_games 局                                    │
+│  - 计算胜率、更新 ELO 评分                                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 **核心特点**:
-- 每个 env 线程维护独立的 CPU 本地 MCTS 树
-- 树遍历、选择、扩展、回传都在 CPU 各自线程并行执行
-- 只有叶子节点评估时才提交给 GPU 批推理
-- 支持子树复用（节点重用），提升 30-50% 搜索效率
+- **内存管理清晰**：训练和推理分离，避免同时占用大量显存
+- **并发控制**：`num_envs` 控制总游戏数，`concurrency` 控制并发数
+- **数据混合**：80% 新数据 + 20% 经验池，提高样本效率
+- **自动评估**：新旧版本对弈，实时 ELO 追踪
 
 ### 配置类
 
 ```python
-from core.config import (
-    GameConfig,      # 游戏配置基类
-    MCTSConfig,      # MCTS 搜索配置
-    BatcherConfig,   # 批推理配置
-    ThreadedEnvConfig,  # 多线程环境配置
-)
-
-# 游戏配置（开发者继承）
-@dataclass
-class MyGameConfig(GameConfig):
-    board_size: int = 8
-    max_game_length: int = 200
+from core.config import MCTSConfig, BatcherConfig
+from core.training_config import TrainingConfig
 
 # MCTS 配置
 mcts_config = MCTSConfig(
-    num_simulations=200,    # 每步模拟次数
+    num_simulations=50,     # 每步模拟次数
     c_puct=1.5,             # UCB 探索常数
     reuse_tree=True,        # 是否复用子树
     dirichlet_alpha=0.3,    # 探索噪声
@@ -1282,16 +1307,21 @@ mcts_config = MCTSConfig(
 
 # 批推理配置
 batcher_config = BatcherConfig(
-    batch_size=256,         # 批大小
-    timeout_ms=5.0,         # 超时触发
+    batch_size=8,           # 批大小（≤ concurrency）
+    timeout_ms=10.0,        # 超时触发
     device="cuda",
 )
 
-# 完整配置
-config = ThreadedEnvConfig(
-    num_envs=128,           # 环境/线程数
-    mcts=mcts_config,
-    batcher=batcher_config,
+# 完整训练配置
+config = TrainingConfig(
+    # 自玩
+    num_envs=256,           # 每 epoch 完成的游戏数
+    concurrency=16,         # 并发游戏数
+    new_data_ratio=0.8,     # 新数据占比
+    
+    # 评估
+    eval_games=5,           # 评估对弈局数
+    eval_temperature=0.5,   # 评估采样温度
 )
 ```
 
@@ -1388,37 +1418,45 @@ batcher.stop()
 1. 收集到 `batch_size` 个请求
 2. 等待超过 `timeout_ms` 毫秒
 
-### 多线程自玩
+### 周期训练使用
 
 ```python
-from core.env import ThreadedSelfPlay
+from core.trainer import DistributedTrainer
+from core.training_config import TrainingConfig
 
-# 创建自玩管理器
-selfplay = ThreadedSelfPlay(
-    game_factory=lambda: make_game("chinese_chess"),
-    network=network,
-    config=ThreadedEnvConfig(num_envs=128),
+# 配置周期训练
+config = TrainingConfig(
+    game_type="chinese_chess",
+    algorithm="alphazero",
+    
+    # 自玩配置
+    num_envs=256,           # 每个 epoch 完成 256 局游戏
+    concurrency=16,         # 同时并发 16 个游戏
+    new_data_ratio=0.8,     # 80% 新数据 + 20% 经验池
+    
+    # 训练配置
+    train_batches_per_epoch=10,
+    batch_size=256,
+    
+    # 评估配置
+    eval_games=5,           # 每 epoch 评估 5 局
+    eval_temperature=0.5,
 )
 
-# 启动所有线程
-selfplay.start()
+# 创建训练器
+trainer = DistributedTrainer(config)
+trainer.setup()
 
-# 收集轨迹
-trajectories = selfplay.collect(num_games=1000)
+# 运行训练（周期模式自动执行：自玩 → 训练 → 评估）
+trainer.run()
 
-# 或带统计信息
-trajectories, stats = selfplay.collect_with_stats(num_games=1000)
-print(stats)
-# {
-#     "num_games": 1000,
-#     "total_time": 120.5,
-#     "avg_game_length": 85.3,
-#     "win_stats": {"player_0": 512, "player_1": 438, "draw": 50},
-#     "games_per_second": 8.3,
-# }
-
-# 停止
-selfplay.stop()
+# 训练过程中可以获取实时状态
+state = trainer.get_state()
+print(f"Epoch: {state['epoch']}")
+print(f"总游戏数: {state['total_games']}")
+print(f"速度: {state['games_per_second']:.2f} games/s")
+print(f"评估胜率: {state['eval_win_rate']:.1%}")
+print(f"ELO: {state['elo_rating']:.0f}")
 ```
 
 ### 开发者使用方式
