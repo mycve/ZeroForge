@@ -53,6 +53,7 @@ npm run dev
 ### 后端部分debug game截图
 ![debug流程](assets/debug.png)
 ![debug mcts访问分布流程](assets/debug_mcts.png)
+![debug mcts访问分布流程](assets/cchess.png)
 
 ### 命令行训练
 

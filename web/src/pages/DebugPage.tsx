@@ -442,7 +442,10 @@ export default function DebugPage() {
                 className="bg-bg-card border border-bg-elevated rounded-xl p-4"
               >
                 <h3 className="font-bold mb-3 text-accent">游戏状态</h3>
-                <pre className="font-mono text-sm bg-bg p-4 rounded-lg overflow-auto whitespace-pre text-accent border border-bg-elevated">
+                <pre 
+                  className="text-sm bg-bg p-4 rounded-lg overflow-auto whitespace-pre text-accent border border-bg-elevated"
+                  style={{ fontFamily: '"Noto Sans Mono CJK SC", "Source Han Mono", "Sarasa Mono SC", "Microsoft YaHei", monospace' }}
+                >
                   {parseRender(sessionState?.game_render)}
                 </pre>
                 <div className="mt-3 grid grid-cols-3 gap-4 text-sm">

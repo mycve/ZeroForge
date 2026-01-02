@@ -307,7 +307,10 @@ function SVGRenderer({ svg, className }: { svg: string; className?: string }) {
 
 function TextRenderer({ text, className }: { text: string; className?: string }) {
   return (
-    <pre className={`font-mono text-sm bg-bg-elevated p-4 rounded-lg overflow-auto ${className || ''}`}>
+    <pre 
+      className={`text-sm bg-bg-elevated p-4 rounded-lg overflow-auto whitespace-pre ${className || ''}`}
+      style={{ fontFamily: '"Noto Sans Mono CJK SC", "Source Han Mono", "Sarasa Mono SC", "Microsoft YaHei", "PingFang SC", monospace' }}
+    >
       {text}
     </pre>
   )

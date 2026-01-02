@@ -491,38 +491,10 @@ class ChineseChessGame(Game):
             return {"type": "text", "text": board_str}
     
     def _render_board_aligned(self) -> str:
-        """渲染简洁棋盘（全角字符对齐）"""
-        # 棋子符号（全角）
-        piece_symbols = {
-            'R': '車', 'N': '馬', 'B': '相', 'A': '仕', 'K': '帥', 'C': '炮', 'P': '兵',
-            'r': '车', 'n': '马', 'b': '象', 'a': '士', 'k': '将', 'c': '砲', 'p': '卒',
-        }
-        
-        lines = []
-        # 全角数字
-        lines.append("　　９８７６５４３２１０")
-        
-        for row in range(9, -1, -1):
-            # 行号用全角
-            row_label = "９８７６５４３２１０"[9 - row]
-            row_str = f"{row_label}　"
-            for col in range(8, -1, -1):
-                square = row * 9 + col
-                piece = self.board.piece_at(square)
-                if piece:
-                    row_str += piece_symbols.get(piece.symbol(), '？')
-                else:
-                    row_str += "．"  # 全角圆点
-            lines.append(row_str)
-            
-            if row == 5:
-                lines.append("　　楚河　汉界　　")
-        
-        lines.append("　　９８７６５４３２１０")
-        turn = "红" if self.board.turn == cchess.RED else "黑"
-        lines.append(f"　　当前：{turn}方走棋")
-        
-        return "\n".join(lines)
+        """渲染棋盘（使用 cchess 库自带的 unicode 方法，替换空位字符确保等宽）"""
+        # 获取库的输出，将 "．" 替换为 "十" 确保等宽显示
+        result = self.board.unicode(axes=True, axes_type=1)
+        return result.replace("．", "十")
     
     def get_state_hash(self) -> int:
         """获取状态哈希（用于检测重复局面）"""
