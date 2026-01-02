@@ -4,12 +4,19 @@ import { Play, Eye, Clock, Users, Gamepad2, Trash2 } from 'lucide-react'
 import { GameBoard } from '../components/GameBoard'
 import { listGameSessions, getGameSession, getGameRender, deleteGameSession } from '../utils/api'
 import type { GameSession } from '../utils/api'
+import { ConfirmDialog } from '../components/ConfirmDialog'
+import { useToast } from '../components/Toast'
 
 export default function GamesPage() {
   const [sessions, setSessions] = useState<GameSession[]>([])
   const [selectedSession, setSelectedSession] = useState<GameSession | null>(null)
   const [renderData, setRenderData] = useState<unknown>(null)
   const [loading, setLoading] = useState(true)
+  
+  // 确认对话框状态
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
+  const toast = useToast()
 
   // 加载会话列表
   useEffect(() => {
@@ -49,20 +56,32 @@ export default function GamesPage() {
     }
   }
   
-  // 删除会话
-  const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
+  // 删除会话 - 显示确认对话框
+  const handleDeleteClick = (id: string, e: React.MouseEvent) => {
     e.stopPropagation() // 防止触发选中
-    if (!confirm('确定要删除这个对局吗？')) return
+    setDeleteTargetId(id)
+    setConfirmOpen(true)
+  }
+  
+  // 确认删除
+  const handleConfirmDelete = async () => {
+    if (!deleteTargetId) return
     
     try {
-      await deleteGameSession(id)
-      setSessions(prev => prev.filter(s => s.id !== id))
-      if (selectedSession?.id === id) {
+      await deleteGameSession(deleteTargetId)
+      setSessions(prev => prev.filter(s => s.id !== deleteTargetId))
+      if (selectedSession?.id === deleteTargetId) {
         setSelectedSession(null)
         setRenderData(null)
       }
+      toast.success('删除成功', '对局已删除')
     } catch (err) {
       console.error('删除会话失败:', err)
+      const msg = err instanceof Error ? err.message : '未知错误'
+      toast.error('删除失败', msg)
+    } finally {
+      setConfirmOpen(false)
+      setDeleteTargetId(null)
     }
   }
 
@@ -136,7 +155,7 @@ export default function GamesPage() {
                           {getStateLabel(session.state)}
                         </span>
                         <button
-                          onClick={(e) => handleDeleteSession(session.id, e)}
+                          onClick={(e) => handleDeleteClick(session.id, e)}
                           className="p-1 rounded hover:bg-error/20 text-gray-500 hover:text-error transition-colors"
                           title="删除对局"
                         >
@@ -251,6 +270,21 @@ export default function GamesPage() {
           </div>
         </div>
       </div>
+      
+      {/* 删除确认对话框 */}
+      <ConfirmDialog
+        isOpen={confirmOpen}
+        title="删除对局"
+        message="确定要删除这个对局吗？此操作不可恢复。"
+        confirmText="删除"
+        cancelText="取消"
+        type="danger"
+        onConfirm={handleConfirmDelete}
+        onCancel={() => {
+          setConfirmOpen(false)
+          setDeleteTargetId(null)
+        }}
+      />
     </div>
   )
 }
