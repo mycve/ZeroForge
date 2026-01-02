@@ -228,6 +228,7 @@ class TrainingManager:
                     self.status.loss = state.loss
                     self.status.value_loss = state.value_loss
                     self.status.policy_loss = state.policy_loss
+                    self.status.reward_loss = getattr(state, 'reward_loss', 0)  # MuZero 奖励损失
                     self.status.avg_game_length = state.avg_game_length
                     self.status.games_per_second = state.games_per_second
                     self.status.steps_per_second = state.steps_per_second
@@ -1189,6 +1190,20 @@ class GameManager:
         logger.info(f"删除游戏会话: {session_id}")
         return {"success": True}
     
+    def clear_all_sessions(self) -> Dict[str, Any]:
+        """清空所有会话"""
+        with self._lock:
+            count = len(self._sessions)
+            # 停止所有 AI 线程
+            self._ai_threads.clear()
+            # 清空会话
+            self._sessions.clear()
+            # 清空订阅者
+            self._subscribers.clear()
+        
+        logger.info(f"清空所有游戏会话: 共 {count} 个")
+        return {"success": True, "deleted_count": count}
+    
     def subscribe(self, session_id: str, callback: Callable):
         """订阅会话更新"""
         with self._lock:
@@ -1443,9 +1458,12 @@ class DebugManager:
             
             # 加载检查点
             if checkpoint_path:
-                checkpoint = torch.load(checkpoint_path, map_location=device)
-                network.load_state_dict(checkpoint.get("network", checkpoint))
-                logger.info(f"加载检查点: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                # 兼容多种检查点格式
+                state_dict = checkpoint.get("network_state_dict") or checkpoint.get("network") or checkpoint
+                network.load_state_dict(state_dict)
+                epoch_info = checkpoint.get("epoch", "?")
+                logger.info(f"加载检查点: {checkpoint_path} (Epoch {epoch_info})")
             
             network = network.to(device)
             network.eval()

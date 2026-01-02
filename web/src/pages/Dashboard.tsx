@@ -155,11 +155,6 @@ export default function Dashboard() {
               value={trainingStatus.buffer_size?.toLocaleString() || '0'}
               color="text-green-400"
             />
-            <MetricRow 
-              label="玩家1胜率" 
-              value={`${((trainingStatus.win_rate?.player_0 || 0) * 100).toFixed(1)}%`}
-              color="text-blue-400"
-            />
           </div>
         </div>
 

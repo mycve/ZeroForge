@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Play, Eye, Clock, Users, Gamepad2, Trash2 } from 'lucide-react'
+import { Play, Eye, Clock, Users, Gamepad2, Trash2, Trash } from 'lucide-react'
 import { GameBoard } from '../components/GameBoard'
-import { listGameSessions, getGameSession, getGameRender, deleteGameSession } from '../utils/api'
+import { listGameSessions, getGameSession, getGameRender, deleteGameSession, clearAllGameSessions } from '../utils/api'
 import type { GameSession } from '../utils/api'
 import { ConfirmDialog } from '../components/ConfirmDialog'
 import { useToast } from '../components/Toast'
@@ -16,6 +16,7 @@ export default function GamesPage() {
   // 确认对话框状态
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null)
+  const [clearAllOpen, setClearAllOpen] = useState(false)
   const toast = useToast()
 
   // 加载会话列表
@@ -63,7 +64,7 @@ export default function GamesPage() {
     setConfirmOpen(true)
   }
   
-  // 确认删除
+  // 确认删除单个
   const handleConfirmDelete = async () => {
     if (!deleteTargetId) return
     
@@ -82,6 +83,23 @@ export default function GamesPage() {
     } finally {
       setConfirmOpen(false)
       setDeleteTargetId(null)
+    }
+  }
+  
+  // 确认清空所有
+  const handleConfirmClearAll = async () => {
+    try {
+      const result = await clearAllGameSessions()
+      setSessions([])
+      setSelectedSession(null)
+      setRenderData(null)
+      toast.success('清空成功', `已删除 ${result.deleted_count} 个对局`)
+    } catch (err) {
+      console.error('清空会话失败:', err)
+      const msg = err instanceof Error ? err.message : '未知错误'
+      toast.error('清空失败', msg)
+    } finally {
+      setClearAllOpen(false)
     }
   }
 
@@ -118,7 +136,19 @@ export default function GamesPage() {
         {/* 会话列表 */}
         <div className="lg:col-span-1">
           <div className="bg-bg-card border border-bg-elevated rounded-xl p-6">
-            <h3 className="text-lg font-semibold font-display mb-4">对局列表</h3>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold font-display">对局列表</h3>
+              {sessions.length > 0 && (
+                <button
+                  onClick={() => setClearAllOpen(true)}
+                  className="flex items-center gap-1 px-2 py-1 text-sm text-gray-400 hover:text-error hover:bg-error/10 rounded transition-colors"
+                  title="清空所有对局"
+                >
+                  <Trash className="w-4 h-4" />
+                  清空
+                </button>
+              )}
+            </div>
             
             {loading ? (
               <div className="text-gray-500 py-8 text-center">加载中...</div>
@@ -284,6 +314,18 @@ export default function GamesPage() {
           setConfirmOpen(false)
           setDeleteTargetId(null)
         }}
+      />
+      
+      {/* 清空所有确认对话框 */}
+      <ConfirmDialog
+        isOpen={clearAllOpen}
+        title="清空所有对局"
+        message={`确定要清空所有 ${sessions.length} 个对局吗？此操作不可恢复。`}
+        confirmText="清空全部"
+        cancelText="取消"
+        type="danger"
+        onConfirm={handleConfirmClearAll}
+        onCancel={() => setClearAllOpen(false)}
       />
     </div>
   )

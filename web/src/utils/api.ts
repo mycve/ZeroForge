@@ -385,6 +385,10 @@ export async function deleteGameSession(gameId: string): Promise<{ success: bool
   return request(`/games/${gameId}`, { method: 'DELETE' })
 }
 
+export async function clearAllGameSessions(): Promise<{ success: boolean; deleted_count: number }> {
+  return request('/games', { method: 'DELETE' })
+}
+
 export async function startGame(gameId: string): Promise<{ success: boolean }> {
   return request(`/games/${gameId}/start`, { method: 'POST' })
 }

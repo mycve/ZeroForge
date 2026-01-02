@@ -487,6 +487,12 @@ def _register_routes(app: FastAPI):
             raise HTTPException(status_code=404, detail=result["error"])
         return result
     
+    @app.delete("/api/games")
+    async def clear_all_games():
+        """清空所有游戏会话"""
+        result = game_manager.clear_all_sessions()
+        return result
+    
     @app.get("/api/games/{game_id}/render")
     async def get_game_render(game_id: str, mode: str = "json"):
         """获取游戏渲染数据"""

@@ -95,6 +95,7 @@ class TrainerState:
     loss: float = 0.0
     value_loss: float = 0.0
     policy_loss: float = 0.0
+    reward_loss: float = 0.0  # MuZero 奖励预测损失
     
     # 自玩统计
     avg_game_length: float = 0.0
@@ -747,6 +748,7 @@ class DistributedTrainer:
             self.state.loss = metrics.get("total_loss", 0)
             self.state.value_loss = metrics.get("value_loss", 0)
             self.state.policy_loss = metrics.get("policy_loss", 0)
+            self.state.reward_loss = metrics.get("reward_loss", 0)  # MuZero 奖励损失
             
             # 评估指标
             if eval_metrics:
@@ -849,6 +851,7 @@ class DistributedTrainer:
                 "loss": self.state.loss,
                 "value_loss": self.state.value_loss,
                 "policy_loss": self.state.policy_loss,
+                "reward_loss": self.state.reward_loss,  # MuZero 奖励损失
                 "avg_game_length": self.state.avg_game_length,
                 "games_per_second": self.state.games_per_second,
                 "steps_per_second": self.state.steps_per_second,
