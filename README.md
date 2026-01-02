@@ -47,7 +47,7 @@ npm run dev
 ```
 
 访问：
-- 前端界面: http://localhost:5173
+- 前端界面: http://localhost:3000
 - API 文档: http://localhost:8000/docs
 
 ### 命令行训练
