@@ -75,8 +75,9 @@ export async function listAlgorithms(): Promise<AlgorithmInfo[]> {
 // ============================================================
 
 export interface ConfigFieldMeta {
-  type: 'int' | 'float' | 'string' | 'select' | 'multiselect'
+  type: 'int' | 'float' | 'string' | 'bool' | 'select' | 'multiselect'
   label: string
+  description?: string
   min?: number
   max?: number
   step?: number

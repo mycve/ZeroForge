@@ -4,8 +4,7 @@ import {
   Zap, 
   Gamepad2, 
   TrendingUp, 
-  Clock, 
-  Cpu, 
+  Cpu,
   Trophy,
   Activity,
   BarChart3
@@ -172,7 +171,7 @@ export default function Dashboard() {
               <MetricRow label="PyTorch" value={systemInfo.torch_version} />
               {systemInfo.cuda_available && (
                 <>
-                  <MetricRow label="GPU" value={systemInfo.gpu_name?.slice(0, 20) || 'N/A'} />
+                  <MetricRow label="GPU" value={systemInfo.gpu_name?.slice(0, 50) || 'N/A'} />
                   <MetricRow label="显存" value={`${systemInfo.gpu_memory}GB`} />
                 </>
               )}
