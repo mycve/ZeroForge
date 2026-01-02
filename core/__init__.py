@@ -6,14 +6,15 @@ Core Framework - 核心框架模块
 - Algorithm ABC: 算法抽象基类
 - Config: 配置基类（GameConfig, MCTSConfig 等）
 - MCTS: CPU 本地树 + GPU 批推理
-- Env: nogil 多线程环境
+- Trainer: 分布式训练器（支持 DDP）
+- SelfPlay: 多线程异步自玩
 - Logging: 结构化日志系统
 
 架构设计:
 - 开发者继承 Game + GameConfig 实现自定义游戏
-- 利用 Python 3.13+ nogil 实现多核并行
+- 多线程异步自玩 + 叶节点批量 GPU 推理
+- 支持 DDP 多卡分布式训练
 - CPU 本地 MCTS 树支持节点复用
-- GPU 批量叶子推理提高效率
 """
 
 from .game import (
@@ -42,6 +43,7 @@ from .logging import StructuredLogger, LogEvent, LogLevel, LogCategory
 from .selfplay import ThreadedSelfPlay, EnvWorker, SelfPlayResult, SelfPlayStats
 from .replay_buffer import ReplayBuffer, PrioritizedReplayBuffer, SampleBatch
 from .checkpoint import CheckpointManager, CheckpointInfo, get_checkpoint_manager
+from .trainer import DistributedTrainer, TrainerState, AsyncSelfPlayWorker
 
 __all__ = [
     # Game
@@ -64,12 +66,16 @@ __all__ = [
     "get_best_device",
     "resolve_device",
     "get_config_schema",
+    # Trainer
+    "DistributedTrainer",
+    "TrainerState",
+    "AsyncSelfPlayWorker",
     # Logging
     "StructuredLogger",
     "LogEvent",
     "LogLevel",
     "LogCategory",
-    # Env
+    # SelfPlay
     "ThreadedSelfPlay",
     "EnvWorker",
     "SelfPlayResult",

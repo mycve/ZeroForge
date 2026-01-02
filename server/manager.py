@@ -61,6 +61,10 @@ class TrainingStatus:
     eval_win_rate: float = 0.0
     eval_elo: float = 0.0
     
+    # 架构状态
+    buffer_size: int = 0          # 回放缓冲区大小
+    num_envs: int = 0             # 并行环境数
+    
     # 时间
     start_time: Optional[float] = None
     elapsed_time: float = 0.0
@@ -87,6 +91,7 @@ class TrainingManager:
         self._network = None
         self._optimizer = None
         self._checkpoint_manager = None
+        self._trainer = None  # DistributedTrainer 实例
         
         # 调试数据（用于前端展示）
         self._debug_data = {
@@ -118,6 +123,9 @@ class TrainingManager:
                 "elapsed_time": self.status.elapsed_time,
                 "games_per_second": self.status.games_per_second,
                 "steps_per_second": self.status.steps_per_second,
+                # 架构状态
+                "buffer_size": self.status.buffer_size,
+                "num_envs": self.status.num_envs,
             }
     
     def _add_debug(self, category: str, data: Dict[str, Any]):
@@ -188,7 +196,88 @@ class TrainingManager:
         self._notify_subscribers()
     
     def _training_loop(self):
-        """训练主循环 - 真实神经网络训练"""
+        """训练主循环 - 使用 DistributedTrainer
+        
+        新架构特点:
+        - 多环境并行自玩（num_envs 个环境，每个自动开线程）
+        - 叶节点批量 GPU 推理（LeafBatcher）
+        - 支持 DDP 多卡训练
+        """
+        try:
+            from core.training_config import TrainingConfig
+            from core.trainer import DistributedTrainer
+            
+            # 解析配置
+            config = TrainingConfig.from_dict(self._config)
+            logger.info(f"训练配置: game={config.game_type}, algo={config.algorithm}, "
+                       f"envs={config.num_envs}, device={config.device}")
+            
+            # 创建分布式训练器
+            trainer = DistributedTrainer(config)
+            self._trainer = trainer
+            
+            # 添加状态回调
+            def on_state_update(state):
+                trainer_state = trainer.get_state()
+                with self._lock:
+                    self.status.epoch = state.epoch
+                    self.status.step = state.step
+                    self.status.total_games = state.total_games
+                    self.status.selfplay_games = state.total_games
+                    self.status.loss = state.loss
+                    self.status.value_loss = state.value_loss
+                    self.status.policy_loss = state.policy_loss
+                    self.status.avg_game_length = state.avg_game_length
+                    self.status.games_per_second = state.games_per_second
+                    self.status.steps_per_second = state.steps_per_second
+                    self.status.elapsed_time = state.elapsed_time
+                    
+                    # 架构状态
+                    self.status.buffer_size = trainer_state.get("buffer_size", 0)
+                    self.status.num_envs = config.num_envs
+                    
+                    # 调试信息
+                    self._add_debug("training", {
+                        "epoch": state.epoch,
+                        "step": state.step,
+                        "total_games": state.total_games,
+                        "loss": round(state.loss, 4),
+                        "value_loss": round(state.value_loss, 4),
+                        "policy_loss": round(state.policy_loss, 4),
+                        "buffer_size": self.status.buffer_size,
+                        "num_envs": self.status.num_envs,
+                        "games_per_second": round(state.games_per_second, 2),
+                        "steps_per_second": round(state.steps_per_second, 2),
+                    })
+                
+                self._notify_subscribers()
+            
+            trainer.add_callback(on_state_update)
+            
+            # 设置训练器
+            trainer.setup()
+            
+            # 保存组件引用
+            self._network = trainer._network
+            self._optimizer = trainer._optimizer
+            self._checkpoint_manager = trainer._checkpoint_manager
+            
+            # 运行训练
+            trainer.run()
+            
+            logger.info("训练完成")
+            
+        except Exception as e:
+            logger.error(f"训练出错: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            with self._lock:
+                self.status.running = False
+            self._notify_subscribers()
+    
+    def _training_loop_legacy(self):
+        """旧版训练循环（保留用于对比测试）"""
         import torch
         import torch.nn.functional as F
         import numpy as np
@@ -200,36 +289,27 @@ class TrainingManager:
             from games import make_game
             from algorithms import make_algorithm
             
-            # 解析配置
             config = TrainingConfig.from_dict(self._config)
             device = resolve_device(config.device)
-            logger.info(f"训练配置: game={config.game_type}, algo={config.algorithm}, device={device}")
             
-            # 创建游戏实例获取空间信息
             game = make_game(config.game_type)
             game.reset()
-            obs_shape = game.observation_space.shape
             action_size = game.action_space.n
             
-            # 创建算法和网络
             algo = make_algorithm(config.algorithm)
             network = algo.create_network(game).to(device)
-            logger.info(f"网络参数量: {sum(p.numel() for p in network.parameters()):,}")
             
-            # 创建优化器
             optimizer = torch.optim.AdamW(
                 network.parameters(),
                 lr=config.lr,
                 weight_decay=config.weight_decay,
             )
             
-            # 创建回放缓冲区
             replay_buffer = ReplayBuffer(
                 capacity=config.replay_buffer_size,
                 action_space_size=action_size,
             )
             
-            # 创建检查点管理器
             self._checkpoint_manager = CheckpointManager(
                 base_dir=config.checkpoint_dir,
                 keep_checkpoints=config.keep_checkpoints,
@@ -238,24 +318,23 @@ class TrainingManager:
             self._network = network
             self._optimizer = optimizer
             
-            # 主训练循环
             for epoch in range(config.num_epochs):
                 if self._stop_event.is_set():
                     break
                 
-                # 暂停检查
                 while self.status.paused and not self._stop_event.is_set():
                     time.sleep(0.1)
                 
                 if self._stop_event.is_set():
                     break
                 
-                # === 自玩阶段 ===
+                # 自玩（旧版同步模式：每 epoch 执行固定数量游戏）
+                num_games_sync = 10  # 旧版同步模式固定执行 10 局
                 trajectories, selfplay_stats = self._run_selfplay(
                     game_type=config.game_type,
                     network=network,
                     device=device,
-                    num_games=config.games_per_actor,
+                    num_games=num_games_sync,
                     num_simulations=config.num_simulations,
                     c_puct=config.c_puct,
                     dirichlet_alpha=config.dirichlet_alpha,
@@ -263,69 +342,34 @@ class TrainingManager:
                     temperature_threshold=config.temperature_threshold,
                 )
                 
-                # 添加到回放缓冲区
                 replay_buffer.add_batch(trajectories)
                 
-                # 调试：经验池状态
-                if epoch == 0:
-                    logger.debug(f"[调试] === 经验池状态 ===")
-                    logger.debug(f"[调试] 轨迹数: {len(replay_buffer)}, 最小要求: {config.min_buffer_size}")
-                    if trajectories:
-                        traj = trajectories[0]
-                        logger.debug(f"[调试] 第一条轨迹: 长度={len(traj)}, "
-                                   f"obs_shape={traj.observations[0].shape if traj.observations else 'N/A'}")
-                
-                # === 训练阶段 ===
+                # 训练
                 train_losses = {"total": 0, "value": 0, "policy": 0}
-                debug_first_batch = (epoch == 0)
                 
                 if len(replay_buffer) >= config.min_buffer_size:
                     network.train()
                     num_batches = max(1, len(trajectories) * 5 // config.batch_size)
                     
-                    if debug_first_batch:
-                        logger.debug(f"[调试] === 训练阶段 ===")
-                        logger.debug(f"[调试] 批次数: {num_batches}, 批大小: {config.batch_size}")
-                    
-                    for batch_idx in range(num_batches):
+                    for _ in range(num_batches):
                         if self._stop_event.is_set():
                             break
                         
-                        batch = replay_buffer.sample(
-                            batch_size=config.batch_size,
-                            unroll_steps=0,  # AlphaZero 不需要 unroll
-                        )
+                        batch = replay_buffer.sample(batch_size=config.batch_size, unroll_steps=0)
                         
-                        # 转换为 tensor
                         obs = torch.from_numpy(batch.observations).to(device)
                         target_policy = torch.from_numpy(batch.target_policies[:, 0, :]).to(device)
                         target_value = torch.from_numpy(batch.target_values[:, 0]).to(device)
                         
-                        # 调试：第一个批次详细信息
-                        if debug_first_batch and batch_idx == 0:
-                            logger.debug(f"[调试] 采样批次: obs={obs.shape}, "
-                                       f"policy={target_policy.shape}, value={target_value.shape}")
-                            logger.debug(f"[调试] 目标价值范围: [{target_value.min():.2f}, {target_value.max():.2f}]")
-                            logger.debug(f"[调试] 目标策略示例: {target_policy[0].cpu().numpy()[:9]}")
-                        
-                        # 前向传播
                         policy_logits, value = network(obs)
                         
-                        # 计算损失
                         policy_loss = F.cross_entropy(policy_logits, target_policy)
                         value_loss = F.mse_loss(value.squeeze(), target_value)
                         total_loss = policy_loss + value_loss
                         
-                        # 调试：第一个批次损失
-                        if debug_first_batch and batch_idx == 0:
-                            logger.debug(f"[调试] 预测价值范围: [{value.min():.2f}, {value.max():.2f}]")
-                            logger.debug(f"[调试] 初始损失: total={total_loss.item():.4f}, "
-                                       f"policy={policy_loss.item():.4f}, value={value_loss.item():.4f}")
-                        
-                        # 反向传播
                         optimizer.zero_grad()
                         total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(network.parameters(), config.grad_clip)
                         optimizer.step()
                         
                         train_losses["total"] += total_loss.item()
@@ -335,69 +379,23 @@ class TrainingManager:
                         with self._lock:
                             self.status.step += 1
                     
-                    # 平均损失
                     for k in train_losses:
                         train_losses[k] /= num_batches
-                    
-                    # 调试：记录训练信息
-                    self._add_debug("training", {
-                        "epoch": epoch + 1,
-                        "num_batches": num_batches,
-                        "batch_size": config.batch_size,
-                        "buffer_size": len(replay_buffer),
-                        "total_loss": round(train_losses["total"], 4),
-                        "policy_loss": round(train_losses["policy"], 4),
-                        "value_loss": round(train_losses["value"], 4),
-                        "target_value_range": [
-                            round(float(target_value.min()), 2),
-                            round(float(target_value.max()), 2)
-                        ] if 'target_value' in dir() else None,
-                        "pred_value_range": [
-                            round(float(value.min()), 2),
-                            round(float(value.max()), 2)
-                        ] if 'value' in dir() else None,
-                    })
-                    
-                    if debug_first_batch:
-                        logger.debug(f"[调试] 平均损失: total={train_losses['total']:.4f}, "
-                                   f"policy={train_losses['policy']:.4f}, value={train_losses['value']:.4f}")
-                else:
-                    if epoch == 0:
-                        logger.debug(f"[调试] 跳过训练: 经验池 {len(replay_buffer)} < {config.min_buffer_size}")
                 
                 # 更新状态
                 with self._lock:
                     self.status.epoch = epoch + 1
                     self.status.total_games += selfplay_stats["num_games"]
-                    self.status.selfplay_games = self.status.total_games
-                    self.status.avg_game_length = selfplay_stats["avg_length"]
-                    self.status.win_rate = selfplay_stats["win_rate"]
                     self.status.loss = train_losses["total"]
                     self.status.value_loss = train_losses["value"]
                     self.status.policy_loss = train_losses["policy"]
-                    
-                    elapsed = time.time() - self.status.start_time
-                    self.status.elapsed_time = elapsed
-                    if elapsed > 0:
-                        self.status.games_per_second = self.status.total_games / elapsed
-                        self.status.steps_per_second = self.status.step / elapsed
                 
                 self._notify_subscribers()
-                logger.info(
-                    f"Epoch {epoch + 1}/{config.num_epochs}: "
-                    f"games={selfplay_stats['num_games']}, "
-                    f"avg_len={selfplay_stats['avg_length']:.1f}, "
-                    f"loss={train_losses['total']:.4f}, "
-                    f"buffer={len(replay_buffer)}"
-                )
                 
-                # 保存检查点
                 if (epoch + 1) % config.save_interval == 0:
                     self._save_checkpoint(epoch + 1, config)
             
-            # 训练结束，保存最终检查点
             self._save_checkpoint(config.num_epochs, config, is_final=True)
-            logger.info("训练完成")
             
         except Exception as e:
             logger.error(f"训练出错: {e}")
@@ -681,13 +679,18 @@ class TrainingManager:
         """停止训练"""
         self._stop_event.set()
         
+        # 停止 DistributedTrainer
+        if self._trainer is not None:
+            self._trainer.stop()
+        
         # 等待训练线程结束
         if self._training_thread and self._training_thread.is_alive():
-            self._training_thread.join(timeout=2.0)
+            self._training_thread.join(timeout=5.0)
         
         with self._lock:
             self.status.running = False
             self.status.paused = False
+            self._trainer = None
         logger.info("训练已停止")
         self._notify_subscribers()
     

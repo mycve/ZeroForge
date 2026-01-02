@@ -28,7 +28,7 @@ export interface AppConfig {
   }
   system: {
     device: string
-    num_actors: number
+    num_envs: number
     log_backends: string[]
   }
 }
@@ -88,6 +88,8 @@ const defaultTrainingStatus: TrainingStatus = {
     elapsed_time: 0,
     games_per_second: 0,
     steps_per_second: 0,
+    buffer_size: 0,
+    num_envs: 0,
 }
 
 export const useAppStore = create<AppState>((set) => ({

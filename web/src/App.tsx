@@ -15,6 +15,7 @@ import ConfigPage from './pages/ConfigPage'
 import GamesPage from './pages/GamesPage'
 import ArenaPage from './pages/ArenaPage'
 import DebugPage from './pages/DebugPage'
+import { ToastProvider } from './components/Toast'
 
 // 导航项
 const navItems = [
@@ -27,6 +28,7 @@ const navItems = [
 
 function App() {
   return (
+    <ToastProvider>
     <div className="min-h-screen bg-bg chess-grid">
       {/* 侧边栏 */}
       <aside className="fixed left-0 top-0 h-screen w-64 bg-bg-card border-r border-bg-elevated z-50">
@@ -90,6 +92,7 @@ function App() {
         </motion.div>
       </main>
     </div>
+    </ToastProvider>
   )
 }
 

@@ -1,14 +1,38 @@
 """
-Env - 多线程环境管理
+SelfPlay - 多线程自玩管理
 
-提供 nogil 多线程自玩支持:
+提供高效的多线程自玩支持:
 - ThreadedSelfPlay: 多线程自玩管理器
-- EnvWorker: 单个环境工作线程
+- EnvWorker: 单个环境工作线程（支持异步批推理）
+
+架构:
+┌─────────────────────────────────────────────────────────────────────┐
+│                       ThreadedSelfPlay                              │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │               LeafBatcher (推理线程)                         │    │
+│  │  - 收集各 Env 线程提交的叶节点                                │    │
+│  │  - 批量 GPU 推理                                             │    │
+│  │  - 分发结果                                                  │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                         ↑ submit()  ↓ result                        │
+│       ┌─────────────────┼───────────┼─────────────────┐            │
+│       ↓                 ↓           ↓                 ↓            │
+│  ┌─────────┐      ┌─────────┐ ┌─────────┐      ┌─────────┐        │
+│  │ Worker0 │      │ Worker1 │ │ Worker2 │ ...  │ WorkerN │        │
+│  │ Game    │      │ Game    │ │ Game    │      │ Game    │        │
+│  │ MCTS    │      │ MCTS    │ │ MCTS    │      │ MCTS    │        │
+│  └─────────┘      └─────────┘ └─────────┘      └─────────┘        │
+│       │                 │           │                 │            │
+│       └─────────────────┴───────────┴─────────────────┘            │
+│                              ↓                                      │
+│                     轨迹数据 (Trajectory)                           │
+└─────────────────────────────────────────────────────────────────────┘
 
 设计原则:
 - 每个线程维护独立的游戏实例和 MCTS 树
-- 叶子节点评估通过 LeafBatcher 批量推理
-- 支持节点复用提升效率
+- MCTS 搜索遇到叶节点时，通过 batcher.submit() 提交到推理队列
+- Batcher 收集满 batch_size 或超时后批量推理，分发结果
+- 支持子树复用提升效率
 """
 
 import threading
@@ -20,7 +44,7 @@ from queue import Queue
 import numpy as np
 
 from .config import ThreadedEnvConfig, MCTSConfig
-from .mcts import MCTSSearch, LeafBatcher
+from .mcts import MCTSSearch, LeafBatcher, LocalMCTSTree
 from .algorithm import Trajectory
 
 logger = logging.getLogger(__name__)
@@ -57,11 +81,19 @@ class EnvWorker:
     """单个环境工作线程
     
     负责运行一个游戏实例，执行自玩。
+    支持同步和异步两种模式。
+    
+    异步模式:
+        MCTS 搜索时，遇到叶节点通过 batcher.submit() 提交到推理队列，
+        等待批量推理完成后继续搜索。
+    
+    同步模式:
+        直接调用 evaluate_fn 进行推理，适用于调试。
     
     Attributes:
         game_factory: 游戏创建函数
         config: MCTS 配置
-        batcher: GPU 批推理器
+        batcher: GPU 批推理器（异步模式）
         worker_id: 工作线程 ID
     """
     
@@ -69,7 +101,7 @@ class EnvWorker:
         self,
         game_factory: Callable,
         config: MCTSConfig,
-        batcher: LeafBatcher,
+        batcher: Optional[LeafBatcher] = None,
         worker_id: int = 0,
     ):
         self.game_factory = game_factory
@@ -77,65 +109,87 @@ class EnvWorker:
         self.batcher = batcher
         self.worker_id = worker_id
         
-        # 创建游戏和搜索
+        # 创建游戏
         self.game = game_factory()
-        self.search = MCTSSearch(self.game, config, batcher=batcher, mode="alphazero")
+        
+        # MCTS 树（使用本地树实现，支持异步评估）
+        self.mcts_tree = LocalMCTSTree(self.game, config, mode="alphazero")
         
         # 统计
         self._games_completed = 0
+        self._total_steps = 0
     
-    def play_one_game(self) -> SelfPlayResult:
-        """执行一局自玩
+    def play_one_game_async(self) -> SelfPlayResult:
+        """异步执行一局自玩（通过 batcher 批量推理）
         
         Returns:
             SelfPlayResult: 自玩结果
+            
+        Raises:
+            RuntimeError: 如果 batcher 未设置
         """
+        if self.batcher is None:
+            raise RuntimeError("异步模式需要设置 batcher")
+        
         start_time = time.time()
         
         # 重置
         self.game.reset()
-        self.search.reset()
+        self.mcts_tree = LocalMCTSTree(self.game, self.config, mode="alphazero")
         
         trajectory = Trajectory()
         move_count = 0
         
+        # 创建异步评估函数
+        def evaluate_fn(obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
+            """通过 batcher 提交并等待结果"""
+            return self.batcher.submit(obs, mask, env_id=self.worker_id)
+        
         while not self.game.is_terminal():
-            # 获取当前状态
             obs = self.game.get_observation()
             current_player = self.game.current_player()
             
-            # MCTS 搜索
-            action, policy, value = self.search.run_async()
+            # MCTS 搜索（内部会多次调用 evaluate_fn）
+            add_noise = (move_count == 0)
+            action, policy, value = self.mcts_tree.search(
+                evaluate_fn=evaluate_fn,
+                num_simulations=self.config.num_simulations,
+                add_noise=add_noise,
+            )
             
             # 记录轨迹
             trajectory.append(
                 observation=obs,
                 action=action,
-                reward=0.0,  # 中间奖励为0
+                reward=0.0,
                 policy=policy,
                 value=value,
                 to_play=current_player,
             )
             
             # 执行动作
-            _, reward, done, info = self.game.step(action)
-            self.search.advance(action)
-            
+            self.game.step(action)
             move_count += 1
+            self._total_steps += 1
+            
+            # 复用子树
+            self.mcts_tree.game = self.game
+            self.mcts_tree.advance(action)
             
             # 检查最大步数
             if move_count >= self.config.max_tree_depth * 2:
-                logger.warning(f"Worker {self.worker_id}: 达到最大步数限制")
+                logger.warning(f"Worker {self.worker_id}: 达到最大步数限制 ({move_count})")
                 break
         
         # 设置最终奖励
         winner = self.game.get_winner()
-        final_rewards = self.game.get_rewards()
-        
-        # 更新轨迹中的奖励（最后一步设置最终结果）
-        if trajectory.rewards:
-            last_player = trajectory.to_play[-1]
-            trajectory.rewards[-1] = final_rewards.get(last_player, 0.0)
+        for i, player in enumerate(trajectory.to_play):
+            if winner is None:
+                trajectory.rewards[i] = 0.0
+            elif player == winner:
+                trajectory.rewards[i] = 1.0
+            else:
+                trajectory.rewards[i] = -1.0
         
         elapsed = time.time() - start_time
         self._games_completed += 1
@@ -147,8 +201,12 @@ class EnvWorker:
             total_time=elapsed,
         )
     
+    def play_one_game(self) -> SelfPlayResult:
+        """执行一局自玩（兼容旧接口，使用异步模式）"""
+        return self.play_one_game_async()
+    
     def play_one_game_sync(self, evaluate_fn: Callable) -> SelfPlayResult:
-        """同步执行一局自玩（不使用 batcher）
+        """同步执行一局自玩（直接调用 evaluate_fn）
         
         Args:
             evaluate_fn: 评估函数 (obs, mask) -> (policy, value)
@@ -160,7 +218,7 @@ class EnvWorker:
         
         # 重置
         self.game.reset()
-        self.search.reset()
+        self.mcts_tree = LocalMCTSTree(self.game, self.config, mode="alphazero")
         
         trajectory = Trajectory()
         move_count = 0
@@ -170,7 +228,12 @@ class EnvWorker:
             current_player = self.game.current_player()
             
             # 同步 MCTS 搜索
-            action, policy, value = self.search.run(evaluate_fn)
+            add_noise = (move_count == 0)
+            action, policy, value = self.mcts_tree.search(
+                evaluate_fn=evaluate_fn,
+                num_simulations=self.config.num_simulations,
+                add_noise=add_noise,
+            )
             
             trajectory.append(
                 observation=obs,
@@ -181,19 +244,26 @@ class EnvWorker:
                 to_play=current_player,
             )
             
-            _, reward, done, info = self.game.step(action)
-            self.search.advance(action)
+            self.game.step(action)
             move_count += 1
+            self._total_steps += 1
+            
+            # 复用子树
+            self.mcts_tree.game = self.game
+            self.mcts_tree.advance(action)
             
             if move_count >= self.config.max_tree_depth * 2:
                 break
         
+        # 设置最终奖励
         winner = self.game.get_winner()
-        final_rewards = self.game.get_rewards()
-        
-        if trajectory.rewards:
-            last_player = trajectory.to_play[-1]
-            trajectory.rewards[-1] = final_rewards.get(last_player, 0.0)
+        for i, player in enumerate(trajectory.to_play):
+            if winner is None:
+                trajectory.rewards[i] = 0.0
+            elif player == winner:
+                trajectory.rewards[i] = 1.0
+            else:
+                trajectory.rewards[i] = -1.0
         
         elapsed = time.time() - start_time
         self._games_completed += 1
@@ -204,6 +274,14 @@ class EnvWorker:
             game_length=move_count,
             total_time=elapsed,
         )
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        return {
+            "worker_id": self.worker_id,
+            "games_completed": self._games_completed,
+            "total_steps": self._total_steps,
+        }
 
 
 # ============================================================
@@ -454,7 +532,7 @@ class ThreadedSelfPlay:
         return {
             "total_games": self._total_games,
             "total_time": self._total_time,
-            "num_workers": len(self._workers),
+            "num_envs": len(self._workers),
             "running": self._running,
             "batcher_stats": self.batcher.get_stats() if self.batcher else {},
         }

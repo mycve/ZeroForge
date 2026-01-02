@@ -143,6 +143,9 @@ export interface TrainingStatus {
   elapsed_time: number
   games_per_second: number
   steps_per_second: number
+  // 新增：架构状态
+  buffer_size: number      // 回放缓冲区大小
+  num_envs: number         // 并行环境数
 }
 
 export async function getTrainingStatus(): Promise<TrainingStatus> {

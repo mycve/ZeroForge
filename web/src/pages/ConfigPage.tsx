@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Save, RefreshCw, Settings, Cpu, Brain, Gamepad2, Database, Zap, FolderOpen } from 'lucide-react'
+import { Save, RefreshCw, Settings, Cpu, Brain, Gamepad2, Database, Zap, FolderOpen, Server } from 'lucide-react'
 import { clsx } from 'clsx'
 import { getConfig, updateConfigBatch, getConfigSchema, listGames, listAlgorithms } from '../utils/api'
 import type { GameInfo, AlgorithmInfo, ConfigSchema, ConfigFieldMeta } from '../utils/api'
+import { useToast } from '../components/Toast'
 
 // 标签页定义
 const tabs = [
@@ -14,6 +15,7 @@ const tabs = [
   { id: 'selfplay', label: '自玩', icon: Cpu },
   { id: 'buffer', label: '缓冲区', icon: Database },
   { id: 'checkpoint', label: '检查点', icon: FolderOpen },
+  { id: 'distributed', label: '分布式', icon: Server },
   { id: 'system', label: '系统', icon: Cpu },
 ]
 
@@ -49,16 +51,20 @@ export default function ConfigPage() {
     loadData()
   }, [])
 
+  // Toast 通知
+  const toast = useToast()
+  
   // 保存配置
   const handleSave = async () => {
     if (!config) return
     setSaving(true)
     try {
       await updateConfigBatch(config)
-      alert('配置已保存')
+      toast.success('保存成功', '配置已更新')
     } catch (e) {
       console.error('保存配置失败:', e)
-      alert('保存失败')
+      const message = e instanceof Error ? e.message : '未知错误'
+      toast.error('保存失败', message)
     } finally {
       setSaving(false)
     }
@@ -155,6 +161,33 @@ export default function ConfigPage() {
               </label>
             ))}
           </div>
+          {meta?.description && (
+            <p className="text-xs text-gray-500 mt-1">{meta.description}</p>
+          )}
+        </div>
+      )
+    }
+    
+    // 布尔开关
+    if (type === 'bool') {
+      return (
+        <div key={key}>
+          <label className="flex items-center gap-3 cursor-pointer">
+            <div className="relative">
+              <input
+                type="checkbox"
+                checked={value as boolean || false}
+                onChange={e => updateValue(key, e.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-bg-elevated rounded-full peer peer-checked:bg-accent transition-colors border border-bg-hover"></div>
+              <div className="absolute left-1 top-1 w-4 h-4 bg-gray-400 rounded-full transition-transform peer-checked:translate-x-5 peer-checked:bg-white"></div>
+            </div>
+            <span className="text-sm text-white">{label}</span>
+          </label>
+          {meta?.description && (
+            <p className="text-xs text-gray-500 mt-1 ml-14">{meta.description}</p>
+          )}
         </div>
       )
     }
@@ -172,6 +205,9 @@ export default function ConfigPage() {
             onChange={e => updateValue(key, parseInt(e.target.value) || 0)}
             className="w-full px-4 py-3 rounded-lg bg-bg-elevated border border-bg-hover text-white focus:border-accent focus:outline-none"
           />
+          {meta?.description && (
+            <p className="text-xs text-gray-500 mt-1">{meta.description}</p>
+          )}
         </div>
       )
     }
@@ -190,6 +226,9 @@ export default function ConfigPage() {
             onChange={e => updateValue(key, parseFloat(e.target.value) || 0)}
             className="w-full px-4 py-3 rounded-lg bg-bg-elevated border border-bg-hover text-white focus:border-accent focus:outline-none"
           />
+          {meta?.description && (
+            <p className="text-xs text-gray-500 mt-1">{meta.description}</p>
+          )}
         </div>
       )
     }

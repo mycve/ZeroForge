@@ -15,6 +15,7 @@ import {
 } from '../utils/api';
 import { motion } from 'framer-motion';
 import { Bug, Play, RotateCcw, Zap, Search, Trash2 } from 'lucide-react';
+import { useToast } from '../components/Toast';
 
 interface DebugSession {
   session_id: string;
@@ -86,6 +87,8 @@ interface HistoryItem {
 }
 
 export default function DebugPage() {
+  const toast = useToast();
+  
   // 游戏和算法列表
   const [games, setGames] = useState<Array<{ name: string; display_name?: string }>>([]);
   const [algorithms, setAlgorithms] = useState<Array<{ name: string }>>([]);
@@ -190,7 +193,7 @@ export default function DebugPage() {
       setMctsResult(null);
       setLastStepResult(null);
     } catch (e: any) {
-      alert(`创建失败: ${e.message}`);
+      toast.error('创建失败', e instanceof Error ? e.message : '未知错误');
     } finally {
       setLoading(false);
     }
@@ -209,7 +212,7 @@ export default function DebugPage() {
         setLastStepResult(null);
       }
     } catch (e: any) {
-      alert(`删除失败: ${e.message}`);
+      toast.error('删除失败', e instanceof Error ? e.message : '未知错误');
     }
   };
 
@@ -222,7 +225,7 @@ export default function DebugPage() {
       setMctsResult(result as MCTSResult);
       await loadActiveSession();
     } catch (e: any) {
-      alert(`MCTS 失败: ${e.message}`);
+      toast.error('MCTS 失败', e instanceof Error ? e.message : '未知错误');
     } finally {
       setLoading(false);
     }
@@ -238,7 +241,7 @@ export default function DebugPage() {
       setMctsResult(null);
       await loadActiveSession();
     } catch (e: any) {
-      alert(`执行失败: ${e.message}`);
+      toast.error('执行失败', e instanceof Error ? e.message : '未知错误');
     } finally {
       setLoading(false);
     }
@@ -254,7 +257,7 @@ export default function DebugPage() {
       setLastStepResult(null);
       await loadActiveSession();
     } catch (e: any) {
-      alert(`重置失败: ${e.message}`);
+      toast.error('重置失败', e instanceof Error ? e.message : '未知错误');
     } finally {
       setLoading(false);
     }
@@ -274,7 +277,7 @@ export default function DebugPage() {
       setMctsResult(null);
       await loadActiveSession();
     } catch (e: any) {
-      alert(`运行失败: ${e.message}`);
+      toast.error('运行失败', e instanceof Error ? e.message : '未知错误');
     } finally {
       setLoading(false);
     }

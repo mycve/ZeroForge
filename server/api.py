@@ -252,6 +252,16 @@ def _register_routes(app: FastAPI):
     @app.put("/api/config")
     async def update_config_batch(values: Dict[str, Any]):
         """批量更新配置"""
+        # 验证配置合法性
+        try:
+            from core.training_config import TrainingConfig
+            # 合并当前配置和新值进行验证
+            current = system_manager.get_config()
+            merged = {**current, **values}
+            TrainingConfig.from_dict(merged)  # 触发验证
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
         system_manager.update_config(values)
         return {"success": True}
     

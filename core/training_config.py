@@ -59,7 +59,8 @@ class TrainingConfig:
         
         # 批处理
         batch_size: 训练批大小
-        inference_batch_size: 推理批大小
+        inference_batch_size: 推理批大小（叶节点批量推理）
+        inference_timeout_ms: 推理超时（毫秒）
         
         # 训练超参
         num_epochs: 训练轮数
@@ -85,6 +86,10 @@ class TrainingConfig:
         save_interval: 保存间隔（轮）
         keep_checkpoints: 保留检查点数量
         
+        # 分布式训练
+        use_ddp: 是否使用 DDP 多卡训练
+        ddp_backend: DDP 后端 (nccl/gloo)
+        
         # 系统
         device: 设备 (auto/cuda/mps/cpu)
         log_backends: 日志后端列表
@@ -94,18 +99,20 @@ class TrainingConfig:
     game_type: str = "tictactoe"
     algorithm: str = "alphazero"
     
-    # === 并发 ===
-    num_actors: int = 4
-    games_per_actor: int = 50
+    # === 并发（自玩） ===
+    num_envs: int = 16                     # 环境数量（每个 env 自动开启线程持续自玩）
+    train_batches_per_epoch: int = 10      # 每 epoch 训练批次数
     
     # === 批处理 ===
-    batch_size: int = 128
-    inference_batch_size: int = 32
+    batch_size: int = 256              # 训练批大小
+    inference_batch_size: int = 8      # 叶节点推理批大小（推荐 num_envs/2，形成流水线）
+    inference_timeout_ms: float = 5.0  # 推理超时（毫秒），超时后强制推理
     
     # === 训练超参 ===
     num_epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
+    grad_clip: float = 1.0  # 梯度裁剪
     
     # === 网络架构 ===
     network_size: str = "auto"  # auto / small / medium / large
@@ -114,11 +121,11 @@ class TrainingConfig:
     hidden_dim: int = 64  # 用于 SimpleAlphaZeroNetwork
     
     # === 回放缓冲区 ===
-    replay_buffer_size: int = 50000
-    min_buffer_size: int = 100  # 降低阈值，让训练更快开始
+    replay_buffer_size: int = 100000
+    min_buffer_size: int = 500  # 开始训练前最小样本数
     
     # === MCTS ===
-    num_simulations: int = 50
+    num_simulations: int = 100
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -128,6 +135,10 @@ class TrainingConfig:
     checkpoint_dir: str = "./checkpoints"
     save_interval: int = 10
     keep_checkpoints: int = 5
+    
+    # === 分布式训练 ===
+    use_ddp: bool = False           # 是否使用 DDP
+    ddp_backend: str = "nccl"       # DDP 后端: nccl (GPU) / gloo (CPU)
     
     # === 系统 ===
     device: str = "auto"
@@ -140,8 +151,16 @@ class TrainingConfig:
     
     def validate(self) -> None:
         """验证配置合法性"""
-        if self.num_actors < 1:
-            raise ValueError(f"num_actors 必须 >= 1，得到 {self.num_actors}")
+        if self.num_envs < 1:
+            raise ValueError(f"num_envs 必须 >= 1，得到 {self.num_envs}")
+        
+        # 批推理大小不能超过环境数（每个 env 同时只产生一个叶子节点）
+        if self.inference_batch_size > self.num_envs:
+            raise ValueError(
+                f"inference_batch_size ({self.inference_batch_size}) 不能超过 num_envs ({self.num_envs})，"
+                f"因为每个 env 同一时刻只产生一个叶子节点。"
+                f"推荐设置为 num_envs 的一半（{self.num_envs // 2}）以形成流水线，让 GPU 始终忙碌。"
+            )
         if self.batch_size < 1:
             raise ValueError(f"batch_size 必须 >= 1，得到 {self.batch_size}")
         if self.num_epochs < 1:
@@ -180,7 +199,7 @@ CONFIG_GROUPS = {
     },
     "training": {
         "label": "训练设置",
-        "fields": ["num_epochs", "batch_size", "lr", "weight_decay"],
+        "fields": ["num_epochs", "batch_size", "lr", "weight_decay", "grad_clip"],
     },
     "network": {
         "label": "网络架构",
@@ -192,7 +211,7 @@ CONFIG_GROUPS = {
     },
     "selfplay": {
         "label": "自玩设置",
-        "fields": ["num_actors", "games_per_actor", "inference_batch_size"],
+        "fields": ["num_envs", "inference_batch_size", "inference_timeout_ms", "train_batches_per_epoch"],
     },
     "buffer": {
         "label": "回放缓冲区",
@@ -201,6 +220,10 @@ CONFIG_GROUPS = {
     "checkpoint": {
         "label": "检查点",
         "fields": ["checkpoint_dir", "save_interval", "keep_checkpoints"],
+    },
+    "distributed": {
+        "label": "分布式训练",
+        "fields": ["use_ddp", "ddp_backend"],
     },
     "system": {
         "label": "系统设置",
@@ -214,9 +237,10 @@ FIELD_METADATA = {
     "game_type": {"type": "select", "options": ["tictactoe", "chinese_chess"], "label": "游戏类型"},
     "algorithm": {"type": "select", "options": ["alphazero", "muzero"], "label": "算法"},
     "num_epochs": {"type": "int", "min": 1, "max": 100000, "label": "训练轮数"},
-    "batch_size": {"type": "int", "min": 1, "max": 4096, "label": "批大小"},
+    "batch_size": {"type": "int", "min": 1, "max": 4096, "label": "训练批大小"},
     "lr": {"type": "float", "min": 1e-6, "max": 1.0, "step": 1e-4, "label": "学习率"},
     "weight_decay": {"type": "float", "min": 0, "max": 0.1, "step": 1e-5, "label": "权重衰减"},
+    "grad_clip": {"type": "float", "min": 0.1, "max": 10.0, "step": 0.1, "label": "梯度裁剪"},
     "network_size": {"type": "select", "options": ["auto", "small", "medium", "large"], "label": "网络大小", "description": "auto 自动选择，small 适合小游戏，large 适合复杂游戏"},
     "num_channels": {"type": "int", "min": 8, "max": 512, "label": "网络通道数", "description": "仅 medium/large 网络使用"},
     "num_blocks": {"type": "int", "min": 1, "max": 40, "label": "ResNet 块数", "description": "仅 medium/large 网络使用"},
@@ -226,14 +250,17 @@ FIELD_METADATA = {
     "dirichlet_alpha": {"type": "float", "min": 0.01, "max": 1.0, "step": 0.01, "label": "Dirichlet Alpha"},
     "dirichlet_epsilon": {"type": "float", "min": 0, "max": 1.0, "step": 0.05, "label": "噪声比例"},
     "temperature_threshold": {"type": "int", "min": 0, "max": 100, "label": "温度阈值步数"},
-    "num_actors": {"type": "int", "min": 1, "max": 256, "label": "自玩线程数"},
-    "games_per_actor": {"type": "int", "min": 1, "max": 1000, "label": "每线程游戏数"},
-    "inference_batch_size": {"type": "int", "min": 1, "max": 512, "label": "推理批大小"},
+    "num_envs": {"type": "int", "min": 1, "max": 256, "label": "环境数量", "description": "并行环境数（每个 env 自动开启线程持续自玩）"},
+    "train_batches_per_epoch": {"type": "int", "min": 1, "max": 1000, "label": "每epoch训练批次", "description": "每个 epoch 从缓冲区采样训练的批次数"},
+    "inference_batch_size": {"type": "int", "min": 1, "max": 512, "label": "推理批大小", "description": "叶节点批量推理（≤num_envs，推荐 num_envs/2 形成流水线）"},
+    "inference_timeout_ms": {"type": "float", "min": 1.0, "max": 100.0, "step": 1.0, "label": "推理超时(ms)", "description": "超时后强制执行批推理"},
     "replay_buffer_size": {"type": "int", "min": 1000, "max": 10000000, "label": "缓冲区大小"},
     "min_buffer_size": {"type": "int", "min": 10, "max": 100000, "label": "最小缓冲量", "description": "低于此值不开始训练"},
     "checkpoint_dir": {"type": "string", "label": "检查点目录"},
     "save_interval": {"type": "int", "min": 1, "max": 1000, "label": "保存间隔（轮）"},
     "keep_checkpoints": {"type": "int", "min": 1, "max": 100, "label": "保留数量"},
+    "use_ddp": {"type": "bool", "label": "启用 DDP", "description": "分布式数据并行训练（多卡）"},
+    "ddp_backend": {"type": "select", "options": ["nccl", "gloo"], "label": "DDP 后端", "description": "nccl 适用于 GPU，gloo 适用于 CPU"},
     "device": {"type": "select", "options": ["auto", "cuda", "mps", "cpu"], "label": "计算设备"},
     "log_backends": {"type": "multiselect", "options": ["console", "tensorboard", "wandb", "file"], "label": "日志后端"},
     "log_dir": {"type": "string", "label": "日志目录"},

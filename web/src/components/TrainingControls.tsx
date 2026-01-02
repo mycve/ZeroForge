@@ -4,41 +4,51 @@ import { Play, Pause, Square, RefreshCw, Save } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAppStore } from '../store'
 import { sendTrainingCommand, saveCheckpoint } from '../utils/api'
+import { useToast } from './Toast'
 
 export function TrainingControls() {
   const { trainingStatus } = useAppStore()
   const { running, paused } = trainingStatus
   const [saving, setSaving] = useState(false)
+  const toast = useToast()
 
   const handleStart = async () => {
     try {
       await sendTrainingCommand('start')
+      toast.success('训练已启动')
     } catch (e) {
-      console.error('启动训练失败:', e)
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('启动失败', msg)
     }
   }
 
   const handlePause = async () => {
     try {
       await sendTrainingCommand('pause')
+      toast.info('训练已暂停')
     } catch (e) {
-      console.error('暂停训练失败:', e)
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('暂停失败', msg)
     }
   }
 
   const handleResume = async () => {
     try {
       await sendTrainingCommand('resume')
+      toast.success('训练已恢复')
     } catch (e) {
-      console.error('恢复训练失败:', e)
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('恢复失败', msg)
     }
   }
 
   const handleStop = async () => {
     try {
       await sendTrainingCommand('stop')
+      toast.info('训练已停止')
     } catch (e) {
-      console.error('停止训练失败:', e)
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('停止失败', msg)
     }
   }
   
@@ -48,13 +58,13 @@ export function TrainingControls() {
     try {
       const result = await saveCheckpoint()
       if (result.success) {
-        alert(`检查点已保存 (Epoch ${result.epoch})`)
+        toast.success('检查点已保存', `Epoch ${result.epoch}`)
       } else {
-        alert(`保存失败: ${result.error}`)
+        toast.error('保存失败', result.error)
       }
     } catch (e) {
-      console.error('保存检查点失败:', e)
-      alert('保存检查点失败')
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('保存检查点失败', msg)
     } finally {
       setSaving(false)
     }

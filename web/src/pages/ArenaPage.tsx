@@ -11,6 +11,7 @@ import {
 import type { GameInfo, GameSession, CheckpointInfo } from '../utils/api'
 import { useGameWebSocket } from '../hooks/useWebSocket'
 import { useAppStore } from '../store'
+import { useToast } from '../components/Toast'
 
 // 基础玩家选项
 const basePlayerOptions = [
@@ -21,6 +22,8 @@ const basePlayerOptions = [
 ]
 
 export default function ArenaPage() {
+  const toast = useToast()
+  
   // 游戏选择
   const [availableGames, setAvailableGames] = useState<GameInfo[]>([])
   const [selectedGame, setSelectedGame] = useState<string>('tictactoe')
@@ -143,7 +146,8 @@ export default function ArenaPage() {
       await refreshGameState(session_id)
     } catch (e) {
       console.error('创建对局失败:', e)
-      alert('创建对局失败')
+      const msg = e instanceof Error ? e.message : '未知错误'
+      toast.error('创建对局失败', msg)
     }
   }
 

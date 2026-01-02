@@ -142,14 +142,19 @@ export default function Dashboard() {
             <MetricRow label="已完成对局" value={trainingStatus.selfplay_games.toString()} />
             <MetricRow label="平均步数" value={trainingStatus.avg_game_length.toFixed(1)} />
             <MetricRow 
+              label="环境数量" 
+              value={trainingStatus.num_envs?.toString() || '0'}
+              color="text-accent"
+            />
+            <MetricRow 
+              label="缓冲区大小" 
+              value={trainingStatus.buffer_size?.toLocaleString() || '0'}
+              color="text-green-400"
+            />
+            <MetricRow 
               label="玩家1胜率" 
               value={`${((trainingStatus.win_rate?.player_0 || 0) * 100).toFixed(1)}%`}
               color="text-blue-400"
-            />
-            <MetricRow 
-              label="平局率" 
-              value={`${((trainingStatus.win_rate?.draw || 0) * 100).toFixed(1)}%`}
-              color="text-gray-400"
             />
           </div>
         </div>
