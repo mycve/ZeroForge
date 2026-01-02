@@ -1,210 +1,258 @@
 # ZeroForge
 
-ZeroForge 是一个面向 MuZero、AlphaZero 及其演进算法的现代化训练框架。它以**流程化训练、Web 配置、可视化与深度调试**为核心，将自博弈强化学习从零散脚本提升为可观测、可组合、可演化的系统工程。
+ZeroForge 是一个现代化的 AlphaZero/MuZero 训练框架，提供完整的自博弈强化学习流程，包括 Web 可视化界面、实时监控和游戏对弈功能。
 
 ## 特性
 
-- 🎮 **游戏插件化** - 通过简单的接口定义，快速接入新游戏
-- 🧠 **算法模块化** - 支持 AlphaZero、MuZero（开发中）等算法
-- 🌐 **Web API** - FastAPI 后端，支持训练控制、状态监控
-- 📊 **实验管理** - 对比不同配置的训练效果
-- 🔧 **配置驱动** - Pydantic 验证，类型安全的配置管理
+- 🎮 **游戏插件化** - 通过 `Game` 接口快速接入新游戏，自动验证和注册
+- 🧠 **算法模块化** - 支持 AlphaZero、MuZero，可扩展
+- 🔍 **完整 MCTS** - GPU 批推理 + CPU 本地树搜索
+- 🌐 **Web 界面** - React 前端 + FastAPI 后端，实时训练监控
+- ⚙️ **智能配置** - 自动设备检测（CUDA > MPS > CPU），网络大小自适应
+- 💾 **检查点管理** - 自动保存、加载模型，支持手动保存
+- 🎯 **游戏对弈** - 人机对弈、AI vs AI、随机玩家
 
 ## 快速开始
 
-### 安装
+### 安装（使用 uv）
 
 ```bash
+# 安装 uv（如果未安装）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # 克隆仓库
-git clone https://github.com/zeroforge/zeroforge.git
-cd zeroforge
+git clone https://github.com/your-repo/ZeroForge.git
+cd ZeroForge
 
-# 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# 或 venv\Scripts\activate  # Windows
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 或使用 pip 安装（开发模式）
-pip install -e ".[all]"
+# 同步依赖（自动创建虚拟环境）
+uv sync
 ```
 
-### 训练井字棋 AI
+### 启动 Web 服务
 
 ```bash
-# 运行示例训练脚本
-python examples/train_tictactoe.py
+# 启动后端 API 服务
+uv run python main.py server
+
+# 或指定端口
+uv run uvicorn server.api:app --reload --port 8000
 ```
 
-输出示例：
-```
-============================================================
-ZeroForge - 井字棋训练示例
-============================================================
-配置:
-  - 迭代次数: 20
-  - 每迭代自博弈: 50 局
-  - 每迭代训练: 50 步
-  - MCTS 模拟: 50 次/步
-============================================================
-
-游戏: tictactoe
-  - 动作空间: 9
-  - 观测形状: (3, 3, 3)
-
-网络参数量: 25,481
-
-==================== 迭代 1/20 ====================
-[自博弈] 进行 50 局...
-  玩家0胜: 24, 玩家1胜: 18, 平局: 8
-  ...
-```
-
-### 启动 Web API
+启动前端（另开终端）：
 
 ```bash
-# 安装 web 依赖
-pip install fastapi uvicorn
-
-# 启动服务
-uvicorn zeroforge.web.app:app --reload --port 8000
+cd web
+npm install
+npm run dev
 ```
 
-访问 http://localhost:8000/docs 查看 API 文档。
+访问：
+- 前端界面: http://localhost:5173
+- API 文档: http://localhost:8000/docs
+
+### 命令行训练
+
+```bash
+# 训练井字棋（简单游戏，快速验证）
+uv run python main.py train --game tictactoe --epochs 100
+
+# 训练中国象棋（复杂游戏）
+uv run python main.py train --game chinese_chess --epochs 1000
+```
 
 ## 项目结构
 
 ```
-zeroforge/
-├── core/                       # 核心抽象层
-│   ├── game.py                 # 游戏基类 (GameState, Game)
-│   ├── network.py              # 神经网络基类
-│   ├── algorithm.py            # 算法基类
-│   └── config.py               # 配置管理 (Pydantic)
+ZeroForge/
+├── core/                       # 核心框架
+│   ├── game.py                 # 游戏抽象基类 (Game, GameState, GameMeta)
+│   ├── algorithm.py            # 算法抽象基类 (Algorithm, Trajectory)
+│   ├── config.py               # 配置类 (MCTSConfig, BatcherConfig)
+│   ├── training_config.py      # 训练配置 (TrainingConfig)
+│   ├── mcts/                   # MCTS 实现
+│   │   ├── node.py             # 树节点 (MCTSNode)
+│   │   ├── tree.py             # 本地树 (LocalMCTSTree)
+│   │   ├── search.py           # 搜索控制器 (MCTSSearch)
+│   │   └── batcher.py          # GPU 批推理 (LeafBatcher)
+│   ├── replay_buffer.py        # 经验回放缓冲区
+│   ├── checkpoint.py           # 检查点管理
+│   └── logging.py              # 结构化日志
 │
-├── games/                      # 游戏插件目录
-│   ├── registry.py             # 游戏注册表
-│   └── tictactoe/              # 井字棋实现
+├── games/                      # 游戏实现
+│   ├── __init__.py             # 注册系统 + 验证
+│   ├── tictactoe/              # 井字棋
+│   │   ├── game.py             # 游戏逻辑
+│   │   └── config.py           # 游戏配置
+│   └── chinese_chess/          # 中国象棋
 │       ├── game.py             # 游戏逻辑
-│       └── network.py          # 专用网络结构
+│       ├── config.py           # 游戏配置
+│       └── cchess/             # 象棋引擎
 │
 ├── algorithms/                 # 算法实现
-│   ├── mcts.py                 # MCTS 核心
-│   └── alphazero/              # AlphaZero
-│       ├── self_play.py        # 自博弈
-│       ├── trainer.py          # 训练器
-│       └── evaluator.py        # 评估器
+│   ├── __init__.py             # 注册系统
+│   ├── alphazero/              # AlphaZero
+│   │   ├── algorithm.py        # 算法逻辑
+│   │   └── network.py          # 神经网络
+│   └── muzero/                 # MuZero
+│       ├── algorithm.py        # 算法逻辑
+│       └── network.py          # 神经网络
 │
-├── storage/                    # 数据存储
-│   ├── replay_buffer.py        # 经验回放
-│   └── checkpoint.py           # 模型存档
+├── server/                     # Web 后端
+│   ├── api.py                  # FastAPI 路由
+│   └── manager.py              # 训练/游戏管理器
 │
-├── web/                        # Web 后端 (FastAPI)
-│   ├── app.py                  # FastAPI 入口
-│   └── api/                    # REST API
+├── web/                        # React 前端
+│   └── src/
+│       ├── pages/              # 页面组件
+│       └── components/         # 通用组件
 │
-└── utils/                      # 工具类
-    └── logger.py               # 日志系统
+└── main.py                     # CLI 入口
 ```
 
 ## 添加新游戏
 
-1. 在 `zeroforge/games/` 下创建新目录
-2. 实现 `GameState` 和 `Game` 子类
-3. 使用 `@register_game` 装饰器注册
+1. 创建游戏目录 `games/mygame/`
+2. 实现 `Game` 接口：
 
 ```python
-from zeroforge.core.game import Game, GameState
-from zeroforge.games.registry import register_game
-
-class MyGameState(GameState):
-    def get_legal_actions(self) -> list[int]:
-        ...
-    
-    def apply_action(self, action: int) -> "MyGameState":
-        ...
-    
-    # ... 其他必要方法
+from core.game import Game, GameState, GameMeta, ObservationSpace, ActionSpace
+from games import register_game
 
 @register_game("mygame")
 class MyGame(Game):
-    @property
-    def name(self) -> str:
-        return "mygame"
+    """我的游戏实现"""
+    
+    # === 必须实现的类方法 ===
+    
+    @classmethod
+    def get_meta(cls) -> GameMeta:
+        """返回游戏元数据"""
+        return GameMeta(
+            name="我的游戏",
+            description="游戏描述",
+            tags=["board", "strategy"],
+            min_players=2,
+            max_players=2,
+        )
+    
+    # === 必须实现的属性 ===
     
     @property
-    def action_size(self) -> int:
-        return 100  # 你的动作空间大小
+    def observation_space(self) -> ObservationSpace:
+        return ObservationSpace(shape=(C, H, W))
     
-    # ... 其他必要方法
+    @property
+    def action_space(self) -> ActionSpace:
+        return ActionSpace(n=100)
+    
+    @property
+    def num_players(self) -> int:
+        return 2
+    
+    @property
+    def supported_render_modes(self) -> list:
+        return ["text", "json"]  # 至少支持 text
+    
+    # === 必须实现的方法 ===
+    
+    def reset(self) -> np.ndarray:
+        """重置游戏，返回初始观测"""
+        ...
+    
+    def step(self, action: int) -> tuple:
+        """执行动作，返回 (obs, reward, done, info)"""
+        ...
+    
+    def legal_actions(self) -> list:
+        """返回合法动作列表"""
+        ...
+    
+    def clone(self) -> "MyGame":
+        """克隆游戏状态（用于 MCTS）"""
+        ...
+    
+    def render(self, mode: str = "text") -> Any:
+        """渲染游戏状态"""
+        if mode not in self.supported_render_modes:
+            raise ValueError(f"不支持: {mode}")
+        if mode == "text":
+            return {"type": "text", "text": "..."}
+        elif mode == "json":
+            return {"type": "grid", "cells": [...]}
 ```
 
-## API 端点
+## Web API
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/api/training/start` | POST | 启动训练 |
 | `/api/training/stop` | POST | 停止训练 |
 | `/api/training/status` | GET | 获取训练状态 |
-| `/api/games/` | GET | 列出所有游戏 |
-| `/api/games/{name}` | GET | 获取游戏详情 |
-| `/api/experiments/` | GET/POST | 实验管理 |
+| `/api/training/save` | POST | 手动保存检查点 |
+| `/api/games` | GET | 列出所有游戏 |
+| `/api/games/{id}/start` | POST | 开始对弈 |
+| `/api/games/{id}/action` | POST | 执行动作 |
+| `/api/checkpoints` | GET | 列出检查点 |
+| `/api/config/schema` | GET | 获取配置 schema |
+| `/ws/training` | WebSocket | 实时训练状态 |
 
-## 配置示例
+## 配置说明
+
+训练配置 `TrainingConfig`：
 
 ```python
-from zeroforge.core.config import TrainingConfig, MCTSConfig
+from core.training_config import TrainingConfig
 
 config = TrainingConfig(
-    game_name="tictactoe",
-    algorithm="alphazero",
-    device="cuda",  # 或 "cpu"
-    num_iterations=100,
-    games_per_iteration=100,
-    training_steps_per_iteration=100,
-    batch_size=256,
-    mcts=MCTSConfig(
-        num_simulations=800,
-        c_puct=1.5,
-    ),
+    # 游戏和算法
+    game_type="tictactoe",      # 游戏类型
+    algorithm="alphazero",      # 算法 (alphazero/muzero)
+    
+    # 网络
+    network_size="auto",        # auto/small/medium/large
+    
+    # 训练
+    num_epochs=100,             # 训练轮数
+    batch_size=128,             # 批大小
+    lr=1e-3,                    # 学习率
+    
+    # MCTS
+    num_simulations=50,         # 每步模拟次数
+    c_puct=1.5,                 # UCB 探索常数
+    
+    # 自玩
+    games_per_actor=50,         # 每轮自玩局数
+    
+    # 系统
+    device="auto",              # auto/cuda/mps/cpu
 )
 ```
 
-## 开发
-
-```bash
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 运行测试
-pytest
-
-# 代码检查
-ruff check zeroforge/
-
-# 类型检查
-mypy zeroforge/
-```
+网络大小自动选择：
+- `small`: 井字棋等小游戏（MLP，~1K 参数）
+- `medium`: 中等规模游戏（ConvNeXt 3层）
+- `large`: 中国象棋等复杂游戏（ConvNeXt 6层，~100K+ 参数）
 
 ## 技术栈
 
 - **深度学习**: PyTorch 2.x
-- **Web 框架**: FastAPI
-- **配置管理**: Pydantic v2
-- **日志**: loguru
+- **Web 后端**: FastAPI + WebSocket
+- **Web 前端**: React + Vite + Zustand
+- **配置管理**: dataclasses
 
 ## 路线图
 
-- [x] 核心框架设计
+- [x] 核心框架（Game, Algorithm, MCTS）
 - [x] AlphaZero 实现
+- [x] MuZero 实现
 - [x] 井字棋游戏
-- [x] Web API
-- [ ] MuZero 实现
-- [ ] 中国象棋游戏
+- [x] 中国象棋游戏
+- [x] Web 训练界面
+- [x] 游戏对弈功能
+- [x] 检查点管理
+- [x] 网络大小自适应
 - [ ] 分布式训练
-- [ ] Web 可视化界面
+- [ ] 更多游戏（围棋、国际象棋）
 
 ## License
 
