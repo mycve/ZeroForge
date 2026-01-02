@@ -92,8 +92,12 @@ export default function Dashboard() {
         
         <StatCard
           title="评估胜率"
-          value={`${(trainingStatus.eval_win_rate * 100).toFixed(1)}%`}
-          subtitle={`ELO: ${trainingStatus.eval_elo.toFixed(0)}`}
+          value={trainingStatus.eval_elo > 0 
+            ? `${(trainingStatus.eval_win_rate * 100).toFixed(1)}%` 
+            : '—'}
+          subtitle={trainingStatus.eval_elo > 0 
+            ? `ELO: ${trainingStatus.eval_elo.toFixed(0)}` 
+            : 'Epoch 2+ 开始评估'}
           icon={Trophy}
           color="accent"
         />

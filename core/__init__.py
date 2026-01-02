@@ -43,7 +43,7 @@ from .logging import StructuredLogger, LogEvent, LogLevel, LogCategory
 from .selfplay import ThreadedSelfPlay, EnvWorker, SelfPlayResult, SelfPlayStats
 from .replay_buffer import ReplayBuffer, PrioritizedReplayBuffer, SampleBatch
 from .checkpoint import CheckpointManager, CheckpointInfo, get_checkpoint_manager
-from .trainer import DistributedTrainer, TrainerState, AsyncSelfPlayWorker
+from .trainer import DistributedTrainer, TrainerState
 
 __all__ = [
     # Game
@@ -69,7 +69,6 @@ __all__ = [
     # Trainer
     "DistributedTrainer",
     "TrainerState",
-    "AsyncSelfPlayWorker",
     # Logging
     "StructuredLogger",
     "LogEvent",

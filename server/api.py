@@ -507,35 +507,79 @@ def _register_routes(app: FastAPI):
     
     @app.websocket("/ws/training")
     async def websocket_training(websocket: WebSocket):
-        """训练状态 WebSocket"""
+        """训练状态 WebSocket
+        
+        改进：
+        1. 服务端主动发送心跳，避免连接超时断开
+        2. 使用 asyncio.wait_for 添加接收超时
+        3. 异常处理更健壮
+        """
         await ws_manager.connect_training(websocket)
         
         # 发送当前状态
-        await websocket.send_json({
-            "type": "training_status",
-            "data": training_manager.get_status()
-        })
+        try:
+            await websocket.send_json({
+                "type": "training_status",
+                "data": training_manager.get_status()
+            })
+        except Exception as e:
+            logger.error(f"发送初始状态失败: {e}")
+            ws_manager.disconnect_training(websocket)
+            return
+        
+        # 心跳间隔（秒）
+        heartbeat_interval = 15
+        last_heartbeat = asyncio.get_event_loop().time()
         
         try:
             while True:
-                # 接收客户端消息（心跳或命令）
-                data = await websocket.receive_text()
-                msg = json.loads(data)
-                
-                if msg.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
-                elif msg.get("type") == "command":
-                    # 处理命令
-                    action = msg.get("action")
-                    if action == "start":
-                        training_manager.start()
-                    elif action == "pause":
-                        training_manager.pause()
-                    elif action == "resume":
-                        training_manager.resume()
-                    elif action == "stop":
-                        training_manager.stop()
+                try:
+                    # 带超时的接收消息，超时后发送心跳
+                    data = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=heartbeat_interval
+                    )
+                    msg = json.loads(data)
+                    
+                    if msg.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+                    elif msg.get("type") == "command":
+                        # 处理命令
+                        action = msg.get("action")
+                        if action == "start":
+                            config = system_manager.get_config()
+                            training_manager.start(config)
+                        elif action == "pause":
+                            training_manager.pause()
+                        elif action == "resume":
+                            training_manager.resume()
+                        elif action == "stop":
+                            training_manager.stop()
+                        # 立即返回新状态
+                        await websocket.send_json({
+                            "type": "training_status",
+                            "data": training_manager.get_status()
+                        })
+                        
+                except asyncio.TimeoutError:
+                    # 超时 - 发送服务端心跳保持连接
+                    current_time = asyncio.get_event_loop().time()
+                    if current_time - last_heartbeat >= heartbeat_interval:
+                        try:
+                            await websocket.send_json({
+                                "type": "heartbeat",
+                                "timestamp": current_time
+                            })
+                            last_heartbeat = current_time
+                        except Exception:
+                            # 发送失败说明连接已断开
+                            break
+                            
         except WebSocketDisconnect:
+            logger.debug("训练 WebSocket 客户端主动断开")
+        except Exception as e:
+            logger.warning(f"训练 WebSocket 异常: {e}")
+        finally:
             ws_manager.disconnect_training(websocket)
     
     @app.websocket("/ws/game/{game_id}")
@@ -824,15 +868,32 @@ def _register_routes(app: FastAPI):
             pass
 
 
+def _to_python(obj):
+    """将 numpy 类型转换为 Python 原生类型"""
+    import numpy as np
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: _to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_to_python(v) for v in obj]
+    return obj
+
+
 def _get_debug_state(game, step_index: int) -> Dict[str, Any]:
     """获取调试状态快照"""
-    return {
+    # 使用 _to_python 转换 numpy 类型
+    return _to_python({
         "step_index": step_index,
         "current_player": game.current_player(),
         "is_terminal": game.is_terminal(),
         "winner": game.get_winner(),
         "legal_actions_count": len(game.legal_actions()),
-    }
+    })
 
 
 # ============================================================

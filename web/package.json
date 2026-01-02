@@ -14,7 +14,8 @@
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
     "zustand": "^4.4.7",
-    "recharts": "^2.10.3",
+    "echarts": "^5.5.0",
+    "echarts-for-react": "^3.0.2",
     "framer-motion": "^10.16.16",
     "lucide-react": "^0.294.0",
     "clsx": "^2.0.0"

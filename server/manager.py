@@ -105,7 +105,8 @@ class TrainingManager:
     def get_status(self) -> Dict[str, Any]:
         """获取训练状态"""
         with self._lock:
-            return {
+            # 使用 _to_python 转换 numpy 类型，避免 JSON 序列化错误
+            return _to_python({
                 "running": self.status.running,
                 "paused": self.status.paused,
                 "step": self.status.step,
@@ -126,7 +127,7 @@ class TrainingManager:
                 # 架构状态
                 "buffer_size": self.status.buffer_size,
                 "num_envs": self.status.num_envs,
-            }
+            })
     
     def _add_debug(self, category: str, data: Dict[str, Any]):
         """添加调试数据"""
@@ -232,6 +233,12 @@ class TrainingManager:
                     self.status.steps_per_second = state.steps_per_second
                     self.status.elapsed_time = state.elapsed_time
                     
+                    # 评估指标（只有 eval_games > 0 才是真正评估过）
+                    eval_games = trainer_state.get("eval_games", 0)
+                    if eval_games > 0:
+                        self.status.eval_win_rate = trainer_state.get("eval_win_rate", 0)
+                        self.status.eval_elo = trainer_state.get("elo_rating", 1500)
+                    
                     # 架构状态
                     self.status.buffer_size = trainer_state.get("buffer_size", 0)
                     self.status.num_envs = config.num_envs
@@ -241,13 +248,16 @@ class TrainingManager:
                         "epoch": state.epoch,
                         "step": state.step,
                         "total_games": state.total_games,
-                        "loss": round(state.loss, 4),
-                        "value_loss": round(state.value_loss, 4),
-                        "policy_loss": round(state.policy_loss, 4),
+                        "loss": round(state.loss, 4) if state.loss else 0,
+                        "value_loss": round(state.value_loss, 4) if state.value_loss else 0,
+                        "policy_loss": round(state.policy_loss, 4) if state.policy_loss else 0,
                         "buffer_size": self.status.buffer_size,
                         "num_envs": self.status.num_envs,
-                        "games_per_second": round(state.games_per_second, 2),
-                        "steps_per_second": round(state.steps_per_second, 2),
+                        "concurrency": config.concurrency,
+                        "eval_win_rate": round(self.status.eval_win_rate, 3),
+                        "eval_elo": round(self.status.eval_elo, 1),
+                        "games_per_second": round(state.games_per_second, 2) if state.games_per_second else 0,
+                        "steps_per_second": round(state.steps_per_second, 2) if state.steps_per_second else 0,
                     })
                 
                 self._notify_subscribers()
@@ -806,7 +816,8 @@ class GameManager:
             session = self._sessions.get(session_id)
             if session is None:
                 return None
-            return {
+            # 使用 _to_python 转换 numpy 类型
+            return _to_python({
                 "id": session.id,
                 "game_type": session.game_type,
                 "num_players": session.num_players,
@@ -816,7 +827,7 @@ class GameManager:
                 "step_count": session.step_count,
                 "history": session.history,
                 "result": session.result,
-            }
+            })
     
     def update_session(self, session_id: str, **kwargs):
         """更新会话"""
@@ -877,7 +888,8 @@ class GameManager:
         if not done and not is_ai:
             self._maybe_start_ai_turn(session_id)
         
-        return {"success": True, "action": action, "done": done}
+        # 使用 _to_python 转换 numpy 类型
+        return _to_python({"success": True, "action": action, "done": done})
     
     def start_game(self, session_id: str) -> Dict[str, Any]:
         """开始游戏"""
@@ -1015,8 +1027,21 @@ class GameManager:
             if session_id in self._ai_threads:
                 del self._ai_threads[session_id]
     
-    def _ai_move_with_checkpoint(self, session_id: str, checkpoint_path: str, legal_actions: List[int]) -> int:
-        """使用检查点进行 AI 下棋"""
+    def _ai_move_with_checkpoint(
+        self, 
+        session_id: str, 
+        checkpoint_path: str, 
+        legal_actions: List[int],
+        temperature: float = 0.5,  # 中等温度，增加随机性
+    ) -> int:
+        """使用检查点进行 AI 下棋
+        
+        Args:
+            session_id: 会话 ID
+            checkpoint_path: 检查点路径
+            legal_actions: 合法动作列表
+            temperature: 动作采样温度（0=贪婪，1=按概率采样，>1=更随机）
+        """
         import torch
         import numpy as np
         import random
@@ -1061,10 +1086,20 @@ class GameManager:
                 policy_logits, value = network(obs_t)
                 policy = torch.softmax(policy_logits, dim=-1)[0].cpu().numpy()
             
-            # 选择最优合法动作
-            legal_probs = [(a, policy[a]) for a in legal_actions]
-            best_action = max(legal_probs, key=lambda x: x[1])[0]
-            return best_action
+            # 使用温度采样选择动作（而不是贪婪选择）
+            legal_probs = np.array([policy[a] for a in legal_actions])
+            
+            if temperature < 0.01:
+                # 温度接近 0，贪婪选择
+                action = legal_actions[np.argmax(legal_probs)]
+            else:
+                # 应用温度
+                legal_probs = np.power(legal_probs + 1e-8, 1.0 / temperature)
+                legal_probs = legal_probs / legal_probs.sum()
+                # 按概率采样
+                action = np.random.choice(legal_actions, p=legal_probs)
+            
+            return action
             
         except Exception as e:
             logger.error(f"检查点 AI 失败: {e}")
@@ -1109,7 +1144,7 @@ class GameManager:
             
             try:
                 render_data = session._game.render(mode=mode)
-                return {"render": render_data}
+                return _to_python({"render": render_data})
             except Exception as e:
                 return {"error": f"渲染失败: {e}"}
     
@@ -1124,7 +1159,8 @@ class GameManager:
             
             try:
                 actions = session._game.legal_actions()
-                return {"actions": actions}
+                # 使用 _to_python 转换 numpy 类型
+                return _to_python({"actions": actions})
             except Exception as e:
                 return {"error": f"获取合法动作失败: {e}"}
     

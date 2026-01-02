@@ -1,36 +1,149 @@
 import { useMemo } from 'react'
-import { 
-  LineChart, 
-  Line, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer,
-  Legend 
-} from 'recharts'
+import ReactECharts from 'echarts-for-react'
 import { useAppStore } from '../store'
 
 interface LossChartProps {
   height?: number
 }
 
+/**
+ * 训练损失图表
+ * 
+ * 交互方式：
+ * - 鼠标滚轮：缩放 X 轴
+ * - 鼠标拖拽：平移 X 轴
+ * - 双击：重置缩放
+ */
 export function LossChart({ height = 300 }: LossChartProps) {
   const { lossHistory, trainingStatus } = useAppStore()
 
-  // 构建图表数据
-  const chartData = lossHistory.length > 0 
-    ? lossHistory 
-    : [{ epoch: 0, loss: 0 }]
-  
-  // 计算 Y 轴范围：从 0 开始，最大值取数据最大值的 1.1 倍（留出空间）
-  const yDomain = useMemo(() => {
-    if (lossHistory.length === 0) return [0, 1]
-    const maxLoss = Math.max(...lossHistory.map(d => d.loss))
-    const minLoss = Math.min(...lossHistory.map(d => d.loss))
-    // 如果最大值很小，设置一个最小范围
-    const upperBound = Math.max(maxLoss * 1.1, 0.1)
-    return [0, upperBound]
+  // 构建图表配置
+  const option = useMemo(() => {
+    const data = lossHistory.length > 0 
+      ? lossHistory.map(d => [d.epoch, d.loss])
+      : [[0, 0]]
+    
+    return {
+      // 背景透明
+      backgroundColor: 'transparent',
+      
+      // 提示框
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: '#1a1a24',
+        borderColor: '#2a2a3a',
+        borderWidth: 1,
+        textStyle: {
+          color: '#888',
+        },
+        formatter: (params: any) => {
+          const p = params[0]
+          return `<div style="padding: 4px 8px;">
+            <div style="color: #888; margin-bottom: 4px;">Epoch ${p.data[0]}</div>
+            <div style="color: #00d4aa; font-weight: bold;">损失: ${p.data[1].toFixed(4)}</div>
+          </div>`
+        },
+      },
+      
+      // 图例（移到右上角避免重叠）
+      legend: {
+        show: true,
+        top: 0,
+        right: 0,
+        textStyle: {
+          color: '#666',
+        },
+      },
+      
+      // 网格
+      grid: {
+        left: 50,
+        right: 20,
+        top: 30,
+        bottom: 30,
+      },
+      
+      // X 轴
+      xAxis: {
+        type: 'value',
+        axisLine: {
+          lineStyle: {
+            color: '#333',
+          },
+        },
+        axisLabel: {
+          color: '#666',
+          formatter: (value: number) => `E${Math.round(value)}`,
+        },
+        splitLine: {
+          show: false,
+        },
+      },
+      
+      // Y 轴
+      yAxis: {
+        type: 'value',
+        axisLine: {
+          lineStyle: {
+            color: '#333',
+          },
+        },
+        axisLabel: {
+          color: '#666',
+          formatter: (value: number) => value.toFixed(2),
+        },
+        splitLine: {
+          lineStyle: {
+            color: 'rgba(255,255,255,0.05)',
+            type: 'dashed',
+          },
+        },
+        min: 0,
+      },
+      
+      // 数据缩放 - 鼠标滚轮缩放 X 轴
+      dataZoom: [
+        {
+          type: 'inside',      // 内置缩放（鼠标滚轮 + 拖拽）
+          xAxisIndex: 0,
+          filterMode: 'none',
+          zoomOnMouseWheel: true,  // 滚轮缩放
+          moveOnMouseMove: true,   // 按住鼠标移动平移
+          moveOnMouseWheel: false, // 禁止滚轮平移
+        },
+      ],
+      
+      // 数据系列
+      series: [
+        {
+          name: '总损失',
+          type: 'line',
+          smooth: true,
+          showSymbol: false,
+          lineStyle: {
+            color: '#00d4aa',
+            width: 2,
+          },
+          areaStyle: {
+            color: {
+              type: 'linear',
+              x: 0,
+              y: 0,
+              x2: 0,
+              y2: 1,
+              colorStops: [
+                { offset: 0, color: 'rgba(0, 212, 170, 0.3)' },
+                { offset: 1, color: 'rgba(0, 212, 170, 0)' },
+              ],
+            },
+          },
+          emphasis: {
+            focus: 'series',
+          },
+          data: data,
+        },
+      ],
+    }
   }, [lossHistory])
 
   return (
@@ -38,58 +151,19 @@ export function LossChart({ height = 300 }: LossChartProps) {
       <div className="flex items-center justify-between mb-4">
         <h3 className="text-lg font-semibold font-display">训练损失</h3>
         <div className="flex items-center gap-4 text-sm">
+          <span className="text-gray-500 text-xs">滚轮缩放 | 拖拽平移</span>
           <span className="text-gray-400">
             当前: <span className="text-accent">{trainingStatus.loss.toFixed(4)}</span>
           </span>
         </div>
       </div>
       
-      <ResponsiveContainer width="100%" height={height}>
-        <LineChart data={chartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
-          <CartesianGrid 
-            strokeDasharray="3 3" 
-            stroke="rgba(255,255,255,0.05)" 
-            vertical={false}
-          />
-          <XAxis 
-            dataKey="epoch" 
-            stroke="#666"
-            tick={{ fill: '#666', fontSize: 12 }}
-            tickFormatter={(value) => `E${value}`}
-          />
-          <YAxis 
-            stroke="#666"
-            tick={{ fill: '#666', fontSize: 12 }}
-            tickFormatter={(value) => value.toFixed(2)}
-            domain={yDomain}
-          />
-          <Tooltip
-            contentStyle={{
-              backgroundColor: '#1a1a24',
-              border: '1px solid #2a2a3a',
-              borderRadius: '8px',
-              padding: '12px',
-            }}
-            labelStyle={{ color: '#888' }}
-            itemStyle={{ color: '#00d4aa' }}
-            formatter={(value: number) => [value.toFixed(4), '损失']}
-            labelFormatter={(label) => `Epoch ${label}`}
-          />
-          <Legend 
-            wrapperStyle={{ paddingTop: '20px' }}
-          />
-          <Line
-            type="monotone"
-            dataKey="loss"
-            name="总损失"
-            stroke="#00d4aa"
-            strokeWidth={2}
-            dot={false}
-            activeDot={{ r: 4, fill: '#00d4aa' }}
-          />
-        </LineChart>
-      </ResponsiveContainer>
+      <ReactECharts
+        option={option}
+        style={{ height: height }}
+        opts={{ renderer: 'canvas' }}
+        notMerge={true}
+      />
     </div>
   )
 }
-
