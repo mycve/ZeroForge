@@ -478,15 +478,23 @@ class DistributedTrainer:
                         logger.warning(f"Worker {worker_id}: 游戏超过 500 步，强制结束")
                         break
                 
-                # 设置奖励
+                # 设置奖励（MuZero 需要即时奖励，AlphaZero 需要终局奖励）
                 winner = game.get_winner()
-                for i, player in enumerate(trajectory.to_play):
+                num_steps = len(trajectory.to_play)
+                
+                # 中间步骤奖励为 0
+                for i in range(num_steps - 1):
+                    trajectory.rewards[i] = 0.0
+                
+                # 终局步骤奖励为游戏结果（从该步玩家视角）
+                if num_steps > 0:
+                    last_player = trajectory.to_play[-1]
                     if winner is None:
-                        trajectory.rewards[i] = 0.0
-                    elif player == winner:
-                        trajectory.rewards[i] = 1.0
+                        trajectory.rewards[-1] = 0.0  # 和棋
+                    elif last_player == winner:
+                        trajectory.rewards[-1] = 1.0  # 该玩家赢了
                     else:
-                        trajectory.rewards[i] = -1.0
+                        trajectory.rewards[-1] = -1.0  # 该玩家输了
                 
                 with results_lock:
                     trajectories.append(trajectory)
@@ -570,12 +578,18 @@ class DistributedTrainer:
     def _run_training_phase(self, new_trajectories: List[Trajectory]) -> Dict[str, float]:
         """训练阶段：80% 新数据 + 20% 经验池
         
+        根据算法类型选择训练方式：
+        - AlphaZero: 直接前向传播，计算 policy + value loss
+        - MuZero: 使用 dynamics unroll，计算 policy + value + reward loss
+        
         Args:
             new_trajectories: 本轮自玩生成的新轨迹
             
         Returns:
             训练指标
         """
+        from algorithms import make_algorithm
+        
         # 确保网络在正确设备上（训练模式）
         base_network = self._network.module if self._is_distributed else self._network
         base_network.to(self._device)
@@ -586,44 +600,71 @@ class DistributedTrainer:
         
         # 计算采样数量
         total_batch_size = self.config.batch_size
-        new_data_ratio = self.config.new_data_ratio
         
-        # 新数据数量
-        new_data_steps = sum(len(t) for t in new_trajectories)
-        
-        # 如果经验池太小，全用新数据
+        # 如果经验池太小，等待更多数据
         if len(self._replay_buffer) < self.config.min_buffer_size:
             logger.debug(f"经验池太小 ({len(self._replay_buffer)}), 等待更多数据")
-            return {"total_loss": 0, "value_loss": 0, "policy_loss": 0}
+            return {"total_loss": 0, "value_loss": 0, "policy_loss": 0, "reward_loss": 0}
+        
+        # 获取算法实例
+        algo = make_algorithm(self.config.algorithm)
+        is_muzero = algo.needs_dynamics  # MuZero 需要 dynamics 网络
+        
+        # MuZero 使用展开步数，AlphaZero 不需要
+        unroll_steps = getattr(algo.config, 'num_unroll_steps', 0) if is_muzero else 0
         
         total_loss = 0.0
         value_loss_sum = 0.0
         policy_loss_sum = 0.0
+        reward_loss_sum = 0.0
         num_batches = max(1, self.config.train_batches_per_epoch)
         
         for batch_idx in range(num_batches):
             if self._stop_event.is_set():
                 break
             
-            # 从经验池采样（包含新旧数据）
-            # ReplayBuffer 内部会自动混合新旧数据
+            # 从经验池采样
             batch = self._replay_buffer.sample(
                 batch_size=total_batch_size,
-                unroll_steps=0,
+                unroll_steps=unroll_steps,
             )
             
-            # 转换为 tensor
-            obs = torch.from_numpy(batch.observations).to(self._device)
-            target_policy = torch.from_numpy(batch.target_policies[:, 0, :]).to(self._device)
-            target_value = torch.from_numpy(batch.target_values[:, 0]).to(self._device)
-            
-            # 前向传播
-            policy_logits, value = self._network(obs)
-            
-            # 计算损失
-            policy_loss = F.cross_entropy(policy_logits, target_policy)
-            value_loss = F.mse_loss(value.squeeze(-1), target_value)
-            loss = policy_loss + value_loss
+            if is_muzero:
+                # MuZero 训练：使用算法的 compute_loss
+                # 转换 batch 为 TrainingTargets 格式
+                from algorithms.muzero.algorithm import TrainingTargets
+                
+                targets = TrainingTargets(
+                    observations=torch.from_numpy(batch.observations).to(self._device),
+                    actions=torch.from_numpy(batch.actions).to(self._device),
+                    target_values=torch.from_numpy(batch.target_values).to(self._device),
+                    target_rewards=torch.from_numpy(batch.target_rewards).to(self._device),
+                    target_policies=torch.from_numpy(batch.target_policies).to(self._device),
+                    masks=torch.from_numpy(batch.masks).to(self._device),
+                )
+                
+                # 使用算法计算损失
+                loss, metrics = algo.compute_loss(base_network, targets)
+                
+                value_loss_sum += metrics.get("value_loss", 0)
+                policy_loss_sum += metrics.get("policy_loss", 0)
+                reward_loss_sum += metrics.get("reward_loss", 0)
+            else:
+                # AlphaZero 训练：直接前向传播
+                obs = torch.from_numpy(batch.observations).to(self._device)
+                target_policy = torch.from_numpy(batch.target_policies[:, 0, :]).to(self._device)
+                target_value = torch.from_numpy(batch.target_values[:, 0]).to(self._device)
+                
+                # 前向传播
+                policy_logits, value = base_network(obs)
+                
+                # 计算损失
+                policy_loss = F.cross_entropy(policy_logits, target_policy)
+                value_loss = F.mse_loss(value.squeeze(-1), target_value)
+                loss = policy_loss + value_loss
+                
+                value_loss_sum += value_loss.item()
+                policy_loss_sum += policy_loss.item()
             
             # 反向传播
             self._optimizer.zero_grad()
@@ -632,8 +673,6 @@ class DistributedTrainer:
             self._optimizer.step()
             
             total_loss += loss.item()
-            value_loss_sum += value_loss.item()
-            policy_loss_sum += policy_loss.item()
             
             with self._lock:
                 self.state.step += 1
@@ -642,6 +681,7 @@ class DistributedTrainer:
             "total_loss": total_loss / num_batches,
             "value_loss": value_loss_sum / num_batches,
             "policy_loss": policy_loss_sum / num_batches,
+            "reward_loss": reward_loss_sum / num_batches,
         }
     
     def _run_eval_phase(self) -> Dict[str, float]:

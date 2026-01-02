@@ -97,8 +97,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # 克隆仓库
 git clone https://github.com/your-repo/ZeroForge.git
 cd ZeroForge
-
-# 同步依赖（自动创建虚拟环境）
+uv venv --python cpython-3.14.2+freethreaded-linux-x86_64-gnu
+# 同步依赖
 uv sync
 ```
 
@@ -106,7 +106,7 @@ uv sync
 
 ```bash
 # 启动后端 API 服务
-uv run python main.py server
+uv run python -Xgil=0 main.py server
 
 # 或指定端口
 uv run uvicorn server.api:app --reload --port 8000
