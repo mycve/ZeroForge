@@ -719,7 +719,15 @@ class DistributedTrainer:
         def select_action_with_temperature(policy: np.ndarray, legal_actions: List[int], temp: float) -> int:
             """使用温度采样选择动作"""
             # 提取合法动作的概率
-            legal_probs = np.array([policy[a] for a in legal_actions])
+            legal_probs = np.array([policy[a] for a in legal_actions], dtype=np.float64)
+            
+            # 处理全零或负数情况
+            legal_probs = np.maximum(legal_probs, 0)
+            prob_sum = legal_probs.sum()
+            
+            if prob_sum < 1e-10:
+                # 概率太小，均匀分布
+                return np.random.choice(legal_actions)
             
             if temp < 0.01:
                 # 温度接近0，选择最大概率
@@ -727,7 +735,16 @@ class DistributedTrainer:
             
             # 应用温度
             legal_probs = np.power(legal_probs, 1.0 / temp)
-            legal_probs = legal_probs / (legal_probs.sum() + 1e-8)
+            
+            # 归一化（确保严格等于 1）
+            prob_sum = legal_probs.sum()
+            if prob_sum < 1e-10:
+                return np.random.choice(legal_actions)
+            legal_probs = legal_probs / prob_sum
+            
+            # 修正浮点误差，确保和为 1
+            legal_probs[-1] = 1.0 - legal_probs[:-1].sum()
+            legal_probs = np.clip(legal_probs, 0, 1)
             
             # 采样
             return np.random.choice(legal_actions, p=legal_probs)
