@@ -94,6 +94,68 @@ games/
         └── svg.py           # SVG 渲染
 ```
 
+### 游戏渲染格式规范
+
+游戏的 `render(mode="json")` 方法返回的数据用于 Web 前端展示。对于网格类游戏（棋盘游戏），必须遵循 `GridRenderData` 格式：
+
+```python
+# GridRenderData 格式
+{
+    "type": "grid",                    # 必须为 "grid"
+    "rows": int,                       # 行数
+    "cols": int,                       # 列数
+    "cells": list[list[any]],          # 二维数组，每个元素是格子内容（None/字符串/数字）
+    "cell_colors": list[list[str]],    # 可选，格子颜色
+    "highlights": list[tuple[int, int]],  # ⚠️ 高亮格子，格式为 [(row, col), ...]
+    "labels": {                        # 可选，坐标标签
+        "row": list[str],
+        "col": list[str],
+    },
+    # ... 其他游戏特定字段
+}
+```
+
+#### ⚠️ 重要注意事项
+
+**`highlights` 字段格式要求**：
+
+```python
+# ✅ 正确格式 - 元组列表
+highlights = [(row, col), ...]
+# 例如: [(4, 4), (5, 3)]
+
+# ❌ 错误格式 - 对象列表（会导致前端报错！）
+highlights = [{"row": row, "col": col}, ...]
+```
+
+前端使用解构语法 `([r, c])` 读取坐标，因此 `highlights` **必须**是可迭代的二元组列表。Python 元组在 JSON 序列化后会变成数组 `[[row, col], ...]`，这是前端期望的格式。
+
+**完整示例**：
+
+```python
+def render(self, mode: str = "json") -> dict:
+    if mode == "json":
+        # 构建高亮列表 - 使用元组格式
+        highlights: List[Tuple[int, int]] = []
+        if self.last_move is not None:
+            row, col = self._action_to_position(self.last_move)
+            highlights.append((row, col))  # ✅ 元组
+        
+        return {
+            "type": "grid",
+            "rows": self.board_size,
+            "cols": self.board_size,
+            "cells": cells,
+            "highlights": highlights,  # JSON 序列化后变成 [[row, col], ...]
+            "labels": {
+                "row": [str(i) for i in range(self.board_size)],
+                "col": [str(i) for i in range(self.board_size)],
+            },
+        }
+```
+
+---
+
 ### 添加新游戏指南
 
 1. **创建游戏目录**:

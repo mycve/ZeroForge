@@ -397,7 +397,7 @@ class MyGame(Game):
 
 ## 技术栈
 
-- **深度学习**: PyTorch 2.x + DDP
+- **深度学习**: PyTorch 2.9.1 + DDP
 - **并行**: Python threading + GPU 批推理
 - **Web 后端**: FastAPI + WebSocket
 - **Web 前端**: React + Vite + Zustand

@@ -516,13 +516,33 @@ class Game(ABC):
         
         Returns:
             渲染结果，类型取决于 mode:
-            - text/human: str
-            - json: dict
-            - svg: str
+            - text/human: str 或 {"type": "text", "text": str}
+            - json: dict (见下方 GridRenderData 格式)
+            - svg: str 或 {"type": "svg", "svg": str}
             - rgb_array: np.ndarray
         
         Raises:
             ValueError: 如果 mode 不在 supported_render_modes 中
+        
+        JSON 模式返回格式（GridRenderData）:
+            当 type="grid" 时，用于网格类游戏（棋盘游戏等）:
+            {
+                "type": "grid",
+                "rows": int,                    # 行数
+                "cols": int,                    # 列数
+                "cells": list[list[any]],       # 二维数组，每个元素是格子内容
+                "cell_colors": list[list[str]], # 可选，格子颜色
+                "highlights": list[tuple[int, int]],  # ⚠️ 高亮格子坐标，格式为 [(row, col), ...]
+                "labels": {                     # 可选，坐标标签
+                    "row": list[str],
+                    "col": list[str],
+                },
+                ... # 其他游戏特定字段
+            }
+            
+            ⚠️ 注意: highlights 必须是元组列表 [(row, col), ...]，
+            不能是对象列表 [{"row": r, "col": c}, ...]！
+            前端会使用解构语法 ([r, c]) 来读取坐标。
         
         Example:
             def render(self, mode: str = "text") -> Any:
@@ -531,7 +551,16 @@ class Game(ABC):
                 if mode == "text":
                     return self._render_text()
                 elif mode == "json":
-                    return self._render_json()
+                    # 正确的 highlights 格式
+                    highlights = [(row, col)]  # ✓ 元组列表
+                    # 错误: highlights = [{"row": row, "col": col}]  # ✗
+                    return {
+                        "type": "grid",
+                        "rows": self.board_size,
+                        "cols": self.board_size,
+                        "cells": cells,
+                        "highlights": highlights,
+                    }
         """
         ...
     

@@ -17,6 +17,22 @@ Games - 游戏实现模块
 - supported_render_modes: 返回支持的渲染模式（至少 'text' 或 'human'）
 - render(mode): 渲染游戏状态
 
+渲染格式规范 (render mode="json"):
+    对于网格类游戏，render(mode="json") 返回 GridRenderData 格式:
+    {
+        "type": "grid",
+        "rows": int,
+        "cols": int,
+        "cells": list[list[any]],
+        "highlights": list[tuple[int, int]],  # ⚠️ 必须是元组列表 [(row, col), ...]
+        ...
+    }
+    
+    ⚠️ 重要: highlights 必须是元组列表，不能是对象列表！
+    
+    正确: highlights = [(4, 4), (5, 3)]
+    错误: highlights = [{"row": 4, "col": 4}]  # 会导致前端报错！
+
 使用方法:
     >>> from games import make_game, list_games
     >>> game = make_game("tictactoe")
@@ -287,6 +303,7 @@ def get_game_debug_info(game: Game) -> Dict[str, Any]:
 
 from .chinese_chess import ChineseChessGame
 from .tictactoe import TicTacToeGame
+from .gomoku import Gomoku9x9Game, Gomoku15x15Game
 
 __all__ = [
     # 注册系统
@@ -300,4 +317,6 @@ __all__ = [
     # 内置游戏
     "ChineseChessGame",
     "TicTacToeGame",
+    "Gomoku9x9Game",
+    "Gomoku15x15Game",
 ]
