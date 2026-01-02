@@ -2,10 +2,10 @@
  * GameBoard - 通用游戏渲染组件
  * 
  * 支持多种渲染模式:
- * - grid: 网格类游戏（井字棋、围棋等）
- * - svg: 后端返回 SVG
+ * - grid: 网格类游戏（井字棋、围棋、五子棋等）
+ * - svg: 后端返回 SVG（中国象棋等）
  * - text: 文本渲染
- * - custom: 自定义渲染（中国象棋等）
+ * - image: 图像渲染（Gymnasium/Atari 游戏等）
  */
 
 import { useState, useCallback, useEffect, useMemo } from 'react'
@@ -29,8 +29,20 @@ interface GridRenderData {
   }
 }
 
+// 图像渲染数据（Gymnasium/Atari 游戏）
+interface ImageRenderData {
+  type: 'image'
+  image_base64?: string      // Base64 编码的图像
+  image_width?: number       // 图像宽度
+  image_height?: number      // 图像高度
+  env_id?: string            // 环境 ID
+  step_count?: number        // 步数
+  total_reward?: number      // 累计奖励
+  is_terminal?: boolean      // 是否结束
+}
+
 // 通用渲染数据
-type RenderData = GridRenderData | { type: 'svg'; svg: string } | { type: 'text'; text: string } | unknown
+type RenderData = GridRenderData | ImageRenderData | { type: 'svg'; svg: string } | { type: 'text'; text: string } | unknown
 
 interface GameBoardProps {
   renderData?: RenderData
@@ -317,6 +329,87 @@ function TextRenderer({ text, className }: { text: string; className?: string })
 }
 
 // ============================================================
+// 图像渲染器（Gymnasium/Atari 游戏）
+// ============================================================
+
+function ImageRenderer({ data, className }: { data: ImageRenderData; className?: string }) {
+  const { image_base64, image_width, image_height, env_id, step_count, total_reward, is_terminal } = data
+  
+  // 调试：检查数据
+  if (!image_base64) {
+    console.warn('[ImageRenderer] 没有图像数据:', { 
+      env_id, 
+      step_count, 
+      image_width, 
+      image_height, 
+      render_error: (data as Record<string, unknown>).render_error,
+      dataKeys: Object.keys(data) 
+    })
+  }
+  
+  return (
+    <div className={`flex flex-col items-center ${className || ''}`}>
+      {/* 游戏图像 */}
+      {image_base64 ? (
+        <div className="relative bg-black rounded-lg overflow-hidden">
+          <img
+            src={`data:image/png;base64,${image_base64}`}
+            alt={env_id || 'Game'}
+            width={image_width || 400}
+            height={image_height || 400}
+            className="block"
+            style={{ 
+              imageRendering: 'auto',  // 使用默认渲染，更清晰
+              maxWidth: '100%',
+              maxHeight: '500px',
+              objectFit: 'contain',
+            }}
+          />
+          {is_terminal && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+              <span className="text-2xl font-bold text-white">游戏结束</span>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="w-96 h-64 bg-bg-elevated rounded-lg flex flex-col items-center justify-center text-gray-500 border border-gray-700 p-4">
+          <span>暂无图像</span>
+          {(data as Record<string, unknown>).render_error && (
+            <span className="text-xs text-red-400 mt-2 text-center">
+              {String((data as Record<string, unknown>).render_error)}
+            </span>
+          )}
+        </div>
+      )}
+      
+      {/* 游戏信息 */}
+      <div className="mt-4 grid grid-cols-3 gap-4 text-sm">
+        {env_id && (
+          <div className="text-center">
+            <div className="text-gray-500">环境</div>
+            <div className="font-mono text-accent">{env_id}</div>
+          </div>
+        )}
+        {step_count !== undefined && (
+          <div className="text-center">
+            <div className="text-gray-500">步数</div>
+            <div className="font-mono">{step_count}</div>
+          </div>
+        )}
+        {total_reward !== undefined && (
+          <div className="text-center">
+            <div className="text-gray-500">奖励</div>
+            <div className={`font-mono ${total_reward >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {total_reward.toFixed(1)}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // 主组件
 // ============================================================
 
@@ -387,12 +480,26 @@ export function GameBoard({
     if (data.type === 'text' && 'text' in renderData) {
       return <TextRenderer text={(renderData as { text: string }).text} className={className} />
     }
+    
+    if (data.type === 'image') {
+      return (
+        <div className={`flex justify-center ${className}`}>
+          <ImageRenderer data={renderData as ImageRenderData} />
+        </div>
+      )
+    }
   }
   
-  // 未知格式，显示 JSON
+  // 未知格式，显示 JSON（用于调试）
+  const typeInfo = typeof renderData === 'object' && renderData !== null && 'type' in renderData 
+    ? (renderData as {type: string}).type 
+    : '无type字段'
+  
   return (
     <div className={`bg-bg-elevated rounded-xl p-4 ${className}`}>
-      <div className="text-sm text-gray-400 mb-2">原始数据:</div>
+      <div className="text-sm text-gray-400 mb-2">
+        未识别的渲染格式 (type: {typeInfo})
+      </div>
       <pre className="font-mono text-xs overflow-auto max-h-64">
         {JSON.stringify(renderData, null, 2)}
       </pre>
@@ -404,5 +511,5 @@ export function GameBoard({
 // 导出辅助组件
 // ============================================================
 
-export { GridRenderer, SVGRenderer, TextRenderer }
-export type { GridRenderData, RenderData, GameBoardProps }
+export { GridRenderer, SVGRenderer, TextRenderer, ImageRenderer }
+export type { GridRenderData, ImageRenderData, RenderData, GameBoardProps }

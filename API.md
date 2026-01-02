@@ -6,6 +6,7 @@
 
 - [核心概念](#核心概念)
 - [游戏模块 API](#游戏模块-api) ⭐ 新增
+- [Gymnasium 游戏支持](#gymnasium-游戏支持) ⭐ 新增
 - [游戏调试 API](#游戏调试-api) ⭐ 新增
 - [训练器 API](#训练器-api)
 - [算法 API](#算法-api)
@@ -259,6 +260,191 @@ print(info)
 #     'player_type': 'TWO_PLAYER'
 # }
 ```
+
+---
+
+## Gymnasium 游戏支持
+
+ZeroForge 支持所有 Gymnasium 兼容环境，包括 Atari、经典控制、MuJoCo 等。
+
+### 依赖安装
+
+```bash
+# 基础 Gymnasium（经典控制游戏）
+pip install gymnasium
+
+# Atari 游戏
+pip install gymnasium[atari] ale-py
+
+# MuJoCo 物理仿真
+pip install gymnasium[mujoco]
+
+# 一次性安装所有
+pip install gymnasium[atari,mujoco] ale-py
+```
+
+### 使用方式
+
+#### 方式1: 预设游戏（推荐）
+
+```python
+from games import make_game, list_games
+
+# 查看所有可用游戏
+print(list_games())
+# ['chinese_chess', 'tictactoe', 'gomoku_9x9', 'gomoku_15x15',
+#  'atari_breakout', 'atari_pong', 'gym_cartpole', 'gym_lunarlander', ...]
+
+# 创建 Atari 游戏
+game = make_game("atari_breakout")
+obs = game.reset()
+print(obs.shape)  # (4, 84, 84) - 4帧灰度图
+
+# 创建经典控制游戏
+game = make_game("gym_cartpole")
+obs = game.reset()
+action = game.legal_actions()[0]
+obs, reward, done, info = game.step(action)
+```
+
+#### 方式2: 自定义配置
+
+```python
+from games.gymnasium import GymnasiumWrapper, AtariConfig
+
+# 使用配置类
+config = AtariConfig(
+    env_id="ALE/Breakout-v5",
+    frame_stack=4,        # 帧堆叠
+    frame_skip=4,         # 跳帧
+    grayscale=True,       # 灰度化
+    resize=(84, 84),      # 缩放
+    clip_rewards=True,    # 奖励裁剪
+)
+game = GymnasiumWrapper(config=config)
+
+# 或直接指定环境 ID
+game = GymnasiumWrapper("CartPole-v1")
+game = GymnasiumWrapper("LunarLander-v3")
+```
+
+#### 方式3: 任意 Gymnasium 环境
+
+```python
+import gymnasium as gym
+from games.gymnasium import GymnasiumWrapper
+
+# 包装任意 Gymnasium 环境
+env = gym.make("MyCustomEnv-v0")
+game = GymnasiumWrapper(env=env)
+```
+
+### 预设游戏列表
+
+#### Atari 游戏
+
+| 游戏名称 | 环境 ID | 描述 |
+|---------|---------|------|
+| `atari_breakout` | ALE/Breakout-v5 | 打砖块 |
+| `atari_pong` | ALE/Pong-v5 | 乒乓球 |
+| `atari_spaceinvaders` | ALE/SpaceInvaders-v5 | 太空侵略者 |
+| `atari_qbert` | ALE/Qbert-v5 | Q*bert |
+| `atari_mspacman` | ALE/MsPacman-v5 | 吃豆人 |
+| `atari_asteroids` | ALE/Asteroids-v5 | 小行星 |
+| `atari_seaquest` | ALE/Seaquest-v5 | 深海探险 |
+| `atari_beamrider` | ALE/BeamRider-v5 | 光束骑士 |
+| `atari_enduro` | ALE/Enduro-v5 | 耐力赛车 |
+| `atari_freeway` | ALE/Freeway-v5 | 穿越高速公路 |
+
+#### 经典控制游戏
+
+| 游戏名称 | 环境 ID | 描述 |
+|---------|---------|------|
+| `gym_cartpole` | CartPole-v1 | 平衡倒立摆 |
+| `gym_lunarlander` | LunarLander-v3 | 月球着陆器 |
+| `gym_mountaincar` | MountainCar-v0 | 爬山车 |
+| `gym_acrobot` | Acrobot-v1 | 双摆机器人 |
+| `gym_pendulum` | Pendulum-v1 | 倒立摆（连续控制） |
+
+#### MuJoCo 物理仿真
+
+| 游戏名称 | 环境 ID | 描述 |
+|---------|---------|------|
+| `mujoco_ant` | Ant-v5 | 四足蚂蚁 |
+| `mujoco_halfcheetah` | HalfCheetah-v5 | 猎豹 |
+| `mujoco_hopper` | Hopper-v5 | 单腿跳跃 |
+| `mujoco_walker2d` | Walker2d-v5 | 双足行走 |
+| `mujoco_humanoid` | Humanoid-v5 | 人形机器人 |
+| `mujoco_swimmer` | Swimmer-v5 | 游泳者 |
+
+### 算法选择
+
+Gymnasium 环境的特殊性在于部分环境不支持深拷贝（clone），这会影响传统 MCTS 的使用。
+
+```python
+game = make_game("atari_breakout")
+
+# 检查是否支持传统 MCTS
+print(game.supports_mcts)  # True/False
+
+# 获取推荐算法
+print(game.recommended_algorithm)  # "alphazero" 或 "gumbel_muzero"
+```
+
+#### 算法对比
+
+| 算法 | 需要 clone | 适用场景 |
+|------|-----------|---------|
+| AlphaZero | 是 | 棋类游戏、支持 clone 的环境 |
+| MCTS | 是 | 同上 |
+| **Gumbel MuZero** | **否** | 所有环境，特别是不支持 clone 的 |
+| **Gumbel AlphaZero** | **否** | 同上 |
+| **Gumbel EfficientZero** | **否** | 同上，更高效的样本利用 |
+
+Gumbel 系列算法使用 Gumbel-Top-k 技巧进行策略改进，不需要完整的 MCTS 树搜索，因此可以在不支持 clone 的环境中使用。
+
+### 配置参数
+
+```python
+from games.gymnasium import GymnasiumConfig
+
+config = GymnasiumConfig(
+    # 环境
+    env_id="CartPole-v1",       # Gymnasium 环境 ID
+    
+    # 观测预处理
+    frame_stack=4,              # 帧堆叠数量
+    frame_skip=4,               # 跳帧数量
+    grayscale=True,             # 灰度化（图像环境）
+    resize=(84, 84),            # 缩放大小
+    normalize_obs=True,         # 归一化到 [0, 1]
+    
+    # 奖励处理
+    clip_rewards=True,          # 裁剪奖励到 [-1, 1]
+    reward_scale=1.0,           # 奖励缩放
+    
+    # Atari 特定
+    terminal_on_life_loss=True, # 生命丢失视为终止
+    noop_max=30,                # 开始时随机 NOOP
+    
+    # 连续动作空间
+    discrete_bins=11,           # 离散化 bins 数量
+)
+```
+
+### 连续动作空间处理
+
+对于 MuJoCo 等连续控制环境，ZeroForge 自动将连续动作空间离散化：
+
+```python
+# 原始: Box(-1, 1, shape=(3,))
+# 离散化: Discrete(11^3 = 1331)
+
+game = make_game("mujoco_ant")
+print(game.action_space.n)  # 1331 (11^3, 3维动作空间)
+```
+
+每个维度离散化为 `discrete_bins` 个动作（默认 11），映射为均匀分布的值。
 
 ---
 

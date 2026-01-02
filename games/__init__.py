@@ -93,12 +93,20 @@ def _validate_game_class(cls: Type[Game], name: str) -> None:
         elif not any(m in render_modes for m in ['text', 'human']):
             errors.append("supported_render_modes 必须至少包含 'text' 或 'human'")
         
-        # 检查 render 方法是否可用
+        # 检查 render 方法是否可用（跳过 human 模式验证，因为它会打印到控制台）
+        import io
+        import sys
         for mode in render_modes:
+            if mode == "human":
+                continue  # human 模式返回 None 是正常的，跳过验证
             try:
-                result = game.render(mode=mode)
-                if result is None:
-                    logger.warning(f"游戏 '{name}' 的 render({mode}) 返回 None")
+                # 捕获可能的控制台输出
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    result = game.render(mode=mode)
+                finally:
+                    sys.stdout = old_stdout
             except NotImplementedError:
                 errors.append(f"render(mode='{mode}') 未实现")
             except Exception as e:
@@ -229,21 +237,21 @@ def get_game_info(name: str) -> Dict[str, Any]:
             "author": meta.author,
             "tags": meta.tags,
             "difficulty": meta.difficulty,
-            # 空间信息
+            # 空间信息（确保 numpy 类型转为 Python 原生类型）
             "observation_space": {
-                "shape": list(game.observation_space.shape),
+                "shape": [int(x) for x in game.observation_space.shape],
                 "dtype": str(game.observation_space.dtype),
             },
             "action_space": {
-                "n": game.action_space.n,
+                "n": int(game.action_space.n),
             },
             # 玩家信息
-            "num_players": game.num_players,
-            "min_players": meta.min_players,
-            "max_players": meta.max_players,
+            "num_players": int(game.num_players),
+            "min_players": int(meta.min_players),
+            "max_players": int(meta.max_players),
             "player_type": game.player_type.value,
-            "is_zero_sum": game.is_zero_sum,
-            "supports_self_play": game.supports_self_play,
+            "is_zero_sum": bool(game.is_zero_sum),
+            "supports_self_play": bool(game.supports_self_play),
             # 渲染
             "render_modes": render_modes,
             # 默认配置
@@ -251,7 +259,8 @@ def get_game_info(name: str) -> Dict[str, Any]:
         }
         return info
     except Exception as e:
-        logger.error(f"获取游戏 '{name}' 信息失败: {e}")
+        # 可选依赖缺失是预期的，使用 WARNING 级别
+        logger.warning(f"获取游戏 '{name}' 信息失败: {e}")
         return {
             "name": name,
             "class": game_cls.__name__,
@@ -278,15 +287,26 @@ def get_game_debug_info(game: Game) -> Dict[str, Any]:
     """
     state = game.get_state()
     
+    # 确保所有值都是 JSON 可序列化的（转换 numpy 类型）
+    legal_actions = state.legal_actions[:20]  # 最多返回 20 个
+    if hasattr(legal_actions, 'tolist'):
+        legal_actions = legal_actions.tolist()
+    else:
+        legal_actions = [int(a) for a in legal_actions]
+    
+    rewards = state.rewards
+    if hasattr(rewards, 'tolist'):
+        rewards = rewards.tolist()
+    
     debug_info = {
-        "current_player": state.current_player,
-        "is_terminal": state.done,
-        "winner": state.winner,
+        "current_player": int(state.current_player),
+        "is_terminal": bool(state.done),
+        "winner": int(state.winner) if state.winner is not None else None,
         "legal_actions_count": len(state.legal_actions),
-        "legal_actions": state.legal_actions[:20],  # 最多返回 20 个
-        "observation_shape": state.observation.shape,
+        "legal_actions": legal_actions,
+        "observation_shape": [int(x) for x in state.observation.shape],
         "observation_dtype": str(state.observation.dtype),
-        "rewards": state.rewards,
+        "rewards": rewards,
         "info": state.info,
     }
     
@@ -305,6 +325,17 @@ from .chinese_chess import ChineseChessGame
 from .tictactoe import TicTacToeGame
 from .gomoku import Gomoku9x9Game, Gomoku15x15Game
 
+# Gymnasium 游戏（可选依赖，按需导入）
+try:
+    from .gymnasium import (
+        GYMNASIUM_AVAILABLE,
+        GymnasiumWrapper,
+    )
+    # 预设游戏在 gymnasium/__init__.py 中自动注册
+except ImportError:
+    GYMNASIUM_AVAILABLE = False
+    GymnasiumWrapper = None
+
 __all__ = [
     # 注册系统
     "register_game",
@@ -319,4 +350,7 @@ __all__ = [
     "TicTacToeGame",
     "Gomoku9x9Game",
     "Gomoku15x15Game",
+    # Gymnasium（可选）
+    "GYMNASIUM_AVAILABLE",
+    "GymnasiumWrapper",
 ]

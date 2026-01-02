@@ -14,6 +14,26 @@ websockets>=12.0
 # 日志
 loguru>=0.7.0
 
+# ============================================================
+# 可选依赖 - Gymnasium 游戏支持
+# ============================================================
+# 
+# 基础 Gymnasium（经典控制游戏：CartPole, LunarLander 等）:
+#   pip install gymnasium
+#
+# Atari 游戏（Breakout, Pong, SpaceInvaders 等）:
+#   pip install gymnasium[atari] ale-py
+#
+# MuJoCo 物理仿真（Ant, HalfCheetah, Humanoid 等）:
+#   pip install gymnasium[mujoco]
+#
+# 一次性安装所有 Gymnasium 支持:
+#   pip install gymnasium[atari,mujoco] ale-py
+#
+# 图像处理（可选，用于 Atari 观测预处理）:
+#   pip install pillow
+# ============================================================
+
 # 开发依赖（可选）
 # pytest>=8.0.0
 # pytest-cov>=4.1.0
