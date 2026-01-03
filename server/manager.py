@@ -202,18 +202,60 @@ class TrainingManager:
         新架构特点:
         - 多环境并行自玩（num_envs 个环境，每个自动开线程）
         - 叶节点批量 GPU 推理（LeafBatcher）
-        - 支持 DDP 多卡训练
+        - 支持 DDP 多卡训练（通过 mp.spawn 启动）
         """
         try:
             from core.training_config import TrainingConfig
-            from core.trainer import DistributedTrainer
+            from core.trainer import DistributedTrainer, launch_distributed_training
+            import torch
             
             # 解析配置
             config = TrainingConfig.from_dict(self._config)
             logger.info(f"训练配置: game={config.game_type}, algo={config.algorithm}, "
                        f"envs={config.num_envs}, device={config.device}")
             
-            # 创建分布式训练器
+            # 检查是否启用 DDP 多卡训练
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            use_ddp = config.use_ddp and num_gpus > 1
+            
+            if use_ddp:
+                logger.info(f"启用 DDP 多卡训练: {num_gpus} 个 GPU")
+                
+                # 状态回调（从子进程接收状态更新）
+                def on_state_update(state_dict):
+                    with self._lock:
+                        self.status.epoch = state_dict.get("epoch", 0)
+                        self.status.step = state_dict.get("step", 0)
+                        self.status.total_games = state_dict.get("total_games", 0)
+                        self.status.selfplay_games = state_dict.get("total_games", 0)
+                        self.status.loss = state_dict.get("loss", 0)
+                        self.status.value_loss = state_dict.get("value_loss", 0)
+                        self.status.policy_loss = state_dict.get("policy_loss", 0)
+                        self.status.reward_loss = state_dict.get("reward_loss", 0)
+                        self.status.avg_game_length = state_dict.get("avg_game_length", 0)
+                        self.status.games_per_second = state_dict.get("games_per_second", 0)
+                        self.status.steps_per_second = state_dict.get("steps_per_second", 0)
+                        self.status.elapsed_time = state_dict.get("elapsed_time", 0)
+                        self.status.buffer_size = state_dict.get("buffer_size", 0)
+                        self.status.num_envs = config.num_envs
+                        
+                        eval_games = state_dict.get("eval_games", 0)
+                        if eval_games > 0:
+                            self.status.eval_win_rate = state_dict.get("eval_win_rate", 0)
+                            self.status.eval_elo = state_dict.get("elo_rating", 1500)
+                    
+                    self._notify_subscribers()
+                
+                # 使用 mp.spawn 启动 DDP 训练
+                launch_distributed_training(
+                    config,
+                    num_gpus=num_gpus,
+                    callback=on_state_update,
+                    blocking=True,
+                )
+                return
+            
+            # 单卡训练（原有逻辑）
             trainer = DistributedTrainer(config)
             self._trainer = trainer
             

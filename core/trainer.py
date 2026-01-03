@@ -983,37 +983,142 @@ class DistributedTrainer:
 # 便捷函数
 # ============================================================
 
+def _ddp_worker(
+    rank: int,
+    world_size: int,
+    config_dict: Dict[str, Any],
+    master_port: int,
+    callback_queue: Optional[Any] = None,
+) -> None:
+    """DDP 工作进程
+    
+    Args:
+        rank: 进程排名
+        world_size: 总进程数
+        config_dict: 配置字典
+        master_port: 主进程端口
+        callback_queue: 用于回调的队列（可选）
+    """
+    import os
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    
+    config = TrainingConfig.from_dict(config_dict)
+    trainer = DistributedTrainer(config)
+    
+    # 如果有回调队列，添加状态回调
+    if callback_queue is not None and rank == 0:
+        def state_callback(state):
+            try:
+                callback_queue.put_nowait(("state", trainer.get_state()))
+            except:
+                pass
+        trainer.add_callback(state_callback)
+    
+    trainer.setup()
+    trainer.run()
+    
+    if callback_queue is not None and rank == 0:
+        callback_queue.put_nowait(("done", None))
+
+
 def launch_distributed_training(
     config: TrainingConfig,
-    num_gpus: int = 1,
-) -> None:
-    """启动分布式训练
+    num_gpus: int = 0,
+    callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    blocking: bool = True,
+) -> Optional[Any]:
+    """启动分布式训练（支持 Web 调用）
+    
+    使用 torch.multiprocessing.spawn 在代码中启动多进程 DDP 训练，
+    不需要 torchrun 命令行。
     
     Args:
         config: 训练配置
-        num_gpus: GPU 数量
+        num_gpus: GPU 数量（0=自动检测）
+        callback: 状态回调函数（仅 rank 0 调用）
+        blocking: 是否阻塞等待训练完成
+    
+    Returns:
+        如果 blocking=False，返回进程上下文，可用于停止训练
     
     Example:
-        >>> config = TrainingConfig(game_type="chinese_chess")
+        >>> config = TrainingConfig(game_type="chinese_chess", use_ddp=True)
+        >>> 
+        >>> # 阻塞模式（等待训练完成）
         >>> launch_distributed_training(config, num_gpus=4)
+        >>> 
+        >>> # 非阻塞模式（后台运行）
+        >>> ctx = launch_distributed_training(config, num_gpus=4, blocking=False)
+        >>> # ... 做其他事情 ...
+        >>> ctx.join()  # 等待完成
     """
-    if num_gpus > 1:
-        # 使用 torchrun 启动
-        import subprocess
-        import sys
-        
-        cmd = [
-            sys.executable, "-m", "torch.distributed.run",
-            f"--nproc_per_node={num_gpus}",
-            __file__,
-            "--config", str(config.to_dict()),
-        ]
-        subprocess.run(cmd)
-    else:
+    import torch.multiprocessing as mp
+    
+    # 自动检测 GPU 数量
+    if num_gpus <= 0:
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    
+    if num_gpus <= 1:
         # 单卡直接运行
         trainer = DistributedTrainer(config)
+        if callback:
+            trainer.add_callback(callback)
         trainer.setup()
         trainer.run()
+        return None
+    
+    # 多卡使用 mp.spawn
+    logger.info(f"启动 DDP 训练: {num_gpus} 个 GPU")
+    
+    # 找一个可用端口
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        master_port = s.getsockname()[1]
+    
+    # 创建回调队列（用于跨进程通信）
+    callback_queue = None
+    if callback:
+        callback_queue = mp.Queue()
+        
+        # 启动回调监听线程
+        def callback_listener():
+            while True:
+                try:
+                    msg_type, data = callback_queue.get(timeout=1.0)
+                    if msg_type == "done":
+                        break
+                    elif msg_type == "state":
+                        callback(data)
+                except:
+                    continue
+        
+        listener_thread = threading.Thread(target=callback_listener, daemon=True)
+        listener_thread.start()
+    
+    config_dict = config.to_dict()
+    
+    if blocking:
+        mp.spawn(
+            _ddp_worker,
+            args=(num_gpus, config_dict, master_port, callback_queue),
+            nprocs=num_gpus,
+            join=True,
+        )
+        return None
+    else:
+        # 非阻塞模式
+        ctx = mp.spawn(
+            _ddp_worker,
+            args=(num_gpus, config_dict, master_port, callback_queue),
+            nprocs=num_gpus,
+            join=False,
+        )
+        return ctx
 
 
 # ============================================================
