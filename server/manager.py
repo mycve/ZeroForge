@@ -291,25 +291,31 @@ class TrainingManager:
                     self._ddp_command_queue = result["command_queue"]
                     self._ddp_context = result["context"]
                     
+                    logger.info("DDP 训练已启动，等待完成...")
+                    
                     # 等待训练完成（支持中途停止）
                     while True:
-                        try:
-                            # 每秒检查一次是否需要停止
-                            self._ddp_context.join(timeout=1.0)
-                            break  # join 成功，训练结束
-                        except Exception:
-                            # 检查是否收到停止信号
-                            if self._stop_event.is_set():
-                                logger.info("收到停止信号，终止 DDP 进程...")
-                                # 强制终止所有子进程
-                                for process in self._ddp_context.processes:
-                                    if process.is_alive():
-                                        process.terminate()
-                                # 等待进程结束
-                                for process in self._ddp_context.processes:
-                                    process.join(timeout=5.0)
-                                break
-                            continue
+                        # 检查是否收到停止信号
+                        if self._stop_event.is_set():
+                            logger.info("收到停止信号，终止 DDP 进程...")
+                            # 强制终止所有子进程
+                            for process in self._ddp_context.processes:
+                                if process.is_alive():
+                                    process.terminate()
+                            # 等待进程结束
+                            for process in self._ddp_context.processes:
+                                process.join(timeout=5.0)
+                            break
+                        
+                        # 检查所有进程是否还在运行
+                        all_done = all(not p.is_alive() for p in self._ddp_context.processes)
+                        if all_done:
+                            logger.info("所有 DDP 进程已结束")
+                            break
+                        
+                        # 短暂等待后继续检查
+                        import time
+                        time.sleep(1.0)
                     
                     self._ddp_command_queue = None
                     self._ddp_context = None
