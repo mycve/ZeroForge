@@ -1091,7 +1091,10 @@ def _ddp_worker(
                 pass
         trainer.add_callback(state_callback)
     
-    # rank 0 监听命令队列（保存检查点等）
+    # 先 setup
+    trainer.setup()
+    
+    # rank 0 在 setup 之后启动命令监听线程
     if command_queue is not None and rank == 0:
         def command_listener():
             """监听主进程发来的命令"""
@@ -1111,11 +1114,10 @@ def _ddp_worker(
                     # 超时或队列空，继续
                     continue
         
-        # 启动命令监听线程
+        # setup 完成后启动命令监听线程
         cmd_thread = threading.Thread(target=command_listener, daemon=True)
         cmd_thread.start()
     
-    trainer.setup()
     trainer.run()
     
     if callback_queue is not None and rank == 0:
