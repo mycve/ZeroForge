@@ -7,7 +7,8 @@ import {
   Cpu,
   Trophy,
   Activity,
-  BarChart3
+  BarChart3,
+  Settings
 } from 'lucide-react'
 import { StatCard } from '../components/StatCard'
 import { LossChart } from '../components/LossChart'
@@ -120,8 +121,47 @@ export default function Dashboard() {
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.3 }}
-        className="mt-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+        className="mt-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6"
       >
+        {/* 任务信息 */}
+        <div className="bg-bg-card border border-bg-elevated rounded-xl p-6">
+          <div className="flex items-center gap-3 mb-4">
+            <Settings className="w-5 h-5 text-accent" />
+            <h3 className="text-lg font-semibold font-display">任务信息</h3>
+            {trainingStatus.running && (
+              <span className="ml-auto flex items-center gap-1 text-xs text-green-400">
+                <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+                运行中
+              </span>
+            )}
+          </div>
+          {trainingStatus.running || trainingStatus.game_type ? (
+            <div className="space-y-4">
+              <MetricRow label="游戏" value={trainingStatus.game_type || '—'} color="text-cyan-400" />
+              <MetricRow label="算法" value={trainingStatus.algorithm || '—'} color="text-purple-400" />
+              <MetricRow 
+                label="进度" 
+                value={trainingStatus.num_epochs > 0 
+                  ? `${trainingStatus.epoch} / ${trainingStatus.num_epochs}` 
+                  : `Epoch ${trainingStatus.epoch}`} 
+                color="text-accent"
+              />
+              <MetricRow 
+                label="运行时长" 
+                value={formatDuration(trainingStatus.elapsed_time)} 
+                color="text-yellow-400"
+              />
+              <MetricRow 
+                label="DDP" 
+                value={trainingStatus.use_ddp ? '多卡' : '单卡'} 
+                color={trainingStatus.use_ddp ? 'text-green-400' : 'text-gray-400'}
+              />
+            </div>
+          ) : (
+            <div className="text-gray-500 text-sm">训练未启动</div>
+          )}
+        </div>
+
         {/* 损失详情 */}
         <div className="bg-bg-card border border-bg-elevated rounded-xl p-6">
           <div className="flex items-center gap-3 mb-4">
@@ -145,8 +185,8 @@ export default function Dashboard() {
             <MetricRow label="已完成对局" value={trainingStatus.selfplay_games.toString()} />
             <MetricRow label="平均步数" value={trainingStatus.avg_game_length.toFixed(1)} />
             <MetricRow 
-              label="环境数量" 
-              value={trainingStatus.num_envs?.toString() || '0'}
+              label="并发数" 
+              value={`${trainingStatus.concurrency || 0} / ${trainingStatus.num_envs || 0}`}
               color="text-accent"
             />
             <MetricRow 
@@ -183,6 +223,23 @@ export default function Dashboard() {
       </motion.div>
     </div>
   )
+}
+
+// 格式化时长
+function formatDuration(seconds: number): string {
+  if (!seconds || seconds < 0) return '0s'
+  
+  const hours = Math.floor(seconds / 3600)
+  const mins = Math.floor((seconds % 3600) / 60)
+  const secs = Math.floor(seconds % 60)
+  
+  if (hours > 0) {
+    return `${hours}h ${mins}m`
+  } else if (mins > 0) {
+    return `${mins}m ${secs}s`
+  } else {
+    return `${secs}s`
+  }
 }
 
 // 指标行组件

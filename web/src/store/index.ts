@@ -90,6 +90,15 @@ const defaultTrainingStatus: TrainingStatus = {
     steps_per_second: 0,
     buffer_size: 0,
     num_envs: 0,
+    concurrency: 0,
+    // 任务配置信息
+    game_type: '',
+    algorithm: '',
+    num_epochs: 0,
+    batch_size: 0,
+    lr: 0,
+    num_simulations: 0,
+    use_ddp: false,
 }
 
 export const useAppStore = create<AppState>((set) => ({

@@ -144,9 +144,18 @@ export interface TrainingStatus {
   elapsed_time: number
   games_per_second: number
   steps_per_second: number
-  // 新增：架构状态
+  // 架构状态
   buffer_size: number      // 回放缓冲区大小
   num_envs: number         // 并行环境数
+  concurrency: number      // 并发数
+  // 任务配置信息
+  game_type: string        // 游戏类型
+  algorithm: string        // 算法
+  num_epochs: number       // 总 epoch 数
+  batch_size: number       // 批大小
+  lr: number               // 学习率
+  num_simulations: number  // MCTS 模拟次数
+  use_ddp: boolean         // 是否使用 DDP
 }
 
 export async function getTrainingStatus(): Promise<TrainingStatus> {

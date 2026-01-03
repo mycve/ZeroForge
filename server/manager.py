@@ -46,6 +46,15 @@ class TrainingStatus:
     epoch: int = 0
     total_games: int = 0
     
+    # 任务配置信息
+    game_type: str = ""           # 游戏类型
+    algorithm: str = ""           # 算法
+    num_epochs: int = 0           # 总 epoch 数
+    batch_size: int = 0           # 批大小
+    lr: float = 0.0               # 学习率
+    num_simulations: int = 0      # MCTS 模拟次数
+    use_ddp: bool = False         # 是否使用 DDP
+    
     # 最新指标
     loss: float = 0.0
     value_loss: float = 0.0
@@ -64,6 +73,7 @@ class TrainingStatus:
     # 架构状态
     buffer_size: int = 0          # 回放缓冲区大小
     num_envs: int = 0             # 并行环境数
+    concurrency: int = 0          # 并发数
     
     # 时间
     start_time: Optional[float] = None
@@ -127,6 +137,15 @@ class TrainingManager:
                 # 架构状态
                 "buffer_size": self.status.buffer_size,
                 "num_envs": self.status.num_envs,
+                "concurrency": self.status.concurrency,
+                # 任务配置信息
+                "game_type": self.status.game_type,
+                "algorithm": self.status.algorithm,
+                "num_epochs": self.status.num_epochs,
+                "batch_size": self.status.batch_size,
+                "lr": self.status.lr,
+                "num_simulations": self.status.num_simulations,
+                "use_ddp": self.status.use_ddp,
             })
     
     def _add_debug(self, category: str, data: Dict[str, Any]):
@@ -188,6 +207,17 @@ class TrainingManager:
             self.status.total_games = 0
             if config:
                 self._config = config
+            
+            # 设置任务配置信息（用于前端显示）
+            self.status.game_type = self._config.get("game_type", "")
+            self.status.algorithm = self._config.get("algorithm", "")
+            self.status.num_epochs = self._config.get("num_epochs", 0)
+            self.status.batch_size = self._config.get("batch_size", 0)
+            self.status.lr = self._config.get("lr", 0.0)
+            self.status.num_simulations = self._config.get("num_simulations", 0)
+            self.status.num_envs = self._config.get("num_envs", 0)
+            self.status.concurrency = self._config.get("concurrency", 0)
+            self.status.use_ddp = self._config.get("use_ddp", False)
         
         self._stop_event.clear()
         self._training_thread = threading.Thread(target=self._training_loop, daemon=True)
