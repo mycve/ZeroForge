@@ -124,6 +124,14 @@ class GomokuGame(Game):
         self._winner: Optional[int] = None
         self._is_terminal: Optional[bool] = None
         self.last_move: Optional[int] = None
+        
+        # 【优化】预分配观测缓冲区，避免每次 get_observation 重新分配
+        self._obs_buffer = np.zeros((NUM_CHANNELS, self.board_size, self.board_size), dtype=np.float32)
+        self._obs_dirty = True  # 标记观测是否需要重新计算
+        
+        # 【优化】缓存合法动作列表和掩码
+        self._legal_actions_cache: Optional[List[int]] = None
+        self._legal_mask_cache: Optional[np.ndarray] = None
     
     # === 空间属性 ===
     
@@ -143,12 +151,18 @@ class GomokuGame(Game):
     
     def reset(self) -> np.ndarray:
         """重置游戏到初始状态"""
-        self.board = np.zeros(self.num_squares, dtype=np.int8)
+        self.board.fill(0)  # 【优化】原地填充，不创建新数组
         self._current_player = 0
         self.move_count = 0
         self._winner = None
         self._is_terminal = None
         self.last_move = None
+        
+        # 【优化】重置缓存
+        self._obs_dirty = True
+        self._legal_actions_cache = None
+        self._legal_mask_cache = None
+        
         return self.get_observation()
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
@@ -180,7 +194,19 @@ class GomokuGame(Game):
         self.move_count += 1
         self.last_move = action
         
-        # 重置缓存
+        # 【优化】增量更新合法动作缓存（只移除刚下的位置）
+        if self._legal_actions_cache is not None:
+            try:
+                self._legal_actions_cache.remove(action)
+            except ValueError:
+                pass  # action 不在列表中（正常情况下不会发生）
+        if self._legal_mask_cache is not None:
+            self._legal_mask_cache[action] = 0.0
+        
+        # 【优化】标记观测需要重新计算
+        self._obs_dirty = True
+        
+        # 重置终局缓存
         self._is_terminal = None
         self._winner = None
         
@@ -205,6 +231,9 @@ class GomokuGame(Game):
                 info["termination"] = "draw"
             
             info["all_rewards"] = self.get_rewards()
+            
+            # 【优化】游戏结束，清空合法动作
+            self._legal_actions_cache = []
         
         # 切换玩家
         self._current_player = 1 - current_player
@@ -212,10 +241,17 @@ class GomokuGame(Game):
         return self.get_observation(), reward, done, info
     
     def legal_actions(self) -> List[int]:
-        """获取合法动作列表"""
+        """获取合法动作列表（带缓存）"""
         if self.is_terminal():
             return []
-        return [i for i in range(self.num_squares) if self.board[i] == 0]
+        
+        # 【优化】使用缓存
+        if self._legal_actions_cache is not None:
+            return self._legal_actions_cache
+        
+        # 首次计算，使用向量化操作
+        self._legal_actions_cache = np.nonzero(self.board == 0)[0].tolist()
+        return self._legal_actions_cache
     
     def current_player(self) -> int:
         """获取当前玩家 (0=黑棋先手, 1=白棋后手)"""
@@ -230,12 +266,17 @@ class GomokuGame(Game):
         cloned._winner = self._winner
         cloned._is_terminal = self._is_terminal
         cloned.last_move = self.last_move
+        
+        # 【优化】克隆后标记缓存无效，让新实例重新计算
+        cloned._obs_dirty = True
+        cloned._legal_actions_cache = None
+        cloned._legal_mask_cache = None
         return cloned
     
     # === 观测编码 ===
     
     def get_observation(self) -> np.ndarray:
-        """获取当前观测
+        """获取当前观测（带缓存，使用预分配数组）
         
         3通道编码：
         - 通道0: 当前玩家的棋子位置
@@ -245,24 +286,33 @@ class GomokuGame(Game):
         Returns:
             形状为 (3, board_size, board_size) 的 float32 数组
         """
+        # 【优化】使用缓存，避免重复计算
+        if not self._obs_dirty:
+            return self._obs_buffer
+        
         board_2d = self.board.reshape(self.board_size, self.board_size)
         
         # 当前玩家的棋子标记
         my_mark = self._current_player + 1  # 1 或 2
         opp_mark = 2 - self._current_player  # 2 或 1
         
-        channel_me = (board_2d == my_mark).astype(np.float32)
-        channel_opp = (board_2d == opp_mark).astype(np.float32)
-        channel_player = np.full((self.board_size, self.board_size), self._current_player, dtype=np.float32)
+        # 【优化】切片赋值是原地操作，numpy 自动处理类型转换
+        self._obs_buffer[0, :, :] = (board_2d == my_mark)
+        self._obs_buffer[1, :, :] = (board_2d == opp_mark)
+        self._obs_buffer[2, :, :] = self._current_player
         
-        return np.stack([channel_me, channel_opp, channel_player], axis=0)
+        self._obs_dirty = False
+        return self._obs_buffer
     
     def get_legal_actions_mask(self) -> np.ndarray:
-        """获取合法动作掩码"""
-        mask = np.zeros(self.num_squares, dtype=np.float32)
-        for action in self.legal_actions():
-            mask[action] = 1.0
-        return mask
+        """获取合法动作掩码（带缓存）"""
+        # 【优化】使用缓存
+        if self._legal_mask_cache is not None:
+            return self._legal_mask_cache
+        
+        # 【优化】向量化计算，避免 Python 循环
+        self._legal_mask_cache = (self.board == 0).astype(np.float32)
+        return self._legal_mask_cache
     
     # === 状态查询 ===
     

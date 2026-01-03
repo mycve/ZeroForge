@@ -3,25 +3,66 @@ LeafBatcher - GPU 批量叶子推理
 
 收集多个 env 线程提交的叶子节点请求，批量推理后返回结果。
 
-设计原则:
-- 线程安全：支持多线程并发提交
-- 高效批处理：达到数量或超时触发推理
-- 低延迟：使用条件变量实现高效等待
+提供两种实现：
+1. LeafBatcher：基于 Queue 的传统实现（有锁）
+2. SlotBatcher：基于预分配槽位的无锁实现（推荐）
 
-架构:
+============================================================
+性能对比
+============================================================
+
+| 特性           | LeafBatcher      | SlotBatcher      |
+|----------------|------------------|------------------|
+| 提交请求       | Queue.put (有锁) | 直接写入 (无锁)  |
+| 收集批次       | Queue.get (有锁) | 扫描数组 (无锁)  |
+| 对象创建       | 每次创建 Request | 预分配复用       |
+| 适用场景       | 动态线程数       | 固定并发数       |
+| no-GIL 性能    | 锁竞争严重       | 无锁，高并发     |
+
+============================================================
+使用指南
+============================================================
+
+1. LeafBatcher（传统方式）:
+   >>> batcher = LeafBatcher(network, config)
+   >>> batcher.start()
+   >>> policy, value = batcher.submit(obs, mask, env_id=0)
+
+2. SlotBatcher（推荐，无锁高性能）:
+   >>> batcher = SlotBatcher(network, config, num_slots=64)
+   >>> batcher.start()
+   >>> batcher.register_slot(slot_id)  # 线程开始时注册
+   >>> policy, value = batcher.submit(slot_id, obs, mask)
+   >>> batcher.unregister_slot(slot_id)  # 线程结束时注销
+
+============================================================
+架构图
+============================================================
+
+【LeafBatcher - 有锁队列】
 ┌─────────────────────────────────────────────────────────┐
 │                    LeafBatcher                           │
-│   - 请求队列（线程安全）                                 │
-│   - 批量收集逻辑                                         │
-│   - GPU 推理执行                                         │
-│   - 结果分发                                             │
+│   - Queue（线程安全，有锁）                              │
+│   - 对象池（线程本地，无锁）                             │
 └─────────────────────────────────────────────────────────┘
                           ↑↓
         ┌─────────────────┼─────────────────┐
         ↓                 ↓                 ↓
    Env线程1           Env线程2          Env线程N
    submit()           submit()          submit()
-   wait...            wait...           wait...
+
+【SlotBatcher - 无锁槽位】
+┌─────────────────────────────────────────────────────────┐
+│                    SlotBatcher                           │
+│   - 预分配槽位数组（无锁）                               │
+│   - 原子状态标记                                         │
+│   - 活跃槽位跟踪                                         │
+└─────────────────────────────────────────────────────────┘
+                          ↑↓
+        ┌─────────────────┼─────────────────┐
+        ↓                 ↓                 ↓
+    Slot[0]           Slot[1]          Slot[N-1]
+   线程直接写入      线程直接写入      线程直接写入
 """
 
 from __future__ import annotations
@@ -45,9 +86,8 @@ from ..config import BatcherConfig
 logger = logging.getLogger(__name__)
 
 
-@dataclass
 class LeafRequest:
-    """叶子节点推理请求
+    """叶子节点推理请求（优化版，使用 __slots__ 减少内存开销）
     
     由 env 线程创建，提交到 batcher 队列。
     
@@ -55,21 +95,66 @@ class LeafRequest:
         observation: 观测数据 [C, H, W]
         legal_mask: 合法动作掩码 [action_space]
         env_id: 环境 ID（用于调试）
-        timestamp: 提交时间戳
         event: 完成事件（用于等待结果）
         result: 推理结果 (policy, value)
     """
-    observation: np.ndarray
-    legal_mask: np.ndarray
-    env_id: int = 0
-    timestamp: float = field(default_factory=time.time)
+    __slots__ = ('observation', 'legal_mask', 'env_id', 'event', 'result', 'error')
     
-    # 同步机制
-    event: threading.Event = field(default_factory=threading.Event)
+    def __init__(
+        self,
+        observation: np.ndarray = None,
+        legal_mask: np.ndarray = None,
+        env_id: int = 0,
+        event: threading.Event = None,
+    ):
+        self.observation = observation
+        self.legal_mask = legal_mask
+        self.env_id = env_id
+        self.event = event if event is not None else threading.Event()
+        self.result: Optional[Tuple[np.ndarray, float]] = None
+        self.error: Optional[Exception] = None
     
-    # 结果
-    result: Optional[Tuple[np.ndarray, float]] = None
-    error: Optional[Exception] = None
+    def reset(self, observation: np.ndarray, legal_mask: np.ndarray, env_id: int = 0):
+        """重置请求以便复用"""
+        self.observation = observation
+        self.legal_mask = legal_mask
+        self.env_id = env_id
+        self.result = None
+        self.error = None
+        self.event.clear()
+
+
+class LeafRequestPool:
+    """LeafRequest 对象池（优化版：线程本地存储，无锁竞争）"""
+    
+    def __init__(self, initial_size: int = 512):
+        # 【优化】使用线程本地存储，每个线程有自己的池，避免锁竞争
+        self._local = threading.local()
+        self._initial_size = initial_size
+    
+    def _get_local_pool(self) -> List[LeafRequest]:
+        """获取当前线程的本地池"""
+        if not hasattr(self._local, 'pool'):
+            # 每个线程首次访问时创建本地池
+            self._local.pool = [LeafRequest() for _ in range(32)]
+        return self._local.pool
+    
+    def acquire(self, observation: np.ndarray, legal_mask: np.ndarray, env_id: int = 0) -> LeafRequest:
+        """获取一个请求对象（无锁）"""
+        pool = self._get_local_pool()
+        if pool:
+            req = pool.pop()
+            req.reset(observation, legal_mask, env_id)
+            return req
+        # 池空了，创建新的
+        return LeafRequest(observation, legal_mask, env_id)
+    
+    def release(self, request: LeafRequest) -> None:
+        """归还请求对象（无锁）"""
+        pool = self._get_local_pool()
+        # 限制每个线程的池大小
+        if len(pool) < 64:
+            pool.append(request)
 
 
 class LeafBatcher:
@@ -129,6 +214,15 @@ class LeafBatcher:
         # 设备
         self._device = config.device
         
+        # 【优化】对象池，避免频繁创建 LeafRequest 和 threading.Event
+        self._request_pool = LeafRequestPool(initial_size=config.batch_size * 4)
+        
+        # 【优化】预分配批量推理数组（延迟初始化，第一次推理时确定形状）
+        self._obs_buffer: Optional[np.ndarray] = None
+        self._mask_buffer: Optional[np.ndarray] = None
+        self._obs_shape: Optional[Tuple[int, ...]] = None
+        self._mask_shape: Optional[Tuple[int, ...]] = None
+        
         logger.info(f"LeafBatcher 初始化: batch_size={config.batch_size}, "
                    f"timeout={config.timeout_ms}ms, device={config.device}")
     
@@ -166,25 +260,28 @@ class LeafBatcher:
         if not self._running:
             raise RuntimeError("LeafBatcher 未运行，请先调用 start()")
         
-        # 创建请求
-        request = LeafRequest(
-            observation=observation,
-            legal_mask=legal_mask,
-            env_id=env_id,
-        )
+        # 【优化】从对象池获取请求，避免创建新 Event
+        request = self._request_pool.acquire(observation, legal_mask, env_id)
         
         # 提交到队列
         self._queue.put(request)
         
         # 等待结果
         if not request.event.wait(timeout=timeout):
+            self._request_pool.release(request)  # 超时也要归还
             raise TimeoutError(f"等待推理结果超时 (env_id={env_id})")
         
         # 检查错误
         if request.error is not None:
-            raise request.error
+            error = request.error
+            self._request_pool.release(request)
+            raise error
         
-        return request.result
+        result = request.result
+        # 【优化】归还请求对象到池
+        self._request_pool.release(request)
+        
+        return result
     
     def start(self) -> None:
         """启动 batcher 线程"""
@@ -324,7 +421,7 @@ class LeafBatcher:
         self,
         batch: List[LeafRequest],
     ) -> List[Tuple[np.ndarray, float]]:
-        """执行批量推理
+        """执行批量推理（优化版：使用预分配缓冲区）
         
         Args:
             batch: 请求列表
@@ -335,9 +432,25 @@ class LeafBatcher:
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch 未安装，无法执行 GPU 推理")
         
-        # 堆叠输入
-        observations = np.stack([r.observation for r in batch])
-        masks = np.stack([r.legal_mask for r in batch])
+        batch_size = len(batch)
+        
+        # 【优化】延迟初始化预分配缓冲区
+        if self._obs_buffer is None:
+            self._obs_shape = batch[0].observation.shape
+            self._mask_shape = batch[0].legal_mask.shape
+            # 预分配最大 batch_size 的缓冲区
+            max_batch = self.config.batch_size
+            self._obs_buffer = np.empty((max_batch,) + self._obs_shape, dtype=np.float32)
+            self._mask_buffer = np.empty((max_batch,) + self._mask_shape, dtype=np.float32)
+        
+        # 【优化】直接拷贝到预分配缓冲区，避免 np.stack 创建新数组
+        for i, req in enumerate(batch):
+            self._obs_buffer[i] = req.observation
+            self._mask_buffer[i] = req.legal_mask
+        
+        # 使用缓冲区的 view（只取当前 batch_size 部分）
+        observations = self._obs_buffer[:batch_size]
+        masks = self._mask_buffer[:batch_size]
         
         # 转换为 tensor
         obs_tensor = torch.from_numpy(observations).to(self._device)
@@ -357,9 +470,7 @@ class LeafBatcher:
         values_np = values.cpu().numpy().flatten()
         
         # 构建结果列表
-        results = []
-        for i in range(len(batch)):
-            results.append((policies_np[i], float(values_np[i])))
+        results = [(policies_np[i], float(values_np[i])) for i in range(batch_size)]
         
         return results
     
@@ -665,3 +776,333 @@ class MuZeroLeafBatcher:
                 "queue_size": self._queue.qsize(),
                 "running": self._running,
             }
+
+
+# ============================================================
+# 无锁预分配槽位 Batcher（高性能版）
+# ============================================================
+
+class SlotBatcher:
+    """无锁预分配槽位 Batcher
+    
+    使用预分配槽位替代队列，完全无锁设计。
+    适用于已知并发数量的场景。
+    
+    设计特点:
+    - 预分配固定数量槽位，每个线程使用固定槽位
+    - 使用原子标记替代锁
+    - 支持动态活跃线程数（游戏结束时减少）
+    - 超时机制避免等待已结束的线程
+    
+    架构:
+    ┌─────────────────────────────────────────────────────────┐
+    │                    SlotBatcher                           │
+    │   - 预分配槽位数组（无锁）                               │
+    │   - 原子状态标记                                         │
+    │   - GPU 推理执行                                         │
+    └─────────────────────────────────────────────────────────┘
+                          ↑↓
+        ┌─────────────────┼─────────────────┐
+        ↓                 ↓                 ↓
+    Slot[0]           Slot[1]          Slot[N-1]
+    线程0直接写        线程1直接写       线程N-1直接写
+    
+    Example:
+        >>> batcher = SlotBatcher(network, config, num_slots=64)
+        >>> batcher.start()
+        >>> 
+        >>> # 在 env 线程中使用（需要传入槽位 ID）
+        >>> def env_thread(slot_id):
+        ...     policy, value = batcher.submit(slot_id, observation, legal_mask)
+        >>> 
+        >>> batcher.stop()
+    """
+    
+    # 槽位状态常量
+    SLOT_EMPTY = 0      # 空闲
+    SLOT_READY = 1      # 请求已提交，等待处理
+    SLOT_DONE = 2       # 结果已就绪
+    
+    def __init__(
+        self,
+        network: Any,
+        config: BatcherConfig,
+        num_slots: int,
+        network_fn: Optional[Callable] = None,
+    ):
+        """初始化 SlotBatcher
+        
+        Args:
+            network: 神经网络
+            config: 批推理配置
+            num_slots: 槽位数量（= 最大并发数）
+            network_fn: 可选的自定义推理函数
+        """
+        self.network = network
+        self.config = config
+        self.num_slots = num_slots
+        self.network_fn = network_fn
+        self._device = config.device
+        
+        # 预分配槽位数组
+        self._slot_states = [self.SLOT_EMPTY] * num_slots  # 状态标记（原子读写）
+        self._slot_obs: List[Optional[np.ndarray]] = [None] * num_slots
+        self._slot_mask: List[Optional[np.ndarray]] = [None] * num_slots
+        self._slot_results: List[Optional[Tuple[np.ndarray, float]]] = [None] * num_slots
+        self._slot_events = [threading.Event() for _ in range(num_slots)]
+        
+        # 活跃槽位跟踪
+        self._active_slots = set(range(num_slots))  # 当前活跃的槽位
+        self._active_lock = threading.Lock()  # 仅用于注册/注销
+        
+        # 预分配批量推理缓冲区
+        self._obs_buffer: Optional[np.ndarray] = None
+        self._mask_buffer: Optional[np.ndarray] = None
+        self._obs_shape: Optional[Tuple[int, ...]] = None
+        self._mask_shape: Optional[Tuple[int, ...]] = None
+        
+        # 控制
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        
+        # 统计（无锁，允许轻微不准确）
+        self._total_requests = 0
+        self._total_batches = 0
+        
+        logger.info(f"SlotBatcher 初始化: num_slots={num_slots}, "
+                   f"batch_size={config.batch_size}, device={config.device}")
+    
+    def register_slot(self, slot_id: int) -> None:
+        """注册槽位为活跃状态（线程开始时调用）"""
+        with self._active_lock:
+            self._active_slots.add(slot_id)
+    
+    def unregister_slot(self, slot_id: int) -> None:
+        """注销槽位（线程结束时调用）"""
+        with self._active_lock:
+            self._active_slots.discard(slot_id)
+    
+    def submit(
+        self,
+        slot_id: int,
+        observation: np.ndarray,
+        legal_mask: np.ndarray,
+        timeout: Optional[float] = None,
+    ) -> Tuple[np.ndarray, float]:
+        """提交推理请求（无锁写入）
+        
+        Args:
+            slot_id: 槽位 ID（每个线程使用固定槽位）
+            observation: 观测数据
+            legal_mask: 合法动作掩码
+            timeout: 等待超时
+            
+        Returns:
+            (policy, value)
+        """
+        if not self._running:
+            raise RuntimeError("SlotBatcher 未运行")
+        
+        # 直接写入预分配槽位（无锁）
+        self._slot_obs[slot_id] = observation
+        self._slot_mask[slot_id] = legal_mask
+        self._slot_events[slot_id].clear()
+        self._slot_states[slot_id] = self.SLOT_READY  # 原子写入，标记就绪
+        
+        # 等待结果
+        if not self._slot_events[slot_id].wait(timeout=timeout):
+            self._slot_states[slot_id] = self.SLOT_EMPTY  # 超时，重置
+            raise TimeoutError(f"槽位 {slot_id} 等待超时")
+        
+        # 获取结果
+        result = self._slot_results[slot_id]
+        self._slot_states[slot_id] = self.SLOT_EMPTY  # 重置为空闲
+        
+        return result
+    
+    def start(self) -> None:
+        """启动 batcher 线程"""
+        if self._running:
+            return
+        
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        logger.info("SlotBatcher 已启动")
+    
+    def stop(self, timeout: float = 5.0) -> None:
+        """停止 batcher"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        logger.info("SlotBatcher 已停止")
+    
+    def _run_loop(self) -> None:
+        """主循环：扫描槽位 -> 批推理 -> 分发结果"""
+        while self._running:
+            try:
+                # 收集就绪的请求
+                batch_slots, batch_obs, batch_mask = self._collect_batch()
+                
+                if not batch_slots:
+                    continue
+                
+                # 执行推理
+                results = self._batch_inference(batch_obs, batch_mask)
+                
+                # 分发结果
+                self._dispatch_results(batch_slots, results)
+                
+                # 更新统计
+                self._total_batches += 1
+                self._total_requests += len(batch_slots)
+                
+            except Exception as e:
+                logger.error(f"SlotBatcher 主循环异常: {e}")
+    
+    def _collect_batch(self) -> Tuple[List[int], List[np.ndarray], List[np.ndarray]]:
+        """收集就绪的请求（无锁扫描）
+        
+        策略：
+        1. 扫描所有槽位，收集 READY 状态的请求
+        2. 达到 batch_size 或超时后返回
+        3. 如果活跃槽位全部就绪，立即返回（不等待）
+        """
+        batch_slots: List[int] = []
+        batch_obs: List[np.ndarray] = []
+        batch_mask: List[np.ndarray] = []
+        
+        timeout_sec = self.config.timeout_ms / 1000.0
+        deadline = time.time() + timeout_sec
+        
+        while len(batch_slots) < self.config.batch_size:
+            # 扫描所有槽位（无锁）
+            for slot_id in range(self.num_slots):
+                if self._slot_states[slot_id] == self.SLOT_READY:
+                    batch_slots.append(slot_id)
+                    batch_obs.append(self._slot_obs[slot_id])
+                    batch_mask.append(self._slot_mask[slot_id])
+                    
+                    if len(batch_slots) >= self.config.batch_size:
+                        break
+            
+            # 已收集到足够请求
+            if len(batch_slots) >= self.config.batch_size:
+                break
+            
+            # 检查是否所有活跃槽位都已就绪（处理剩余环境不足的情况）
+            with self._active_lock:
+                active_count = len(self._active_slots)
+            
+            if active_count > 0 and len(batch_slots) >= active_count:
+                # 所有活跃槽位都已提交，立即处理
+                break
+            
+            # 超时检查
+            if time.time() >= deadline:
+                break
+            
+            # 如果没有就绪请求，短暂休眠避免忙等
+            if not batch_slots:
+                time.sleep(0.0005)  # 0.5ms
+        
+        return batch_slots, batch_obs, batch_mask
+    
+    def _batch_inference(
+        self,
+        observations: List[np.ndarray],
+        masks: List[np.ndarray],
+    ) -> List[Tuple[np.ndarray, float]]:
+        """执行批量推理"""
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch 未安装")
+        
+        batch_size = len(observations)
+        
+        # 延迟初始化缓冲区
+        if self._obs_buffer is None:
+            self._obs_shape = observations[0].shape
+            self._mask_shape = masks[0].shape
+            max_batch = self.config.batch_size
+            self._obs_buffer = np.empty((max_batch,) + self._obs_shape, dtype=np.float32)
+            self._mask_buffer = np.empty((max_batch,) + self._mask_shape, dtype=np.float32)
+        
+        # 填充缓冲区
+        for i, (obs, mask) in enumerate(zip(observations, masks)):
+            self._obs_buffer[i] = obs
+            self._mask_buffer[i] = mask
+        
+        # 转换为 tensor
+        obs_tensor = torch.from_numpy(self._obs_buffer[:batch_size]).to(self._device)
+        mask_tensor = torch.from_numpy(self._mask_buffer[:batch_size]).to(self._device)
+        
+        # 推理
+        with torch.no_grad():
+            if self.network_fn is not None:
+                policies, values = self.network_fn(obs_tensor, mask_tensor)
+            else:
+                policies, values = self._call_network(obs_tensor, mask_tensor)
+        
+        # 转换回 numpy
+        policies_np = policies.cpu().numpy()
+        values_np = values.cpu().numpy().flatten()
+        
+        return [(policies_np[i], float(values_np[i])) for i in range(batch_size)]
+    
+    def _call_network(
+        self,
+        observations: "torch.Tensor",
+        masks: "torch.Tensor",
+    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """调用网络"""
+        import torch.nn.functional as F
+        
+        net = self.network
+        while hasattr(net, "module"):
+            net = net.module
+        while hasattr(net, "_orig_mod"):
+            net = net._orig_mod
+        
+        if hasattr(net, "initial_inference"):
+            hidden, logits, values = net.initial_inference(observations)
+            masked_logits = logits.masked_fill(~masks.bool(), -1e9)
+            policies = F.softmax(masked_logits, dim=-1)
+            return policies, values.squeeze(-1)
+        
+        if hasattr(net, "forward"):
+            output = net(observations)
+            if isinstance(output, tuple) and len(output) == 2:
+                logits, values = output
+                masked_logits = logits.masked_fill(~masks.bool(), -1e9)
+                policies = F.softmax(masked_logits, dim=-1)
+                return policies, values.squeeze(-1)
+        
+        raise ValueError("网络没有 initial_inference 或兼容的 forward 方法")
+    
+    def _dispatch_results(
+        self,
+        batch_slots: List[int],
+        results: List[Tuple[np.ndarray, float]],
+    ) -> None:
+        """分发结果到对应槽位"""
+        for slot_id, result in zip(batch_slots, results):
+            self._slot_results[slot_id] = result
+            self._slot_states[slot_id] = self.SLOT_DONE
+            self._slot_events[slot_id].set()  # 唤醒等待线程
+    
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        with self._active_lock:
+            active_count = len(self._active_slots)
+        
+        ready_count = sum(1 for s in self._slot_states if s == self.SLOT_READY)
+        
+        return {
+            "total_requests": self._total_requests,
+            "total_batches": self._total_batches,
+            "num_slots": self.num_slots,
+            "active_slots": active_count,
+            "ready_slots": ready_count,
+            "running": self._running,
+        }

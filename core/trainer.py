@@ -30,6 +30,32 @@ Trainer - 周期训练器
 - 内存管理清晰：训练和推理分离，避免同时占用大量显存
 - 数据质量高：每轮训练使用最新策略生成的数据
 - 可配置性强：可灵活调整游戏数量、并发数、新旧数据比例
+
+============================================================
+性能优化（自玩阶段）
+============================================================
+
+默认使用 SlotBatcher（无锁预分配槽位）替代 LeafBatcher：
+
+【SlotBatcher 架构】
+┌─────────────────────────────────────────────────────────────────────────┐
+│   线程0 ── Slot[0] ─┐                                                   │
+│   线程1 ── Slot[1] ─┼─► SlotBatcher(扫描) ─► GPU 推理 ─► 分发结果       │
+│   线程N ── Slot[N] ─┘                                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+特点:
+- 无锁写入：每个线程直接写入自己的槽位
+- 无锁扫描：Batcher 线程扫描所有槽位收集请求
+- 动态槽位：游戏结束时槽位回收复用
+- 适配 no-GIL：Python 3.13+ free-threaded 高并发
+
+配置:
+- use_slot_batcher: True（默认）使用无锁 SlotBatcher
+                    False 回退到传统 LeafBatcher
+- concurrency: 并发数 = SlotBatcher 槽位数
+
+详细说明见: core/PERFORMANCE.md
 """
 
 import os
@@ -409,25 +435,33 @@ class DistributedTrainer:
             新生成的轨迹列表
         """
         import gc
+        from .mcts import SlotBatcher
         
         # 确保网络在正确设备上（推理模式）
         base_network = self._network.module if self._is_distributed else self._network
         base_network.to(self._device)
         base_network.eval()
         
-        # 创建 Batcher
+        # 创建 Batcher 配置
         batcher_config = BatcherConfig(
             batch_size=self.config.inference_batch_size,
             timeout_ms=self.config.inference_timeout_ms,
             device=str(self._device),
         )
-        batcher = LeafBatcher(base_network, batcher_config)
-        batcher.start()
         
         trajectories: List[Trajectory] = []
         completed_games = 0
         total_games = self.config.num_envs
         concurrency = self.config.concurrency
+        
+        # 【优化】使用无锁 SlotBatcher（预分配槽位）
+        use_slot_batcher = getattr(self.config, 'use_slot_batcher', True)
+        
+        if use_slot_batcher:
+            batcher = SlotBatcher(base_network, batcher_config, num_slots=concurrency)
+        else:
+            batcher = LeafBatcher(base_network, batcher_config)
+        batcher.start()
         
         # 线程安全的结果收集
         results_lock = threading.Lock()
@@ -436,11 +470,20 @@ class DistributedTrainer:
         # 检查是否使用 Gumbel 搜索
         use_gumbel = self.config.algorithm in ("gumbel_alphazero", "gumbel_muzero")
         
-        def run_one_game(worker_id: int):
-            """运行一局游戏"""
+        def run_one_game(worker_id: int, slot_id: int):
+            """运行一局游戏
+            
+            Args:
+                worker_id: 工作线程 ID（用于统计）
+                slot_id: 槽位 ID（用于 SlotBatcher，循环复用）
+            """
             nonlocal completed_games
             
             try:
+                # 注册槽位（SlotBatcher）
+                if use_slot_batcher:
+                    batcher.register_slot(slot_id)
+                
                 game = self._game_factory()
                 game.reset()
                 
@@ -448,7 +491,10 @@ class DistributedTrainer:
                 move_count = 0
                 
                 def evaluate_fn(obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
-                    return batcher.submit(obs, mask, env_id=worker_id)
+                    if use_slot_batcher:
+                        return batcher.submit(slot_id, obs, mask)
+                    else:
+                        return batcher.submit(obs, mask, env_id=worker_id)
                 
                 # 根据算法类型选择搜索策略
                 if use_gumbel:
@@ -532,6 +578,10 @@ class DistributedTrainer:
                 logger.error(f"Worker {worker_id} 自玩出错: {e}")
                 import traceback
                 traceback.print_exc()
+            finally:
+                # 注销槽位（SlotBatcher）
+                if use_slot_batcher:
+                    batcher.unregister_slot(slot_id)
         
         # 启动初始并发
         next_game_id = 0
@@ -539,15 +589,36 @@ class DistributedTrainer:
         last_update_time = time.time()
         phase_start_time = time.time()
         
+        # 槽位分配：使用 worker_id % concurrency 复用槽位
+        slot_assignments: Dict[int, int] = {}  # worker_id -> slot_id
+        available_slots = list(range(concurrency))  # 可用槽位列表
+        
         while completed_games < total_games and not self._stop_event.is_set():
-            # 清理已完成的线程
-            active_workers = [t for t in active_workers if t.is_alive()]
+            # 清理已完成的线程，回收槽位
+            new_active = []
+            for t, worker_id in active_workers:
+                if t.is_alive():
+                    new_active.append((t, worker_id))
+                else:
+                    # 线程结束，回收槽位
+                    if worker_id in slot_assignments:
+                        freed_slot = slot_assignments.pop(worker_id)
+                        available_slots.append(freed_slot)
+            active_workers = new_active
             
             # 启动新的游戏（保持并发数）
-            while len(active_workers) < concurrency and next_game_id < total_games:
-                t = threading.Thread(target=run_one_game, args=(next_game_id,), daemon=True)
+            while len(active_workers) < concurrency and next_game_id < total_games and available_slots:
+                # 分配槽位
+                slot_id = available_slots.pop(0)
+                slot_assignments[next_game_id] = slot_id
+                
+                t = threading.Thread(
+                    target=run_one_game, 
+                    args=(next_game_id, slot_id), 
+                    daemon=True
+                )
                 t.start()
-                active_workers.append(t)
+                active_workers.append((t, next_game_id))
                 next_game_id += 1
             
             # 实时更新状态（每 0.5 秒或有新完成时）
@@ -579,7 +650,7 @@ class DistributedTrainer:
             time.sleep(0.05)
         
         # 等待所有线程完成
-        for t in active_workers:
+        for t, _ in active_workers:
             t.join(timeout=30.0)
         
         # 停止 batcher，释放资源
