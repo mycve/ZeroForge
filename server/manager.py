@@ -1593,19 +1593,50 @@ class DebugManager:
                     
                     return policy, value[0].item()
             
-            # 执行 MCTS 搜索
-            _, policy_dict, root_value = mcts_tree.search(
-                evaluate_fn=evaluate_fn,
-                num_simulations=num_simulations,
-                add_noise=(session.step == 0),
-            )
+            # 检查是否使用 Gumbel 搜索
+            use_gumbel = session.algorithm in ("gumbel_alphazero", "gumbel_muzero")
+            
+            if use_gumbel:
+                # Gumbel MCTS 搜索
+                from core.mcts import GumbelMCTSSearch
+                from core.training_config import TrainingConfig
+                
+                # 获取 Gumbel 配置
+                config = TrainingConfig()
+                gumbel_search = GumbelMCTSSearch(
+                    game,
+                    mcts_tree.config,
+                    batcher=None,
+                    mode="alphazero",
+                    max_considered_actions=config.gumbel_max_actions,
+                    gumbel_scale=config.gumbel_scale,
+                )
+                # 同步树状态
+                gumbel_search.tree = mcts_tree
+                gumbel_search._move_count = session.step
+                
+                action, policy_dict, root_value = gumbel_search.run(
+                    evaluate_fn=evaluate_fn,
+                    num_simulations=num_simulations,
+                )
+                top_k = config.gumbel_max_actions
+            else:
+                # 标准 MCTS 搜索
+                _, policy_dict, root_value = mcts_tree.search(
+                    evaluate_fn=evaluate_fn,
+                    num_simulations=num_simulations,
+                    add_noise=(session.step == 0),
+                )
+                top_k = 10  # 标准 MCTS 显示 top 10
             
             # 获取根节点详情
             import math
             root = mcts_tree.root
             
             # 调试模式：使用确定性选择（访问次数最多的动作）
-            action = root.get_best_action()
+            if not use_gumbel:
+                action = root.get_best_action()
+            
             sqrt_parent_visits = math.sqrt(root.visit_count + 1)
             c_puct = mcts_tree.config.c_puct
             
@@ -1632,9 +1663,11 @@ class DebugManager:
                 "selected_action": action,
                 "root_value": round(root_value, 4),
                 "root_visits": root.visit_count,
-                "policy": {a: round(p, 4) for a, p in sorted(policy_dict.items(), key=lambda x: -x[1])[:10]},
-                "children": children_info[:10],
+                "policy": {a: round(p, 4) for a, p in sorted(policy_dict.items(), key=lambda x: -x[1])[:top_k]},
+                "children": children_info[:top_k],
                 "game_render": game.render("text"),
+                "search_type": "gumbel" if use_gumbel else "standard",
+                "top_k": top_k,
             })
             
             # 保存 MCTS 搜索结果，供 step_game 使用

@@ -633,7 +633,9 @@ export default function DebugPage() {
               </div>
               
               <div className="mb-3">
-                <div className="text-sm text-gray-400 mb-2">策略分布 (Top 10):</div>
+                <div className="text-sm text-gray-400 mb-2">
+                  策略分布 ({mctsResult.search_type === 'gumbel' ? `Gumbel Top-${mctsResult.top_k}` : `Top ${mctsResult.top_k || 10}`}):
+                </div>
                 <div className="flex gap-1 flex-wrap">
                   {Object.entries(mctsResult.policy).map(([action, prob]) => (
                     <span

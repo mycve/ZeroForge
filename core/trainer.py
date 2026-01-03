@@ -433,6 +433,9 @@ class DistributedTrainer:
         results_lock = threading.Lock()
         active_workers: List[threading.Thread] = []
         
+        # 检查是否使用 Gumbel 搜索
+        use_gumbel = self.config.algorithm in ("gumbel_alphazero", "gumbel_muzero")
+        
         def run_one_game(worker_id: int):
             """运行一局游戏"""
             nonlocal completed_games
@@ -441,23 +444,44 @@ class DistributedTrainer:
                 game = self._game_factory()
                 game.reset()
                 
-                mcts_tree = LocalMCTSTree(game, self._mcts_config, mode="alphazero")
                 trajectory = Trajectory()
                 move_count = 0
                 
                 def evaluate_fn(obs: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, float]:
                     return batcher.submit(obs, mask, env_id=worker_id)
                 
+                # 根据算法类型选择搜索策略
+                if use_gumbel:
+                    from core.mcts import GumbelMCTSSearch
+                    search = GumbelMCTSSearch(
+                        game, 
+                        self._mcts_config,
+                        batcher=batcher,
+                        mode="alphazero",
+                        max_considered_actions=self.config.gumbel_max_actions,
+                        gumbel_scale=self.config.gumbel_scale,
+                    )
+                else:
+                    mcts_tree = LocalMCTSTree(game, self._mcts_config, mode="alphazero")
+                
                 while not game.is_terminal() and not self._stop_event.is_set():
                     current_player = game.current_player()
                     obs = game.get_observation()
                     
-                    add_noise = (move_count == 0)
-                    action, policy_dict, root_value = mcts_tree.search(
-                        evaluate_fn=evaluate_fn,
-                        num_simulations=self._mcts_config.num_simulations,
-                        add_noise=add_noise,
-                    )
+                    if use_gumbel:
+                        # Gumbel MCTS 搜索（使用 Top-k + Sequential Halving）
+                        action, policy_dict, root_value = search.run(
+                            evaluate_fn=evaluate_fn,
+                            num_simulations=self._mcts_config.num_simulations,
+                        )
+                    else:
+                        # 标准 MCTS 搜索
+                        add_noise = (move_count == 0)
+                        action, policy_dict, root_value = mcts_tree.search(
+                            evaluate_fn=evaluate_fn,
+                            num_simulations=self._mcts_config.num_simulations,
+                            add_noise=add_noise,
+                        )
                     
                     trajectory.append(
                         observation=obs,
@@ -471,8 +495,12 @@ class DistributedTrainer:
                     game.step(action)
                     move_count += 1
                     
-                    mcts_tree.game = game
-                    mcts_tree.advance(action)
+                    if use_gumbel:
+                        search.game = game
+                        search.advance(action)
+                    else:
+                        mcts_tree.game = game
+                        mcts_tree.advance(action)
                     
                     if move_count > 500:
                         logger.warning(f"Worker {worker_id}: 游戏超过 500 步，强制结束")
@@ -598,7 +626,8 @@ class DistributedTrainer:
         # 将新数据加入经验池
         self._replay_buffer.add_batch(new_trajectories)
         
-        # 计算采样数量
+        # 计算新数据量
+        new_data_steps = sum(len(t) for t in new_trajectories)
         total_batch_size = self.config.batch_size
         
         # 如果经验池太小，等待更多数据
@@ -617,7 +646,12 @@ class DistributedTrainer:
         value_loss_sum = 0.0
         policy_loss_sum = 0.0
         reward_loss_sum = 0.0
-        num_batches = max(1, self.config.train_batches_per_epoch)
+        
+        # 根据 replay_ratio 自动计算训练批次数
+        # 这样每个新样本平均被训练 replay_ratio 次
+        num_batches = max(1, int(new_data_steps * self.config.replay_ratio / total_batch_size))
+        
+        logger.debug(f"训练批次: {num_batches}, 新数据: {new_data_steps}, 批大小: {total_batch_size}")
         
         for batch_idx in range(num_batches):
             if self._stop_event.is_set():
