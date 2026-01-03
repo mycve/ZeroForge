@@ -102,6 +102,7 @@ class TrainingManager:
         self._optimizer = None
         self._checkpoint_manager = None
         self._trainer = None  # DistributedTrainer 实例
+        self._ddp_command_queue = None  # DDP 模式下的命令队列
         
         # 调试数据（用于前端展示）
         self._debug_data = {
@@ -276,13 +277,23 @@ class TrainingManager:
                     
                     self._notify_subscribers()
                 
-                # 使用 mp.spawn 启动 DDP 训练
-                launch_distributed_training(
+                # 使用非阻塞模式启动 DDP 训练，获取命令队列
+                result = launch_distributed_training(
                     config,
                     num_gpus=num_gpus,
                     callback=on_state_update,
-                    blocking=True,
+                    blocking=False,
                 )
+                
+                # 保存命令队列引用（用于手动保存检查点等）
+                if result:
+                    self._ddp_command_queue = result["command_queue"]
+                    ddp_context = result["context"]
+                    
+                    # 阻塞等待训练完成
+                    ddp_context.join()
+                    self._ddp_command_queue = None
+                
                 return
             
             # 单卡训练（原有逻辑）
@@ -733,6 +744,16 @@ class TrainingManager:
         if not self.status.running:
             return {"error": "训练未运行"}
         
+        # DDP 模式：通过命令队列发送保存请求到 rank 0
+        if self._ddp_command_queue is not None:
+            try:
+                self._ddp_command_queue.put("save_checkpoint")
+                logger.info(f"已发送保存检查点命令 (DDP 模式, epoch={self.status.epoch})")
+                return {"success": True, "epoch": self.status.epoch, "mode": "ddp"}
+            except Exception as e:
+                return {"error": f"发送保存命令失败: {e}"}
+        
+        # 单卡模式：直接保存
         if self._checkpoint_manager is None or self._network is None:
             return {"error": "训练组件未初始化"}
         
@@ -761,6 +782,15 @@ class TrainingManager:
     def stop(self):
         """停止训练"""
         self._stop_event.set()
+        
+        # DDP 模式：发送停止命令
+        if self._ddp_command_queue is not None:
+            try:
+                self._ddp_command_queue.put("stop")
+                logger.info("已发送停止命令 (DDP 模式)")
+            except:
+                pass
+            self._ddp_command_queue = None
         
         # 停止 DistributedTrainer
         if self._trainer is not None:

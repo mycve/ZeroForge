@@ -1060,6 +1060,7 @@ def _ddp_worker(
     config_dict: Dict[str, Any],
     master_port: int,
     callback_queue: Optional[Any] = None,
+    command_queue: Optional[Any] = None,
 ) -> None:
     """DDP 工作进程
     
@@ -1068,7 +1069,8 @@ def _ddp_worker(
         world_size: 总进程数
         config_dict: 配置字典
         master_port: 主进程端口
-        callback_queue: 用于回调的队列（可选）
+        callback_queue: 用于回调的队列（可选，子进程 -> 主进程）
+        command_queue: 用于命令的队列（可选，主进程 -> 子进程）
     """
     import os
     os.environ["MASTER_ADDR"] = "localhost"
@@ -1089,6 +1091,30 @@ def _ddp_worker(
                 pass
         trainer.add_callback(state_callback)
     
+    # rank 0 监听命令队列（保存检查点等）
+    if command_queue is not None and rank == 0:
+        def command_listener():
+            """监听主进程发来的命令"""
+            while trainer.state.running:
+                try:
+                    cmd = command_queue.get(timeout=0.5)
+                    if cmd == "save_checkpoint":
+                        logger.info("[DDP rank 0] 收到保存检查点命令")
+                        trainer._save_checkpoint(trainer.state.epoch, is_final=False)
+                        if callback_queue:
+                            callback_queue.put_nowait(("checkpoint_saved", trainer.state.epoch))
+                    elif cmd == "stop":
+                        logger.info("[DDP rank 0] 收到停止命令")
+                        trainer.state.running = False
+                        break
+                except:
+                    # 超时或队列空，继续
+                    continue
+        
+        # 启动命令监听线程
+        cmd_thread = threading.Thread(target=command_listener, daemon=True)
+        cmd_thread.start()
+    
     trainer.setup()
     trainer.run()
     
@@ -1101,7 +1127,7 @@ def launch_distributed_training(
     num_gpus: int = 0,
     callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     blocking: bool = True,
-) -> Optional[Any]:
+) -> Optional[Dict[str, Any]]:
     """启动分布式训练（支持 Web 调用）
     
     使用 torch.multiprocessing.spawn 在代码中启动多进程 DDP 训练，
@@ -1114,7 +1140,10 @@ def launch_distributed_training(
         blocking: 是否阻塞等待训练完成
     
     Returns:
-        如果 blocking=False，返回进程上下文，可用于停止训练
+        字典包含:
+        - command_queue: 命令队列（用于发送保存检查点等命令）
+        - context: 进程上下文（blocking=False 时）
+        阻塞模式返回 None
     
     Example:
         >>> config = TrainingConfig(game_type="chinese_chess", use_ddp=True)
@@ -1123,9 +1152,9 @@ def launch_distributed_training(
         >>> launch_distributed_training(config, num_gpus=4)
         >>> 
         >>> # 非阻塞模式（后台运行）
-        >>> ctx = launch_distributed_training(config, num_gpus=4, blocking=False)
-        >>> # ... 做其他事情 ...
-        >>> ctx.join()  # 等待完成
+        >>> result = launch_distributed_training(config, num_gpus=4, blocking=False)
+        >>> result["command_queue"].put("save_checkpoint")  # 发送保存命令
+        >>> result["context"].join()  # 等待完成
     """
     import torch.multiprocessing as mp
     
@@ -1151,11 +1180,13 @@ def launch_distributed_training(
         s.bind(('', 0))
         master_port = s.getsockname()[1]
     
-    # 创建回调队列（用于跨进程通信）
-    callback_queue = None
+    # 创建回调队列（子进程 -> 主进程）
+    callback_queue = mp.Queue() if callback else None
+    
+    # 创建命令队列（主进程 -> 子进程 rank 0）
+    command_queue = mp.Queue()
+    
     if callback:
-        callback_queue = mp.Queue()
-        
         # 启动回调监听线程
         def callback_listener():
             while True:
@@ -1165,6 +1196,8 @@ def launch_distributed_training(
                         break
                     elif msg_type == "state":
                         callback(data)
+                    elif msg_type == "checkpoint_saved":
+                        logger.info(f"[DDP] 检查点已保存: epoch {data}")
                 except:
                     continue
         
@@ -1176,7 +1209,7 @@ def launch_distributed_training(
     if blocking:
         mp.spawn(
             _ddp_worker,
-            args=(num_gpus, config_dict, master_port, callback_queue),
+            args=(num_gpus, config_dict, master_port, callback_queue, command_queue),
             nprocs=num_gpus,
             join=True,
         )
@@ -1185,11 +1218,14 @@ def launch_distributed_training(
         # 非阻塞模式
         ctx = mp.spawn(
             _ddp_worker,
-            args=(num_gpus, config_dict, master_port, callback_queue),
+            args=(num_gpus, config_dict, master_port, callback_queue, command_queue),
             nprocs=num_gpus,
             join=False,
         )
-        return ctx
+        return {
+            "command_queue": command_queue,
+            "context": ctx,
+        }
 
 
 # ============================================================
