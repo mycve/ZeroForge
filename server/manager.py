@@ -103,6 +103,7 @@ class TrainingManager:
         self._checkpoint_manager = None
         self._trainer = None  # DistributedTrainer 实例
         self._ddp_command_queue = None  # DDP 模式下的命令队列
+        self._ddp_context = None  # DDP 进程上下文（用于强制终止）
         
         # 调试数据（用于前端展示）
         self._debug_data = {
@@ -285,14 +286,33 @@ class TrainingManager:
                     blocking=False,
                 )
                 
-                # 保存命令队列引用（用于手动保存检查点等）
+                # 保存命令队列和上下文引用
                 if result:
                     self._ddp_command_queue = result["command_queue"]
-                    ddp_context = result["context"]
+                    self._ddp_context = result["context"]
                     
-                    # 阻塞等待训练完成
-                    ddp_context.join()
+                    # 等待训练完成（支持中途停止）
+                    while True:
+                        try:
+                            # 每秒检查一次是否需要停止
+                            self._ddp_context.join(timeout=1.0)
+                            break  # join 成功，训练结束
+                        except Exception:
+                            # 检查是否收到停止信号
+                            if self._stop_event.is_set():
+                                logger.info("收到停止信号，终止 DDP 进程...")
+                                # 强制终止所有子进程
+                                for process in self._ddp_context.processes:
+                                    if process.is_alive():
+                                        process.terminate()
+                                # 等待进程结束
+                                for process in self._ddp_context.processes:
+                                    process.join(timeout=5.0)
+                                break
+                            continue
+                    
                     self._ddp_command_queue = None
+                    self._ddp_context = None
                 
                 return
             
@@ -783,16 +803,31 @@ class TrainingManager:
         """停止训练"""
         self._stop_event.set()
         
-        # DDP 模式：发送停止命令
+        # DDP 模式：发送停止命令并等待终止
         if self._ddp_command_queue is not None:
             try:
                 self._ddp_command_queue.put("stop")
                 logger.info("已发送停止命令 (DDP 模式)")
             except:
                 pass
+        
+        # 强制终止 DDP 进程（如果还在运行）
+        if self._ddp_context is not None:
+            logger.info("强制终止 DDP 进程...")
+            try:
+                for process in self._ddp_context.processes:
+                    if process.is_alive():
+                        process.terminate()
+                for process in self._ddp_context.processes:
+                    process.join(timeout=3.0)
+                    if process.is_alive():
+                        process.kill()  # 强制杀死
+            except Exception as e:
+                logger.warning(f"终止 DDP 进程时出错: {e}")
+            self._ddp_context = None
             self._ddp_command_queue = None
         
-        # 停止 DistributedTrainer
+        # 停止 DistributedTrainer（单卡模式）
         if self._trainer is not None:
             self._trainer.stop()
         
@@ -1135,7 +1170,9 @@ class GameManager:
         session_id: str, 
         checkpoint_path: str, 
         legal_actions: List[int],
-        temperature: float = 0.5,  # 中等温度，增加随机性
+        use_mcts: bool = True,  # 是否使用 MCTS 搜索
+        num_simulations: int = None,  # None 表示使用检查点配置
+        temperature: float = 0.3,  # 适中温度，有一点变化
     ) -> int:
         """使用检查点进行 AI 下棋
         
@@ -1143,7 +1180,9 @@ class GameManager:
             session_id: 会话 ID
             checkpoint_path: 检查点路径
             legal_actions: 合法动作列表
-            temperature: 动作采样温度（0=贪婪，1=按概率采样，>1=更随机）
+            use_mcts: 是否使用 MCTS 搜索（强烈建议开启）
+            num_simulations: MCTS 模拟次数（None=使用检查点配置）
+            temperature: 动作采样温度（0=贪婪，1=按概率采样）
         """
         import torch
         import numpy as np
@@ -1163,6 +1202,12 @@ class GameManager:
             algo_type = checkpoint.get("algorithm")
             device = resolve_device("auto")
             
+            # 从检查点配置中读取 MCTS 参数
+            config = checkpoint.get("config", {})
+            if num_simulations is None:
+                num_simulations = config.get("num_simulations", 50)
+            c_puct = config.get("c_puct", 1.5)
+            
             # 获取或创建网络
             cache_key = checkpoint_path
             if cache_key not in self._ai_networks:
@@ -1175,21 +1220,63 @@ class GameManager:
             
             network = self._ai_networks[cache_key]
             
-            # 获取当前观测
+            # 获取当前游戏状态
             with self._lock:
                 session = self._sessions.get(session_id)
                 if session is None:
                     return random.choice(legal_actions)
                 game = session._game
                 obs = game.get_observation()
+                legal_mask = game.get_legal_actions_mask()
             
-            # 使用网络预测
+            # 使用 MCTS 搜索（推荐，强度更高）
+            if use_mcts:
+                from core.mcts import MCTSConfig, LocalMCTSTree
+                
+                # 创建 MCTS 树（使用检查点配置）
+                mcts_config = MCTSConfig(
+                    num_simulations=num_simulations,
+                    c_puct=c_puct,
+                    dirichlet_alpha=0.0,  # 对战时不加噪声
+                    dirichlet_epsilon=0.0,
+                )
+                mcts_tree = LocalMCTSTree(game.clone(), mcts_config, mode="alphazero")
+                
+                # 评估函数
+                def evaluate_fn(obs_np, mask_np):
+                    with torch.no_grad():
+                        obs_t = torch.from_numpy(obs_np).unsqueeze(0).float().to(device)
+                        policy_logits, value = network(obs_t)
+                        policy = torch.softmax(policy_logits, dim=-1)[0].cpu().numpy()
+                        value_scalar = value.item()
+                    return policy, value_scalar
+                
+                # 执行 MCTS 搜索
+                action, policy_dict, root_value = mcts_tree.search(
+                    evaluate_fn=evaluate_fn,
+                    num_simulations=num_simulations,
+                    add_noise=False,  # 对战时不加噪声
+                )
+                
+                # 使用温度从 MCTS 策略中采样
+                if temperature > 0.01 and policy_dict:
+                    actions = list(policy_dict.keys())
+                    probs = np.array([policy_dict[a] for a in actions])
+                    # 应用温度
+                    probs = np.power(probs + 1e-8, 1.0 / temperature)
+                    probs = probs / probs.sum()
+                    action = np.random.choice(actions, p=probs)
+                
+                logger.debug(f"[AI] MCTS 选择: action={action}, sims={num_simulations}, value={root_value:.3f}")
+                return action
+            
+            # 不用 MCTS，直接用网络预测（弱）
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs).unsqueeze(0).float().to(device)
                 policy_logits, value = network(obs_t)
                 policy = torch.softmax(policy_logits, dim=-1)[0].cpu().numpy()
             
-            # 使用温度采样选择动作（而不是贪婪选择）
+            # 使用温度采样选择动作
             legal_probs = np.array([policy[a] for a in legal_actions])
             
             if temperature < 0.01:
@@ -1206,6 +1293,8 @@ class GameManager:
             
         except Exception as e:
             logger.error(f"检查点 AI 失败: {e}")
+            import traceback
+            traceback.print_exc()
             return random.choice(legal_actions)
     
     def _ai_move_with_algo(self, session_id: str, algo: str, legal_actions: List[int]) -> int:
