@@ -365,7 +365,11 @@ class GumbelSearch:
         
         if self.config.temperature > 0:
             q_probs = np.exp(q_array / self.config.temperature)
-            q_probs = q_probs / (q_probs.sum() + 1e-8)
+            q_sum = q_probs.sum()
+            if q_sum > 0:
+                q_probs = q_probs / q_sum
+            else:
+                q_probs = np.ones_like(q_probs) / len(q_probs)
         else:
             # 贪婪选择
             q_probs = np.zeros_like(q_array)
@@ -411,7 +415,14 @@ class GumbelSearch:
         else:
             # 温度采样
             probs = probs ** (1.0 / temperature)
-            probs = probs / (probs.sum() + 1e-8)
+            prob_sum = probs.sum()
+            if prob_sum > 0:
+                probs = probs / prob_sum
+            else:
+                # 概率全为0时，均匀分布
+                probs = np.ones_like(probs) / len(probs)
+            # 确保概率精确求和为1（修复浮点误差）
+            probs = probs / probs.sum()
             return np.random.choice(actions, p=probs)
 
 

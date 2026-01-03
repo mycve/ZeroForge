@@ -388,7 +388,12 @@ class MCTSNode:
         else:
             # 温度采样
             visits_temp = visits ** (1.0 / temperature)
-            probs = visits_temp / visits_temp.sum()
+            total = visits_temp.sum()
+            if total > 0:
+                probs = visits_temp / total
+            else:
+                # 访问次数全为0时，均匀分布
+                probs = np.ones_like(visits, dtype=np.float32) / len(visits)
         
         return {action: float(prob) for action, prob in zip(actions, probs)}
     

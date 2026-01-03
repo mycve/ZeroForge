@@ -387,7 +387,14 @@ class GumbelMCTSSearch:
             return actions[np.argmax(probs)]
         else:
             probs = probs ** (1.0 / temperature)
-            probs = probs / (probs.sum() + 1e-8)
+            prob_sum = probs.sum()
+            if prob_sum > 0:
+                probs = probs / prob_sum
+            else:
+                # 概率全为0时，均匀分布
+                probs = np.ones_like(probs) / len(probs)
+            # 确保概率精确求和为1（修复浮点误差）
+            probs = probs / probs.sum()
             return np.random.choice(actions, p=probs)
     
     # ========================================
