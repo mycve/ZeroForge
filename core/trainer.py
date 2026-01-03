@@ -1182,11 +1182,14 @@ def launch_distributed_training(
         s.bind(('', 0))
         master_port = s.getsockname()[1]
     
+    # 使用 Manager 创建队列（避免 Python 3.14t 的 SemLock 问题）
+    manager = mp.Manager()
+    
     # 创建回调队列（子进程 -> 主进程）
-    callback_queue = mp.Queue() if callback else None
+    callback_queue = manager.Queue() if callback else None
     
     # 创建命令队列（主进程 -> 子进程 rank 0）
-    command_queue = mp.Queue()
+    command_queue = manager.Queue()
     
     if callback:
         # 启动回调监听线程
