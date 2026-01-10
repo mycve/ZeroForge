@@ -4,11 +4,11 @@
 
 ## 特性
 
-- 🚀 **Gumbel MuZero** - 采用最先进的 Gumbel MuZero 算法，高效策略改进
+- 🚀 **Gumbel MuZero** - 最先进算法，仅需 50-200 次模拟（传统需 800）
 - ⚡ **JAX 加速** - 纯 JAX 实现，支持 JIT 编译和多 GPU 数据并行
 - 🧠 **ConvNeXt 网络** - 现代卷积神经网络架构，16 步历史状态输入
 - 🎮 **完整规则** - 纯 JAX 实现的中国象棋引擎，支持长将、重复局面检测
-- 🖥️ **图形界面** - Pygame GUI 支持人机对弈和 FEN 导入测试
+- 🌐 **Web 界面** - Gradio Web GUI，支持人机对弈、FEN 导入测试
 - 📊 **训练监控** - TensorBoard 集成、ELO 评分、检查点管理
 
 ## 安装
@@ -40,17 +40,20 @@ python main.py train --config configs/default.yaml
 python main.py train --resume
 ```
 
-### 图形界面对弈
+### Web 界面对弈 (推荐)
 
 ```bash
-# 双人模式
-python main.py gui
+# 双人模式 - 打开 http://localhost:7860
+python main.py web
 
 # 使用训练好的模型对弈
-python main.py gui --checkpoint checkpoints/
+python main.py web --checkpoint checkpoints/
 
-# 导入 FEN 测试规则
-python main.py gui --fen "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
+# 分享到公网 (生成临时链接)
+python main.py web --share
+
+# 调整 AI 思考深度
+python main.py web --checkpoint checkpoints/ --simulations 400
 ```
 
 ### CLI 对弈
@@ -85,13 +88,21 @@ ZeroForge/
 ├── evaluation/             # 评估模块
 │   ├── arena.py            # 对弈竞技场
 │   └── elo.py              # ELO 评分
-├── gui/                    # 图形界面
-│   └── xiangqi_gui.py      # Pygame GUI
+├── gui/                    # Web 界面
+│   └── web_gui.py          # Gradio GUI
 └── cli/                    # 命令行界面
     └── play.py             # CLI 对弈
 ```
 
 ## 技术细节
+
+### Gumbel MuZero 优势
+
+| 特性 | AlphaZero/MuZero | Gumbel MuZero |
+|------|------------------|---------------|
+| MCTS 模拟次数 | 800 | **50-200** |
+| 策略改进 | 访问计数 | Sequential Halving |
+| 探索策略 | UCB | Gumbel-Top-k |
 
 ### 观察空间
 
@@ -113,8 +124,8 @@ ZeroForge/
     │
     ▼
 ┌─────────────────┐
-│ Representation  │  ConvNeXt (8 blocks)
-│    Network      │  → 隐藏状态 (256, 10, 9)
+│ Representation  │  ConvNeXt (12 blocks)
+│    Network      │  → 隐藏状态 (384, 10, 9)
 └─────────────────┘
     │
     ├─────────────────────┐
@@ -122,7 +133,7 @@ ZeroForge/
 ┌─────────────┐    ┌─────────────┐
 │  Dynamics   │    │ Prediction  │
 │   Network   │    │   Network   │
-│ (4 blocks)  │    │ (4 blocks)  │
+│ (6 blocks)  │    │ (6 blocks)  │
 └─────────────┘    └─────────────┘
     │                     │
     ▼                     ├───────┬───────┐
@@ -136,33 +147,56 @@ ZeroForge/
 - ✅ 将帅对面
 - ✅ 将军检测
 - ✅ 将死/困毙判定
-- ✅ 重复局面检测 (三次重复判和)
+- ✅ 重复局面检测 (Zobrist 哈希，三次重复判和)
 - ✅ 长将检测 (连续将军 6 次判负)
 - ✅ 和棋规则 (200 步/120 步无吃子)
 
 ## 配置说明
 
-主要配置项 (`configs/default.yaml`):
+默认配置针对 **8×GPU (32GB) + 128核 CPU** 优化:
 
 ```yaml
 # 网络配置
+network:
+  hidden_dim: 384           # 隐藏层维度
+  repr_blocks: 12           # 表示网络深度
+  dyn_blocks: 6             # 动态网络深度
+  pred_blocks: 6            # 预测网络深度
+
+# MCTS 配置
+mcts:
+  num_simulations: 100      # Gumbel MuZero 不需要太多
+  discount: 1.0             # 棋类游戏用 1.0
+  temperature_threshold: 30 # 前 30 步高温度探索
+  temperature_high: 1.0     # 探索温度
+  temperature_low: 0.25     # 利用温度
+
+# 训练配置
+training:
+  batch_size: 512           # 每 GPU，8 GPU 总共 4096
+  learning_rate: 0.003      # 大 batch 需要更高 LR
+  value_loss_weight: 1.0    # 棋类游戏 value 重要
+```
+
+<details>
+<summary>小规模配置 (单 GPU)</summary>
+
+```yaml
 network:
   hidden_dim: 256
   repr_blocks: 8
   dyn_blocks: 4
   pred_blocks: 4
 
-# MCTS 配置
-mcts:
-  num_simulations: 800
-  gumbel_scale: 1.0
-
-# 训练配置
 training:
   batch_size: 256
   learning_rate: 0.0002
-  num_training_steps: 1000000
+
+self_play:
+  num_parallel_games: 32
 ```
+
+</details>
 
 ## 依赖
 
@@ -170,13 +204,13 @@ training:
 - JAX >= 0.4.30 (支持 CUDA 12)
 - Flax >= 0.8.0
 - mctx >= 0.0.5
-- Pygame >= 2.5.0
+- Gradio >= 4.0.0
 
 ## 参考
 
-- [Gumbel MuZero (Danihelka et al., 2022)](https://arxiv.org/abs/2104.06303)
-- [MuZero (Schrittwieser et al., 2020)](https://arxiv.org/abs/1911.08265)
-- [AlphaZero (Silver et al., 2018)](https://arxiv.org/abs/1712.01815)
+- [Gumbel MuZero (Danihelka et al., 2022)](https://arxiv.org/abs/2104.06303) - Policy improvement by planning with Gumbel
+- [MuZero (Schrittwieser et al., 2020)](https://arxiv.org/abs/1911.08265) - Mastering Atari, Go, Chess and Shogi
+- [AlphaZero (Silver et al., 2018)](https://arxiv.org/abs/1712.01815) - Mastering Chess and Shogi
 - [mctx - JAX MCTS Library](https://github.com/google-deepmind/mctx)
 
 ## License

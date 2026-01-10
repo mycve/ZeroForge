@@ -122,15 +122,20 @@ def cmd_train(args):
     # MCTS 配置
     mcts_cfg = config.get("mcts", {})
     mcts_config = MCTSConfig(
-        num_simulations=mcts_cfg.get("num_simulations", 800),
+        num_simulations=mcts_cfg.get("num_simulations", 100),
         max_num_considered_actions=mcts_cfg.get("max_num_considered_actions", 16),
         gumbel_scale=mcts_cfg.get("gumbel_scale", 1.0),
-        discount=mcts_cfg.get("discount", 0.997),
-        temperature=mcts_cfg.get("temperature", 1.0),
+        discount=mcts_cfg.get("discount", 1.0),
+        temperature=mcts_cfg.get("temperature_high", 1.0),  # 默认高温度
         use_dirichlet_noise=True,
         dirichlet_alpha=mcts_cfg.get("dirichlet_alpha", 0.3),
         dirichlet_fraction=mcts_cfg.get("dirichlet_fraction", 0.25),
     )
+    
+    # 温度退火配置
+    temp_threshold = mcts_cfg.get("temperature_threshold", 30)
+    temp_high = mcts_cfg.get("temperature_high", 1.0)
+    temp_low = mcts_cfg.get("temperature_low", 0.25)
     
     # 创建目录
     checkpoint_dir = config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")
@@ -174,9 +179,13 @@ def cmd_train(args):
         rng_key, init_key = jax.random.split(rng_key)
         game_state = env.init(init_key)
         
+        step_in_game = 0
         while not game_state.terminated:
             # 记录当前玩家
             to_plays.append(int(game_state.current_player))
+            
+            # 温度退火：前 N 步高温度，之后低温度
+            current_temp = temp_high if step_in_game < temp_threshold else temp_low
             
             # 获取观察
             obs = env.observe(game_state)
@@ -198,18 +207,20 @@ def cmd_train(args):
                 rng_key=search_key,
             )
             
-            # 记录策略和价值
-            policy = get_improved_policy(policy_output, mcts_config.temperature)
+            # 记录策略和价值（训练目标用高温度）
+            policy = get_improved_policy(policy_output, temp_high)
             policies.append(np.array(policy[0]))
             
             root_value = float(policy_output.search_tree.node_values[0, 0])
             values.append(root_value)
             
-            # 选择动作
+            # 选择动作（使用退火后的温度）
             rng_key, action_key = jax.random.split(rng_key)
-            action = select_action(policy_output, temperature=mcts_config.temperature, rng_key=action_key)
+            action = select_action(policy_output, temperature=current_temp, rng_key=action_key)
             action = int(action[0])
             actions.append(action)
+            
+            step_in_game += 1
             
             # 执行动作
             game_state = env.step(game_state, jnp.int32(action))
@@ -467,8 +478,8 @@ def main():
         help="模型检查点路径"
     )
     play_parser.add_argument(
-        "--simulations", type=int, default=800,
-        help="MCTS 模拟次数"
+        "--simulations", type=int, default=200,
+        help="MCTS 模拟次数 (Gumbel MuZero 推荐 50-200)"
     )
     
     # Web GUI 命令 (推荐)
@@ -482,8 +493,8 @@ def main():
         help="配置文件路径"
     )
     web_parser.add_argument(
-        "--simulations", type=int, default=800,
-        help="MCTS 模拟次数"
+        "--simulations", type=int, default=200,
+        help="MCTS 模拟次数 (Gumbel MuZero 推荐 50-200)"
     )
     web_parser.add_argument(
         "--share", action="store_true",

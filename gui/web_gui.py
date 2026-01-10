@@ -613,20 +613,12 @@ def create_gui(ai_callback: Optional[Callable] = None):
     
     # JavaScript 注入到全局 - 使用事件委托
     js_init = """
-    console.log('[Chess] JS 初始化开始');
-    
     function setupChessBoard() {
-        console.log('[Chess] 设置事件监听');
-        
-        // 使用事件委托监听整个 document
         document.addEventListener('click', function(e) {
             const target = e.target;
-            console.log('[Chess] 点击:', target.tagName, target.className);
-            
             if (target.classList && target.classList.contains('click-area')) {
                 const row = target.getAttribute('data-row');
                 const col = target.getAttribute('data-col');
-                console.log('[Chess] 棋盘点击:', row, col);
                 if (row !== null && col !== null) {
                     triggerMove(row, col);
                 }
@@ -635,9 +627,6 @@ def create_gui(ai_callback: Optional[Callable] = None):
     }
     
     function triggerMove(row, col) {
-        console.log('[Chess] triggerMove:', row, col);
-        
-        // Gradio 4.x 组件选择器 - 尝试多种方式
         let rowInput = document.querySelector('#row-input textarea') 
                     || document.querySelector('#row-input input')
                     || document.querySelector('[id*="row-input"] textarea')
@@ -650,20 +639,7 @@ def create_gui(ai_callback: Optional[Callable] = None):
                     || document.querySelector('[id*="click-handler"]')
                     || document.querySelector('button[id*="click-handler"]');
         
-        console.log('[Chess] 找到元素:', !!rowInput, !!colInput, !!clickBtn);
-        
-        // 调试：打印所有带 id 的元素
-        if (!rowInput || !colInput || !clickBtn) {
-            console.log('[Chess] 调试 - 页面所有 ID:');
-            document.querySelectorAll('[id]').forEach(el => {
-                if (el.id.includes('row') || el.id.includes('col') || el.id.includes('click')) {
-                    console.log('  -', el.id, el.tagName);
-                }
-            });
-        }
-        
         if (rowInput && colInput && clickBtn) {
-            // 设置值 - 兼容 textarea 和 input
             const setter = rowInput.tagName === 'TEXTAREA' 
                 ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
                 : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -671,25 +647,18 @@ def create_gui(ai_callback: Optional[Callable] = None):
             setter.call(rowInput, row.toString());
             setter.call(colInput, col.toString());
             
-            // 触发 input 事件
             rowInput.dispatchEvent(new Event('input', { bubbles: true }));
             colInput.dispatchEvent(new Event('input', { bubbles: true }));
             
-            console.log('[Chess] 触发点击按钮');
             setTimeout(() => clickBtn.click(), 30);
-        } else {
-            console.log('[Chess] 找不到输入元素!');
         }
     }
     
-    // 页面加载后设置
-    console.log('[Chess] readyState:', document.readyState);
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', setupChessBoard);
     } else {
         setupChessBoard();
     }
-    console.log('[Chess] JS 初始化完成');
     """
     
     # 创建界面
