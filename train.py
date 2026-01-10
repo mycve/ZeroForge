@@ -3,8 +3,7 @@
 ZeroForge - 中国象棋 Gumbel MuZero
 训练脚本：自我对弈 + 训练 + ELO 评估 + 断点继续 + TensorBoard
 
-参考实现: https://github.com/zjjMaiMai/GumbelAlphaZero/blob/master/main.py
-关键改动: 使用简单的 @jax.jit 方式，不使用 pmap，确保 GPU 利用率正常
+支持多卡数据并行 (pmap)
 """
 
 import os
@@ -13,6 +12,7 @@ import jax.numpy as jnp
 import optax
 import chex
 import inspect
+from flax import jax_utils
 from jax import lax
 from typing import NamedTuple
 from flax.training import checkpoints, train_state
@@ -61,15 +61,12 @@ class Sample(NamedTuple):
 
 
 # ============================================================================
-# 自我对弈 (全 JIT)
+# 自我对弈 (为 pmap 设计，不加 @jax.jit)
 # ============================================================================
 
 def make_selfplay_fn(env, network, config: dict):
     """
-    创建 JIT 编译的自我对弈函数
-    
-    参考: https://github.com/zjjMaiMai/GumbelAlphaZero/blob/master/main.py
-    关键点：整个 selfplay 函数用 @jax.jit 装饰，内部使用 vmap 和 lax.scan
+    创建自我对弈函数（会被 pmap 包裹，不要加 @jax.jit）
     """
     
     num_parallel = config["self_play"]["num_parallel_games"]
@@ -88,7 +85,7 @@ def make_selfplay_fn(env, network, config: dict):
         supports_max_actions = False
     
     def recurrent_fn(params, rng_key, action, embedding):
-        """MuZero 动态模型 - 用于 MCTS 内部模拟"""
+        """MuZero 动态模型"""
         next_state, reward, logits, value = network.apply(
             params, embedding, action.astype(jnp.int32),
             method=network.recurrent_inference
@@ -100,33 +97,23 @@ def make_selfplay_fn(env, network, config: dict):
             value=value,
         ), next_state
     
-    # 预先 vmap 化环境函数（只做一次）
     v_init = jax.vmap(env.init)
     v_step = jax.vmap(env.step)
     v_observe = jax.vmap(env.observe)
     
-    @jax.jit
+    # 注意：不加 @jax.jit，因为会被 pmap 包裹
     def selfplay_fn(params, key):
-        """
-        单次自我对弈，生成训练数据
-        
-        参考 GumbelAlphaZero 的实现方式：
-        - 整个函数 JIT 编译
-        - 使用 lax.scan 展开时间步
-        """
+        """单设备的自我对弈"""
         k0, k1, k2 = jax.random.split(key, 3)
         
-        # 初始化并行游戏
         state = v_init(jax.random.split(k0, num_parallel))
         
         def selfplay_step(state, key):
-            """单步自玩 - 被 lax.scan 调用"""
             k_policy, k_reset = jax.random.split(key)
             
             obs = v_observe(state)
             player = state.current_player
             
-            # 获取网络输出（representation + prediction）
             output = network.apply(params, obs)
             root = mctx.RootFnOutput(
                 prior_logits=output.policy_logits,
@@ -134,7 +121,6 @@ def make_selfplay_fn(env, network, config: dict):
                 embedding=output.hidden_state,
             )
 
-            # MCTS 搜索
             if supports_max_actions:
                 policy_output = mctx.gumbel_muzero_policy(
                     params=params,
@@ -155,11 +141,9 @@ def make_selfplay_fn(env, network, config: dict):
                     invalid_actions=~state.legal_action_mask,
                 )
             
-            # 执行动作
             next_state = v_step(state, policy_output.action)
             reward = jax.vmap(lambda s, p: s.rewards[p])(next_state, player)
 
-            # auto-reset：终局后重置，保证持续产出对局
             reset_state = v_init(jax.random.split(k_reset, num_parallel))
             term = next_state.terminated
 
@@ -180,17 +164,15 @@ def make_selfplay_fn(env, network, config: dict):
             )
             return state_after, traj
         
-        # 展开时间步 (lax.scan 是 JAX 的循环原语，会被高效编译)
         _, traj = jax.lax.scan(
             selfplay_step,
             state,
             jax.random.split(k1, num_steps),
         )
         
-        # 计算 TD 目标值（从后往前传播）
         def compute_value(carry, t):
             value = t.reward + discount * carry * (1 - t.terminated.astype(jnp.float32))
-            return -value, value  # 负号：对手视角
+            return -value, value
         
         _, target_value = jax.lax.scan(
             compute_value,
@@ -199,10 +181,8 @@ def make_selfplay_fn(env, network, config: dict):
             reverse=True,
         )
         
-        # 有效样本掩码 (游戏结束后的步骤无效)
         mask = jnp.cumsum(traj.terminated[::-1], axis=0)[::-1] == 0
         
-        # 展平 (T, B, ...) -> (T*B, ...)
         total_samples = num_steps * num_parallel
         sample = Sample(
             obs=traj.obs.reshape(total_samples, *traj.obs.shape[2:]),
@@ -211,7 +191,6 @@ def make_selfplay_fn(env, network, config: dict):
         )
         mask = mask.reshape(total_samples)
         
-        # 打乱并分成 minibatch
         perm = jax.random.permutation(k2, total_samples)
         sample = jax.tree.map(lambda x: x[perm], sample)
         mask = mask[perm]
@@ -237,13 +216,11 @@ def make_train_step(network, config: dict):
     
     value_loss_weight = config["training"].get("value_loss_weight", 1.0)
     
-    @jax.jit
     def train_step(state, batch, mask):
-        """单步训练 (JIT 编译)"""
+        """单步训练（会被 pmap 包裹）"""
         def loss_fn(params):
             output = network.apply(params, batch.obs)
             
-            # 使用 mask 加权损失 (只计算有效样本)
             policy_loss_per_sample = optax.losses.softmax_cross_entropy(
                 output.policy_logits, batch.policy
             )
@@ -251,7 +228,6 @@ def make_train_step(network, config: dict):
                 output.value, batch.value
             )
             
-            # 加权平均
             mask_sum = mask.sum() + 1e-8
             policy_loss = (policy_loss_per_sample * mask).sum() / mask_sum
             value_loss = (value_loss_per_sample * mask).sum() / mask_sum
@@ -261,8 +237,13 @@ def make_train_step(network, config: dict):
         
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, (ploss, vloss)), grads = grad_fn(state.params)
+        
+        # 多卡：跨设备平均梯度
+        grads = lax.pmean(grads, axis_name="devices")
+        loss = lax.pmean(loss, axis_name="devices")
+        ploss = lax.pmean(ploss, axis_name="devices")
+        vloss = lax.pmean(vloss, axis_name="devices")
 
-        # 梯度裁剪
         grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
         
         state = state.apply_gradients(grads=grads)
@@ -276,7 +257,7 @@ def make_train_step(network, config: dict):
 # ============================================================================
 
 def make_eval_fn(env, network, config: dict):
-    """创建评估函数 (新模型 vs 旧模型)"""
+    """创建评估函数"""
     
     num_games = config["evaluation"].get("num_games", 100)
     max_steps = config["self_play"].get("max_steps", 200)
@@ -289,7 +270,6 @@ def make_eval_fn(env, network, config: dict):
     def eval_fn(new_params, old_params, elo, key):
         k0, k1, k2 = jax.random.split(key, 3)
         
-        # 随机分配新/旧模型的颜色
         new_is_red = jax.random.bernoulli(k0, 0.5, (num_games,))
         state = v_init(jax.random.split(k1, num_games))
         
@@ -297,11 +277,9 @@ def make_eval_fn(env, network, config: dict):
             state, = carry
             obs = v_observe(state)
             
-            # 新模型推理
             new_output = network.apply(new_params, obs)
             old_output = network.apply(old_params, obs)
             
-            # 选择当前玩家对应的模型
             is_new_turn = (state.current_player == 0) == new_is_red
             logits = jnp.where(
                 is_new_turn[:, None],
@@ -309,7 +287,6 @@ def make_eval_fn(env, network, config: dict):
                 old_output.policy_logits,
             )
             
-            # 贪心选择
             logits = jnp.where(state.legal_action_mask, logits, -1e9)
             action = jnp.argmax(logits, axis=-1)
             
@@ -322,7 +299,6 @@ def make_eval_fn(env, network, config: dict):
             jax.random.split(k2, max_steps),
         )
         
-        # 计算新模型的胜率
         new_wins = jnp.where(
             new_is_red,
             final_state.winner == 0,
@@ -332,7 +308,6 @@ def make_eval_fn(env, network, config: dict):
         draws = (final_state.winner == -1).astype(jnp.float32)
         win_rate = (new_wins + 0.5 * draws).mean()
         
-        # 更新 ELO
         expected = 1 / (1 + 10 ** ((elo - elo) / 400))
         new_elo = elo + 32 * (win_rate - expected) * num_games
         
@@ -346,7 +321,7 @@ def make_eval_fn(env, network, config: dict):
 # ============================================================================
 
 class CheckpointManager:
-    """简单的检查点管理"""
+    """检查点管理"""
     
     def __init__(self, checkpoint_dir: str, max_to_keep: int = 5):
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -354,7 +329,6 @@ class CheckpointManager:
         self.max_to_keep = max_to_keep
         
     def save(self, state: TrainState, step: int, elo: float):
-        """保存检查点"""
         ckpt = {
             "params": state.params,
             "opt_state": state.opt_state,
@@ -370,7 +344,6 @@ class CheckpointManager:
         logger.info(f"检查点已保存: step={step}, elo={elo:.1f}")
         
     def restore(self, state: TrainState) -> tuple:
-        """恢复检查点"""
         ckpt = checkpoints.restore_checkpoint(str(self.checkpoint_dir), None)
         if ckpt is None:
             return state, 0, 1500.0
@@ -388,26 +361,47 @@ class CheckpointManager:
 
 def main():
     """
-    主训练函数
-    
-    参考: https://github.com/zjjMaiMai/GumbelAlphaZero/blob/master/main.py
-    使用简单的 JIT 方式运行，确保 GPU 利用率正常
+    主训练函数 - 多卡数据并行版本
     """
-    # 加载配置
     config = load_config()
     
-    # 路径
     checkpoint_dir = config["checkpoint"].get("checkpoint_dir", "checkpoints")
     log_dir = config["logging"].get("log_dir", "logs")
     
+    # ====================================================================
+    # 多卡配置
+    # ====================================================================
+    devices = jax.local_devices()
+    n_devices = len(devices)
+    
     logger.info("=" * 60)
-    logger.info("ZeroForge - 中国象棋 Gumbel MuZero")
+    logger.info("ZeroForge - 中国象棋 Gumbel MuZero (多卡版)")
     logger.info("=" * 60)
     logger.info(f"JAX 后端: {jax.default_backend()}")
-    logger.info(f"可用设备: {jax.devices()}")
-    logger.info(f"并行游戏: {config['self_play']['num_parallel_games']}")
+    logger.info(f"设备数量: {n_devices}")
+    logger.info(f"设备列表: {devices}")
+    
+    # 检查配置是否能被设备数整除
+    global_batch_size = config["training"]["batch_size"]
+    global_num_parallel = config["self_play"]["num_parallel_games"]
+    
+    if global_batch_size % n_devices != 0:
+        raise ValueError(
+            f"batch_size={global_batch_size} 必须能被设备数 {n_devices} 整除！"
+            f"建议改为 {(global_batch_size // n_devices + 1) * n_devices}"
+        )
+    if global_num_parallel % n_devices != 0:
+        raise ValueError(
+            f"num_parallel_games={global_num_parallel} 必须能被设备数 {n_devices} 整除！"
+            f"建议改为 {(global_num_parallel // n_devices + 1) * n_devices}"
+        )
+    
+    per_device_batch = global_batch_size // n_devices
+    per_device_parallel = global_num_parallel // n_devices
+    
+    logger.info(f"全局 batch_size: {global_batch_size} (每卡 {per_device_batch})")
+    logger.info(f"全局 num_parallel_games: {global_num_parallel} (每卡 {per_device_parallel})")
     logger.info(f"MCTS 模拟: {config['mcts']['num_simulations']}")
-    logger.info(f"批大小: {config['training']['batch_size']}")
     
     # 环境和网络
     env = XiangqiEnv()
@@ -420,15 +414,13 @@ def main():
     key = jax.random.PRNGKey(config.get("seed", 42))
     key, init_key = jax.random.split(key)
     
-    batch_size = config["training"]["batch_size"]
-    
     state = create_train_state(
         init_key, network,
-        input_shape=(batch_size, 240, 10, 9),
+        input_shape=(per_device_batch, 240, 10, 9),
         learning_rate=config["training"]["learning_rate"],
     )
     
-    # 检查点管理
+    # 检查点
     ckpt_manager = CheckpointManager(
         checkpoint_dir,
         max_to_keep=config["checkpoint"].get("max_to_keep", 5),
@@ -443,12 +435,29 @@ def main():
     logger.info(f"TensorBoard: tensorboard --logdir {log_dir}")
     
     # ====================================================================
-    # 创建 JIT 编译的函数（参考 GumbelAlphaZero 的实现方式）
-    # 不使用 pmap，直接用 @jax.jit，让 JAX 自动调度到 GPU
+    # 创建每设备的配置和函数
     # ====================================================================
-    selfplay_fn = make_selfplay_fn(env, network, config)
-    train_step = make_train_step(network, config)
+    config_per_device = dict(config)
+    config_per_device["self_play"] = dict(config["self_play"])
+    config_per_device["training"] = dict(config["training"])
+    config_per_device["self_play"]["num_parallel_games"] = per_device_parallel
+    config_per_device["training"]["batch_size"] = per_device_batch
+    
+    selfplay_fn = make_selfplay_fn(env, network, config_per_device)
+    train_step = make_train_step(network, config_per_device)
     eval_fn = make_eval_fn(env, network, config)
+    
+    # ====================================================================
+    # pmap 包装
+    # ====================================================================
+    # 自玩: 每卡独立运行，不需要跨卡通信
+    p_selfplay = jax.pmap(selfplay_fn, axis_name="devices")
+    
+    # 训练: 每卡处理自己的数据，梯度跨卡平均
+    p_train_step = jax.pmap(train_step, axis_name="devices")
+    
+    # 复制参数到所有设备
+    state = jax_utils.replicate(state)
     
     # 训练配置
     save_interval = config["checkpoint"].get("save_interval", 1000)
@@ -457,44 +466,48 @@ def main():
     tb_interval = config["logging"].get("tensorboard_interval", 100)
     num_training_steps = config["training"]["num_training_steps"]
     
-    old_params = state.params  # 用于 ELO 评估
+    old_params = jax_utils.unreplicate(state.params)
     best_elo = elo
     
     logger.info("开始训练...")
-    logger.info("首次运行会进行 JIT 编译，可能需要几分钟，请耐心等待...")
+    logger.info("首次运行需要 JIT 编译，可能需要几分钟...")
     start_time = time.time()
     
     # ====================================================================
-    # 训练循环 (参考 GumbelAlphaZero 的简单方式)
+    # 训练循环
     # ====================================================================
     while step < num_training_steps:
         iter_start = time.time()
         step_at_iter_start = step
         key, k0, k1 = jax.random.split(key, 3)
         
-        # ----- 自我对弈 (JIT 编译，会自动在 GPU 上运行) -----
-        data, data_mask = selfplay_fn(state.params, k0)
-        n_batches = data.obs.shape[0]
-        n_samples = n_batches * batch_size
+        # 为每张卡生成独立的随机数
+        device_keys = jax.random.split(k0, n_devices)
         
-        # ----- 训练 (逐 batch，类似参考代码) -----
+        # ----- 多卡自我对弈 -----
+        # data: (n_devices, n_batches, per_device_batch, ...)
+        data, data_mask = p_selfplay(state.params, device_keys)
+        n_batches = data.obs.shape[1]
+        n_samples = n_devices * n_batches * per_device_batch
+        
+        # ----- 多卡训练 -----
         total_loss = 0.0
         total_ploss = 0.0
         total_vloss = 0.0
         
         for batch_idx in range(n_batches):
-            # 提取当前 batch
-            batch = jax.tree.map(lambda x: x[batch_idx], data)
-            mask = data_mask[batch_idx]
+            # 提取每卡的当前 batch: (n_devices, per_device_batch, ...)
+            batch = jax.tree.map(lambda x: x[:, batch_idx], data)
+            mask = data_mask[:, batch_idx]
             
-            # 训练一步 (JIT 编译)
-            state, metrics = train_step(state, batch, mask)
+            # pmap 训练
+            state, metrics = p_train_step(state, batch, mask)
             
-            total_loss += float(metrics["loss"])
-            total_ploss += float(metrics["policy_loss"])
-            total_vloss += float(metrics["value_loss"])
+            # metrics 在所有设备上相同（已 pmean），取第一个即可
+            total_loss += float(metrics["loss"][0])
+            total_ploss += float(metrics["policy_loss"][0])
+            total_vloss += float(metrics["value_loss"][0])
         
-        # step 按 batch 计数
         step += n_batches
         
         avg_loss = total_loss / n_batches
@@ -502,31 +515,30 @@ def main():
         avg_vloss = total_vloss / n_batches
         iter_time = time.time() - iter_start
         
-        # 控制台日志
-        def _crossed_interval(prev_step: int, curr_step: int, interval: int) -> bool:
-            """判断本轮内是否跨过了 interval 的边界"""
-            return interval > 0 and (prev_step // interval) != (curr_step // interval)
+        # 日志
+        def _crossed(prev, curr, interval):
+            return interval > 0 and (prev // interval) != (curr // interval)
 
-        if _crossed_interval(step_at_iter_start, step, log_interval):
+        if _crossed(step_at_iter_start, step, log_interval):
             elapsed = time.time() - start_time
             samples_per_sec = n_samples / iter_time if iter_time > 0 else 0
             logger.info(
                 f"step={step}, loss={avg_loss:.4f}, ploss={avg_ploss:.4f}, vloss={avg_vloss:.4f}, "
-                f"samples={n_samples}, elo={elo:.1f}, "
-                f"time={iter_time:.1f}s ({samples_per_sec:.0f} samples/s), elapsed={elapsed/60:.1f}min"
+                f"samples={n_samples} ({n_devices}卡×{n_batches}批×{per_device_batch}), "
+                f"time={iter_time:.1f}s ({samples_per_sec:.0f}/s), elapsed={elapsed/60:.1f}min"
             )
 
-        # TensorBoard
-        if _crossed_interval(step_at_iter_start, step, tb_interval):
+        if _crossed(step_at_iter_start, step, tb_interval):
             writer.add_scalar("loss/total", avg_loss, step)
             writer.add_scalar("loss/policy", avg_ploss, step)
             writer.add_scalar("loss/value", avg_vloss, step)
             writer.add_scalar("perf/samples_per_iter", n_samples, step)
-            writer.add_scalar("perf/iter_time", iter_time, step)
+            writer.add_scalar("perf/samples_per_sec", n_samples / iter_time, step)
         
-        # ELO 评估
-        if _crossed_interval(step_at_iter_start, step, eval_interval):
-            elo, win_rate = eval_fn(state.params, old_params, elo, k1)
+        # ELO 评估 (单卡运行)
+        if _crossed(step_at_iter_start, step, eval_interval):
+            current_params = jax_utils.unreplicate(state.params)
+            elo, win_rate = eval_fn(current_params, old_params, elo, k1)
             elo = float(elo)
             win_rate = float(win_rate)
             
@@ -537,15 +549,15 @@ def main():
             
             if elo > best_elo:
                 best_elo = elo
-                old_params = state.params  # 更新对手
+                old_params = current_params
                 logger.info(f"新最佳模型! elo={elo:.1f}")
         
         # 保存检查点
-        if _crossed_interval(step_at_iter_start, step, save_interval):
-            ckpt_manager.save(state, step, elo)
+        if _crossed(step_at_iter_start, step, save_interval):
+            ckpt_manager.save(jax_utils.unreplicate(state), step, elo)
     
     # 最终保存
-    ckpt_manager.save(state, step, elo)
+    ckpt_manager.save(jax_utils.unreplicate(state), step, elo)
     writer.close()
     
     total_time = time.time() - start_time
