@@ -87,7 +87,7 @@ class XiangqiState:
     
     # === 违规检测相关 ===
     
-    # 局面哈希历史 (POSITION_HISTORY_SIZE,) int64 - 用于重复局面检测
+    # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32 - 用于重复局面检测
     position_hashes: jnp.ndarray
     
     # 当前有效哈希数量
@@ -107,27 +107,28 @@ class XiangqiState:
 # Zobrist 哈希: 预计算随机数表
 # 形状: (棋子种类数+1, 棋盘格子数) = (15, 90)
 # 棋子编码: -7 到 7 (0=空), 所以需要偏移
+# 注意: 使用 int32 避免 JAX x64 模式问题，32 位哈希对于检测重复局面足够
 _ZOBRIST_SEED = 42
 _ZOBRIST_TABLE = jax.random.randint(
     jax.random.PRNGKey(_ZOBRIST_SEED),
     shape=(15, NUM_SQUARES),
-    minval=jnp.iinfo(jnp.int64).min,
-    maxval=jnp.iinfo(jnp.int64).max,
-    dtype=jnp.int64
+    minval=jnp.iinfo(jnp.int32).min,
+    maxval=jnp.iinfo(jnp.int32).max,
+    dtype=jnp.int32
 )
 
 # 当前玩家的哈希值
 _PLAYER_HASH = jax.random.randint(
     jax.random.PRNGKey(_ZOBRIST_SEED + 1),
     shape=(2,),
-    minval=jnp.iinfo(jnp.int64).min,
-    maxval=jnp.iinfo(jnp.int64).max,
-    dtype=jnp.int64
+    minval=jnp.iinfo(jnp.int32).min,
+    maxval=jnp.iinfo(jnp.int32).max,
+    dtype=jnp.int32
 )
 
 
 @jax.jit
-def compute_position_hash(board: jnp.ndarray, player: jnp.int32) -> jnp.int64:
+def compute_position_hash(board: jnp.ndarray, player: jnp.int32) -> jnp.int32:
     """
     计算局面的 Zobrist 哈希值
     
@@ -154,7 +155,7 @@ def compute_position_hash(board: jnp.ndarray, player: jnp.int32) -> jnp.int64:
 
 
 @jax.jit
-def count_repetitions(position_hash: jnp.int64, 
+def count_repetitions(position_hash: jnp.int32, 
                        position_hashes: jnp.ndarray, 
                        hash_count: jnp.int32) -> jnp.int32:
     """
@@ -211,7 +212,7 @@ class XiangqiEnv:
         
         # 计算初始局面哈希
         init_hash = compute_position_hash(board, current_player)
-        position_hashes = jnp.zeros(POSITION_HISTORY_SIZE, dtype=jnp.int64)
+        position_hashes = jnp.zeros(POSITION_HISTORY_SIZE, dtype=jnp.int32)
         position_hashes = position_hashes.at[0].set(init_hash)
         
         return XiangqiState(

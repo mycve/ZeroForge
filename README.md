@@ -15,7 +15,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/zeroforge/zeroforge.git
+git clone https://github.com/mycve/zeroforge.git
 cd zeroforge
 
 # 安装依赖 (GPU 版本)

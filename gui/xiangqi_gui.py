@@ -175,7 +175,7 @@ class XiangqiRules:
         # 创建新状态
         from xiangqi.env import compute_position_hash
         pos_hash = compute_position_hash(jax_board, jnp.int32(player))
-        position_hashes = jnp.zeros(POSITION_HISTORY_SIZE, dtype=jnp.int64)
+        position_hashes = jnp.zeros(POSITION_HISTORY_SIZE, dtype=jnp.int32)
         position_hashes = position_hashes.at[0].set(pos_hash)
         
         return XiangqiState(
