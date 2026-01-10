@@ -374,9 +374,27 @@ class MuZeroTrainer:
                 ema_params=restored.params if self.config.use_ema else None,
             )
         
-        # 初始化网络
+        # 初始化网络 (需要初始化所有子网络的参数)
         init_key, rng_key = jax.random.split(rng_key)
+        
+        # 使用 __call__ 初始化 representation 和 prediction
         params = self.network.init(init_key, sample_observation)
+        
+        # 额外初始化 dynamics 网络 (通过 recurrent_inference)
+        # 创建假的隐藏状态和动作
+        hidden_dim = self.network.hidden_dim
+        batch_size = sample_observation.shape[0]
+        dummy_hidden = jnp.zeros((batch_size, hidden_dim, 10, 9))
+        dummy_action = jnp.zeros((batch_size,), dtype=jnp.int32)
+        
+        init_key2, rng_key = jax.random.split(rng_key)
+        dyn_params = self.network.init(
+            init_key2, dummy_hidden, dummy_action, 
+            method=self.network.recurrent_inference
+        )
+        
+        # 合并参数 (dynamics 参数会在 dyn_params 中)
+        params = _merge_params(params, dyn_params)
         
         # 初始化优化器
         opt_state = self.optimizer.init(params)
@@ -462,6 +480,28 @@ class MuZeroTrainer:
 # ============================================================================
 # 辅助函数
 # ============================================================================
+
+def _merge_params(params1: dict, params2: dict) -> dict:
+    """
+    深度合并两个参数字典
+    
+    用于合并不同方法初始化的参数
+    """
+    import copy
+    result = copy.deepcopy(params1)
+    
+    def merge_dict(d1, d2):
+        for key, value in d2.items():
+            if key in d1:
+                if isinstance(value, dict) and isinstance(d1[key], dict):
+                    merge_dict(d1[key], value)
+                # 如果 key 已存在且不是 dict，保留 d1 的值
+            else:
+                d1[key] = value
+    
+    merge_dict(result, params2)
+    return result
+
 
 def _shard_batch(batch: SampleBatch, num_devices: int) -> SampleBatch:
     """将批次分片到多个设备"""
