@@ -58,16 +58,30 @@ COLOR_INFO_BG = (245, 245, 245)
 COLOR_BUTTON = (70, 130, 180)
 COLOR_BUTTON_HOVER = (100, 160, 210)
 
-# 棋子定义
-PIECE_NAMES = {
-    1: ('帥', '将'),
+# 棋子定义 - 中文名称 (红方, 黑方)
+PIECE_NAMES_CN = {
+    1: ('帅', '将'),  # 使用简体字
     2: ('仕', '士'),
     3: ('相', '象'),
-    4: ('傌', '馬'),
-    5: ('俥', '車'),
-    6: ('炮', '砲'),
+    4: ('马', '马'),
+    5: ('车', '车'),
+    6: ('炮', '炮'),
     7: ('兵', '卒'),
 }
+
+# 英文备选名称 (用于字体不支持中文时)
+PIECE_NAMES_EN = {
+    1: ('K', 'k'),   # King
+    2: ('A', 'a'),   # Advisor
+    3: ('B', 'b'),   # Bishop/Elephant
+    4: ('N', 'n'),   # Knight
+    5: ('R', 'r'),   # Rook
+    6: ('C', 'c'),   # Cannon
+    7: ('P', 'p'),   # Pawn
+}
+
+# 默认使用中文
+PIECE_NAMES = PIECE_NAMES_CN
 
 # FEN 字符映射
 FEN_PIECE_MAP = {
@@ -267,6 +281,67 @@ class XiangqiRules:
 class XiangqiGUI:
     """中国象棋图形界面 - 使用 xiangqi 模块规则"""
     
+    # 类变量：是否支持中文
+    _chinese_font_supported = None
+    _font_name_used = None
+    
+    @classmethod
+    def _load_chinese_font(cls, size: int) -> pygame.font.Font:
+        """
+        加载支持中文的字体 (跨平台)
+        
+        尝试顺序:
+        1. Windows: SimHei, Microsoft YaHei
+        2. macOS: PingFang SC, Heiti SC, STHeiti
+        3. Linux: Noto Sans CJK, WenQuanYi
+        4. 回退: 系统默认字体
+        """
+        import platform
+        
+        # 如果已知字体名称，直接使用
+        if cls._font_name_used:
+            return pygame.font.SysFont(cls._font_name_used, size)
+        
+        # 按优先级排列的中文字体列表
+        font_candidates = []
+        
+        system = platform.system()
+        if system == 'Windows':
+            font_candidates = [
+                'simhei', 'Microsoft YaHei', 'SimSun', 'FangSong', 'KaiTi'
+            ]
+        elif system == 'Darwin':  # macOS
+            font_candidates = [
+                'PingFang SC', 'Heiti SC', 'STHeiti', 'Songti SC', 
+                'Hiragino Sans GB', 'Apple LiGothic'
+            ]
+        else:  # Linux
+            font_candidates = [
+                'Noto Sans CJK SC', 'Noto Sans CJK', 'WenQuanYi Micro Hei',
+                'WenQuanYi Zen Hei', 'Droid Sans Fallback', 'AR PL UMing CN',
+                'Noto Sans SC', 'Source Han Sans CN'
+            ]
+        
+        # 尝试加载每个候选字体
+        for font_name in font_candidates:
+            try:
+                font = pygame.font.SysFont(font_name, size)
+                # 测试是否能渲染中文棋子字符
+                test_surface = font.render('车马炮', True, (0, 0, 0))
+                if test_surface.get_width() > 20:  # 成功渲染多个字符
+                    print(f"[GUI] 使用中文字体: {font_name}")
+                    cls._font_name_used = font_name
+                    cls._chinese_font_supported = True
+                    return font
+            except:
+                continue
+        
+        # 回退到默认字体
+        print("[GUI] 警告: 未找到中文字体，使用英文棋子名称")
+        cls._chinese_font_supported = False
+        cls._font_name_used = None
+        return pygame.font.Font(None, size + 10)  # 默认字体稍大一点
+    
     def __init__(self, ai_callback: Optional[Callable] = None):
         if not JAX_AVAILABLE:
             raise RuntimeError(
@@ -283,10 +358,10 @@ class XiangqiGUI:
         self.clock = pygame.time.Clock()
         self.running = True
         
-        # 字体
-        self.font_large = pygame.font.SysFont('simhei', 36)
-        self.font_medium = pygame.font.SysFont('simhei', 24)
-        self.font_small = pygame.font.SysFont('simhei', 18)
+        # 字体 - 跨平台中文字体支持
+        self.font_large = self._load_chinese_font(36)
+        self.font_medium = self._load_chinese_font(24)
+        self.font_small = self._load_chinese_font(18)
         
         # 规则引擎 (使用 xiangqi 模块)
         self.rules = XiangqiRules()
@@ -316,6 +391,10 @@ class XiangqiGUI:
         # 消息
         self.message = ""
         self.message_time = 0
+        
+        # 缓存（避免每帧调用 JAX）
+        self._is_check_cache = False
+        self._king_pos_cache = None
         
         # 初始化
         self.reset_game()
@@ -360,6 +439,9 @@ class XiangqiGUI:
         self.last_move = None
         self.fen_input = ""
         self.fen_input_active = False
+        
+        # 更新缓存
+        self._update_check_cache()
     
     def show_message(self, msg: str, duration: int = 3000):
         """显示消息"""
@@ -388,8 +470,16 @@ class XiangqiGUI:
     
     @property
     def is_check(self) -> bool:
-        """是否被将军"""
-        return self.rules.is_in_check(self.board, self.current_player)
+        """是否被将军（使用缓存）"""
+        return self._is_check_cache
+    
+    def _update_check_cache(self):
+        """更新将军状态缓存"""
+        self._is_check_cache = self.rules.is_in_check(self.board, self.current_player)
+        if self._is_check_cache:
+            self._king_pos_cache = self.rules.find_king(self.board, self.current_player)
+        else:
+            self._king_pos_cache = None
     
     @property
     def step_count(self) -> int:
@@ -486,16 +576,18 @@ class XiangqiGUI:
             else:
                 pygame.draw.circle(self.screen, COLOR_LEGAL_MOVE, (x, y), CELL_SIZE // 2 + 3, 3)
         
-        # 将军警告
-        if self.is_check:
-            king_pos = self.rules.find_king(self.board, self.current_player)
-            if king_pos:
-                x, y = self.board_to_screen(*king_pos)
-                pygame.draw.circle(self.screen, COLOR_CHECK, (x, y), CELL_SIZE // 2 + 8, 4)
+        # 将军警告 (使用缓存的 king 位置)
+        if self.is_check and hasattr(self, '_king_pos_cache') and self._king_pos_cache:
+            x, y = self.board_to_screen(*self._king_pos_cache)
+            pygame.draw.circle(self.screen, COLOR_CHECK, (x, y), CELL_SIZE // 2 + 8, 4)
     
     def draw_pieces(self):
         """绘制棋子"""
         board = self.board
+        
+        # 根据字体支持选择棋子名称
+        piece_names = PIECE_NAMES_CN if self._chinese_font_supported else PIECE_NAMES_EN
+        
         for row in range(BOARD_HEIGHT):
             for col in range(BOARD_WIDTH):
                 piece = board[row, col]
@@ -510,8 +602,8 @@ class XiangqiGUI:
                     pygame.draw.circle(self.screen, piece_color, (x, y), CELL_SIZE // 2 - 2, 2)
                     
                     piece_type = abs(piece)
-                    if piece_type in PIECE_NAMES:
-                        name = PIECE_NAMES[piece_type][0 if is_red else 1]
+                    if piece_type in piece_names:
+                        name = piece_names[piece_type][0 if is_red else 1]
                         text = self.font_large.render(name, True, piece_color)
                         text_rect = text.get_rect(center=(x, y))
                         self.screen.blit(text, text_rect)
@@ -656,14 +748,17 @@ class XiangqiGUI:
         """执行走棋 - 使用 xiangqi 规则"""
         # 保存历史
         self.state_history.append(self.state)
-        
+
         # 使用 xiangqi 模块执行走棋
         self.state = self.rules.make_move(self.state, from_row, from_col, to_row, to_col)
-        
+
         # 更新 UI 状态
         self.last_move = (from_row, from_col, to_row, to_col)
         self.selected_pos = None
         self.legal_moves = []
+        
+        # 更新缓存
+        self._update_check_cache()
         
         # 检查结果
         if self.is_game_over:
@@ -686,6 +781,7 @@ class XiangqiGUI:
                 self.last_move = None
                 self.selected_pos = None
                 self.legal_moves = []
+                self._update_check_cache()  # 更新缓存
                 self.show_message("悔棋成功")
             else:
                 self.show_message("无法悔棋")
@@ -783,7 +879,7 @@ class XiangqiGUI:
             self.draw_info_panel()
             
             pygame.display.flip()
-            self.clock.tick(60)
+            self.clock.tick(30)  # 棋盘游戏不需要高帧率
         
         pygame.quit()
 
