@@ -28,8 +28,8 @@ network:
   hidden_dim: 384
   # 观察通道数 (自动计算: (16+1)*14+2 = 240)
   observation_channels: 240
-  # 动作空间大小
-  action_space_size: 2086
+  # 动作空间大小 (自动从环境获取，无需配置)
+  # action_space_size: 会被 env.action_space_size 覆盖
   
   # Representation Network (加深)
   repr_blocks: 12

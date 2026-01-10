@@ -85,12 +85,12 @@ def cmd_train(args):
     logger.info(f"观察空间: {env.observation_shape}")
     logger.info(f"动作空间: {env.action_space_size}")
     
-    # 创建网络
+    # 创建网络 (使用环境的实际动作空间大小)
     net_config = config.get("network", {})
     network = MuZeroNetwork(
         observation_channels=net_config.get("observation_channels", NUM_OBSERVATION_CHANNELS),
         hidden_dim=net_config.get("hidden_dim", 256),
-        action_space_size=net_config.get("action_space_size", ACTION_SPACE_SIZE),
+        action_space_size=env.action_space_size,  # 使用环境的实际值
         repr_blocks=net_config.get("repr_blocks", 8),
         dyn_blocks=net_config.get("dyn_blocks", 4),
         pred_blocks=net_config.get("pred_blocks", 4),
