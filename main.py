@@ -141,6 +141,10 @@ def cmd_train(args):
     from mcts.search import MCTSRunner
     mcts_runner = MCTSRunner(network, mcts_config, env.action_space_size)
     
+    # 并行自我对弈配置
+    num_parallel_games = config.get("self_play", {}).get("num_parallel_games", 64)
+    logger.info(f"并行自我对弈: {num_parallel_games} 局/批次")
+    
     # 创建目录 (Orbax 要求绝对路径)
     checkpoint_dir = Path(config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")).resolve()
     log_dir = Path(config.get("logging", {}).get("log_dir", "logs")).resolve()
@@ -254,47 +258,67 @@ def cmd_train(args):
     
     # 预热信息
     logger.info(f"Replay Buffer 最小数据量: {training_config.min_replay_size}")
-    logger.info(f"开始自我对弈预热...")
+    logger.info(f"开始并行自我对弈预热...")
+    
+    # 导入并行自我对弈
+    from training.parallel_selfplay import run_parallel_selfplay
     
     try:
         while state.step < training_config.num_training_steps:
-            # 自我对弈生成数据
+            # 自我对弈生成数据 (批量并行)
             buffer_size = len(trainer.replay_buffer)
             need_more_data = buffer_size < training_config.min_replay_size or state.step % 10 == 0
             
             if need_more_data:
                 rng_key, play_key = jax.random.split(rng_key)
-                trajectory = run_self_play_game(state.params, play_key)
-                trainer.add_trajectory(trajectory)
-                games_played += 1
+                
+                # 批量并行自我对弈
+                trajectories = run_parallel_selfplay(
+                    env=env,
+                    mcts_runner=mcts_runner,
+                    params=state.params,
+                    rng_key=play_key,
+                    num_parallel=num_parallel_games,
+                    temp_threshold=temp_threshold,
+                    temp_high=temp_high,
+                    temp_low=temp_low,
+                )
+                
+                # 添加所有轨迹
+                total_steps = 0
+                for trajectory in trajectories:
+                    trainer.add_trajectory(trajectory)
+                    total_steps += len(trajectory.observations)
+                    
+                    # 数据增强
+                    if config.get("self_play", {}).get("use_mirror_augmentation", True):
+                        rng_key, aug_key = jax.random.split(rng_key)
+                        if jax.random.uniform(aug_key) < 0.5:
+                            from xiangqi.mirror import mirror_observation, mirror_action, mirror_policy
+                            mirrored_traj = Trajectory(
+                                observations=np.array([np.array(mirror_observation(jnp.array(o))) for o in trajectory.observations]),
+                                actions=np.array([int(mirror_action(jnp.int32(a))) for a in trajectory.actions]),
+                                rewards=trajectory.rewards,
+                                policies=np.array([np.array(mirror_policy(jnp.array(p))) for p in trajectory.policies]),
+                                values=trajectory.values,
+                                to_plays=trajectory.to_plays,
+                                game_result=trajectory.game_result,
+                                is_mirrored=True,
+                            )
+                            trainer.add_trajectory(mirrored_traj)
+                
+                games_played += len(trajectories)
                 
                 # 预热期间显示进度
-                if buffer_size < training_config.min_replay_size:
-                    if games_played % 5 == 0:  # 每5局显示一次
-                        logger.info(
-                            f"预热中: {buffer_size}/{training_config.min_replay_size} 步 "
-                            f"({games_played} 局, {len(trajectory.observations)} 步/局)"
-                        )
+                new_buffer_size = len(trainer.replay_buffer)
+                if new_buffer_size < training_config.min_replay_size:
+                    logger.info(
+                        f"预热中: {new_buffer_size}/{training_config.min_replay_size} 步 "
+                        f"({games_played} 局, +{total_steps} 步)"
+                    )
                 elif state.step == 0:
                     logger.info(f"预热完成! 开始训练... (共 {games_played} 局)")
                     logger.info("开始训练...")
-                
-                # 数据增强
-                if config.get("self_play", {}).get("use_mirror_augmentation", True):
-                    rng_key, aug_key = jax.random.split(rng_key)
-                    if jax.random.uniform(aug_key) < 0.5:
-                        from xiangqi.mirror import mirror_observation, mirror_action, mirror_policy
-                        mirrored_traj = Trajectory(
-                            observations=np.array([np.array(mirror_observation(jnp.array(o))) for o in trajectory.observations]),
-                            actions=np.array([int(mirror_action(jnp.int32(a))) for a in trajectory.actions]),
-                            rewards=trajectory.rewards,
-                            policies=np.array([np.array(mirror_policy(jnp.array(p))) for p in trajectory.policies]),
-                            values=trajectory.values,
-                            to_plays=trajectory.to_plays,  # to_plays 镜像不变
-                            game_result=trajectory.game_result,
-                            is_mirrored=True,
-                        )
-                        trainer.add_trajectory(mirrored_traj)
             
             # 训练步骤
             rng_key, train_key = jax.random.split(rng_key)
