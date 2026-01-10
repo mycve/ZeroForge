@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zeroforge"
+version = "0.1.0"
+description = "中国象棋 Gumbel MuZero AI - 基于 JAX/Flax 的强化学习训练框架"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "ZeroForge Team"},
+]
+keywords = [
+    "chinese-chess", "xiangqi", "gumbel-muzero", "muzero", "alphazero",
+    "reinforcement-learning", "game-ai", "mcts", "jax", "flax"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Games/Entertainment :: Board Games",
+]
+requires-python = ">=3.12"
+
+dependencies = [
+    # 核心 JAX 依赖
+    "numpy>=2.0.0",
+    "jax[cuda12]>=0.4.30",
+    "flax>=0.8.0",
+    "optax>=0.2.0",
+    "mctx>=0.0.5",
+    "chex>=0.1.8",
+    
+    # 检查点和序列化
+    "orbax-checkpoint>=0.5.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    
+    # 日志和可视化
+    "tensorboard>=2.15.0",
+    "pillow",
+    
+    # GUI 人机对弈
+    "pygame>=2.5.0",
+]
+
+[project.optional-dependencies]
+# CPU 版本 (无 CUDA)
+cpu = [
+    "jax>=0.4.30",
+]
+
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+[project.urls]
+Repository = "https://github.com/zeroforge/zeroforge"
+
+[tool.hatch.build.targets.wheel]
+packages = ["xiangqi", "networks", "mcts", "training", "evaluation", "cli", "gui"]
+
+[project.scripts]
+zeroforge = "main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+]
+ignore = [
+    "E501",  # line too long
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

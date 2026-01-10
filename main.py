@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""
+ZeroForge - 中国象棋 Gumbel MuZero AI
+主入口点
+
+用法:
+    python main.py train                    # 开始训练
+    python main.py train --resume           # 从检查点继续训练
+    python main.py play                     # 人机对弈
+    python main.py play --checkpoint PATH   # 使用指定检查点对弈
+    python main.py eval                     # 评估模型
+"""
+
+from __future__ import annotations
+import argparse
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+import yaml
+
+import jax
+import jax.numpy as jnp
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 配置加载
+# ============================================================================
+
+def load_config(config_path: str = "configs/default.yaml") -> dict:
+    """加载配置文件"""
+    config_path = Path(config_path)
+    if not config_path.exists():
+        logger.warning(f"配置文件不存在: {config_path}, 使用默认配置")
+        return {}
+    
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    
+    return config
+
+
+# ============================================================================
+# 训练命令
+# ============================================================================
+
+def cmd_train(args):
+    """训练命令"""
+    from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
+    from xiangqi.actions import ACTION_SPACE_SIZE
+    from xiangqi.mirror import augment_trajectory
+    from networks.muzero import MuZeroNetwork
+    from mcts.search import MCTSConfig, batched_mcts
+    from training.trainer import MuZeroTrainer, TrainingConfig
+    from training.replay_buffer import Trajectory, PrioritizedReplayBuffer
+    from training.logging import TrainingLogger, setup_logging
+    from training.checkpoint import CheckpointManager
+    from evaluation.arena import Arena, Player
+    from evaluation.elo import ELOTracker
+    import numpy as np
+    import time
+    
+    # 加载配置
+    config = load_config(args.config)
+    
+    # 设置日志
+    setup_logging(log_level="INFO")
+    
+    logger.info("=" * 60)
+    logger.info("ZeroForge - 中国象棋 Gumbel MuZero 训练")
+    logger.info("=" * 60)
+    logger.info(f"设备: {jax.devices()}")
+    logger.info(f"配置: {args.config}")
+    
+    # 创建环境
+    env = XiangqiEnv()
+    logger.info(f"观察空间: {env.observation_shape}")
+    logger.info(f"动作空间: {env.action_space_size}")
+    
+    # 创建网络
+    net_config = config.get("network", {})
+    network = MuZeroNetwork(
+        observation_channels=net_config.get("observation_channels", NUM_OBSERVATION_CHANNELS),
+        hidden_dim=net_config.get("hidden_dim", 256),
+        action_space_size=net_config.get("action_space_size", ACTION_SPACE_SIZE),
+        repr_blocks=net_config.get("repr_blocks", 8),
+        dyn_blocks=net_config.get("dyn_blocks", 4),
+        pred_blocks=net_config.get("pred_blocks", 4),
+        value_support_size=net_config.get("value_support_size", 0),
+        reward_support_size=net_config.get("reward_support_size", 0),
+    )
+    
+    # 训练配置
+    train_config = config.get("training", {})
+    training_config = TrainingConfig(
+        seed=config.get("seed", 42),
+        num_training_steps=train_config.get("num_training_steps", 1000000),
+        batch_size=train_config.get("batch_size", 256),
+        learning_rate=train_config.get("learning_rate", 2e-4),
+        lr_warmup_steps=train_config.get("lr_warmup_steps", 1000),
+        lr_decay_steps=train_config.get("lr_decay_steps", 100000),
+        weight_decay=train_config.get("weight_decay", 1e-4),
+        unroll_steps=train_config.get("unroll_steps", 5),
+        td_steps=train_config.get("td_steps", 10),
+        policy_loss_weight=train_config.get("policy_loss_weight", 1.0),
+        value_loss_weight=train_config.get("value_loss_weight", 0.25),
+        reward_loss_weight=train_config.get("reward_loss_weight", 1.0),
+        replay_buffer_size=config.get("replay_buffer", {}).get("capacity", 100000),
+        min_replay_size=config.get("replay_buffer", {}).get("min_size", 1000),
+        use_ema=train_config.get("use_ema", True),
+        ema_decay=train_config.get("ema_decay", 0.999),
+    )
+    
+    # MCTS 配置
+    mcts_cfg = config.get("mcts", {})
+    mcts_config = MCTSConfig(
+        num_simulations=mcts_cfg.get("num_simulations", 800),
+        max_num_considered_actions=mcts_cfg.get("max_num_considered_actions", 16),
+        gumbel_scale=mcts_cfg.get("gumbel_scale", 1.0),
+        discount=mcts_cfg.get("discount", 0.997),
+        temperature=mcts_cfg.get("temperature", 1.0),
+        use_dirichlet_noise=True,
+        dirichlet_alpha=mcts_cfg.get("dirichlet_alpha", 0.3),
+        dirichlet_fraction=mcts_cfg.get("dirichlet_fraction", 0.25),
+    )
+    
+    # 创建目录
+    checkpoint_dir = config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")
+    log_dir = config.get("logging", {}).get("log_dir", "logs")
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # 创建训练器
+    trainer = MuZeroTrainer(network, training_config, checkpoint_dir)
+    
+    # 创建日志器
+    experiment_name = config.get("experiment_name", "xiangqi_muzero")
+    train_logger = TrainingLogger(
+        log_dir=log_dir,
+        experiment_name=experiment_name,
+        console_interval=config.get("logging", {}).get("console_interval", 100),
+        tensorboard_interval=config.get("logging", {}).get("tensorboard_interval", 10),
+    )
+    
+    # 创建 ELO 追踪器
+    elo_tracker = ELOTracker(save_path=f"{checkpoint_dir}/elo.json")
+    
+    # 初始化训练状态
+    rng_key = jax.random.PRNGKey(config.get("seed", 42))
+    sample_obs = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9))
+    state = trainer.init_state(rng_key, sample_obs)
+    
+    logger.info(f"训练起始步数: {state.step}")
+    
+    # 自我对弈函数
+    def run_self_play_game(params, rng_key):
+        """运行一局自我对弈"""
+        observations = []
+        actions = []
+        policies = []
+        values = []
+        rewards = []
+        to_plays = []  # 记录每步的当前玩家
+        
+        # 初始化游戏
+        rng_key, init_key = jax.random.split(rng_key)
+        game_state = env.init(init_key)
+        
+        while not game_state.terminated:
+            # 记录当前玩家
+            to_plays.append(int(game_state.current_player))
+            
+            # 获取观察
+            obs = env.observe(game_state)
+            observations.append(np.array(obs))
+            
+            # MCTS 搜索
+            obs_batch = obs[jnp.newaxis, ...]
+            legal_mask_batch = game_state.legal_action_mask[jnp.newaxis, ...]
+            
+            rng_key, search_key = jax.random.split(rng_key)
+            
+            from mcts.search import run_mcts, get_improved_policy, select_action
+            policy_output = run_mcts(
+                observation=obs_batch,
+                legal_action_mask=legal_mask_batch,
+                network_apply=network.apply,
+                params=params,
+                config=mcts_config,
+                rng_key=search_key,
+            )
+            
+            # 记录策略和价值
+            policy = get_improved_policy(policy_output, mcts_config.temperature)
+            policies.append(np.array(policy[0]))
+            
+            root_value = float(policy_output.search_tree.node_values[0, 0])
+            values.append(root_value)
+            
+            # 选择动作
+            rng_key, action_key = jax.random.split(rng_key)
+            action = select_action(policy_output, temperature=mcts_config.temperature, rng_key=action_key)
+            action = int(action[0])
+            actions.append(action)
+            
+            # 执行动作
+            game_state = env.step(game_state, jnp.int32(action))
+            
+            # 记录奖励
+            rewards.append(float(game_state.rewards[0]))  # 红方视角
+        
+        # 创建轨迹
+        trajectory = Trajectory(
+            observations=np.array(observations),
+            actions=np.array(actions),
+            rewards=np.array(rewards),
+            policies=np.array(policies),
+            values=np.array(values),
+            to_plays=np.array(to_plays, dtype=np.int32),
+            game_result=int(game_state.winner),
+        )
+        
+        return trajectory
+    
+    # 主训练循环
+    logger.info("开始训练...")
+    
+    save_interval = config.get("checkpoint", {}).get("save_interval", 1000)
+    eval_interval = config.get("evaluation", {}).get("eval_interval", 5000)
+    
+    best_elo = 1500.0
+    
+    try:
+        while state.step < training_config.num_training_steps:
+            # 自我对弈生成数据
+            if len(trainer.replay_buffer) < training_config.min_replay_size or \
+               state.step % 10 == 0:  # 每10步补充数据
+                rng_key, play_key = jax.random.split(rng_key)
+                trajectory = run_self_play_game(state.params, play_key)
+                trainer.add_trajectory(trajectory)
+                
+                # 数据增强
+                if config.get("self_play", {}).get("use_mirror_augmentation", True):
+                    rng_key, aug_key = jax.random.split(rng_key)
+                    if jax.random.uniform(aug_key) < 0.5:
+                        from xiangqi.mirror import mirror_observation, mirror_action, mirror_policy
+                        mirrored_traj = Trajectory(
+                            observations=np.array([np.array(mirror_observation(jnp.array(o))) for o in trajectory.observations]),
+                            actions=np.array([int(mirror_action(jnp.int32(a))) for a in trajectory.actions]),
+                            rewards=trajectory.rewards,
+                            policies=np.array([np.array(mirror_policy(jnp.array(p))) for p in trajectory.policies]),
+                            values=trajectory.values,
+                            to_plays=trajectory.to_plays,  # to_plays 镜像不变
+                            game_result=trajectory.game_result,
+                            is_mirrored=True,
+                        )
+                        trainer.add_trajectory(mirrored_traj)
+            
+            # 训练步骤
+            rng_key, train_key = jax.random.split(rng_key)
+            state, metrics = trainer.train_step(state, train_key)
+            
+            if metrics:
+                train_logger.log_training(state.step, metrics)
+                
+                # 记录 buffer 状态
+                train_logger.log_buffer(
+                    state.step,
+                    len(trainer.replay_buffer),
+                    trainer.replay_buffer.num_trajectories(),
+                )
+            
+            # 保存检查点
+            if state.step > 0 and state.step % save_interval == 0:
+                current_elo = elo_tracker.get_rating(f"step_{state.step}")
+                is_best = current_elo > best_elo
+                if is_best:
+                    best_elo = current_elo
+                
+                trainer.save_checkpoint(
+                    state,
+                    elo_ratings={f"step_{state.step}": current_elo},
+                    is_best=is_best,
+                )
+            
+            # 评估
+            if state.step > 0 and state.step % eval_interval == 0:
+                logger.info(f"开始评估 (step={state.step})...")
+                # 这里可以添加与历史最佳版本的对弈评估
+                # 简化起见，只记录当前 ELO
+                elo_tracker.ratings[f"step_{state.step}"] = elo_tracker.ratings.get(
+                    f"step_{state.step}",
+                    type(elo_tracker.ratings.get("step_0", ELOTracker().get_player_info("")))(
+                        rating=1500 + state.step * 0.001
+                    )
+                )
+                
+                current_elo = elo_tracker.get_rating(f"step_{state.step}")
+                train_logger.log_eval(
+                    state.step,
+                    elo=current_elo,
+                    win_rate=0.5,  # 占位
+                    games_played=0,
+                )
+    
+    except KeyboardInterrupt:
+        logger.info("训练被用户中断")
+    
+    finally:
+        # 保存最终检查点
+        trainer.save_checkpoint(state)
+        train_logger.close()
+        logger.info("训练完成!")
+
+
+# ============================================================================
+# 对弈命令
+# ============================================================================
+
+def cmd_play(args):
+    """人机对弈命令 (CLI 模式)"""
+    from cli.play import ChessCLI
+    from mcts.search import MCTSConfig
+    
+    mcts_config = MCTSConfig(
+        num_simulations=args.simulations,
+        use_dirichlet_noise=False,
+    )
+    
+    cli = ChessCLI(
+        checkpoint_path=args.checkpoint,
+        mcts_config=mcts_config,
+    )
+    cli.play()
+
+
+# ============================================================================
+# GUI 命令
+# ============================================================================
+
+def cmd_gui(args):
+    """图形界面人机对弈"""
+    from gui.xiangqi_gui import run_gui
+    import numpy as np
+    
+    ai_callback = None
+    
+    # 如果提供了检查点，加载 AI
+    if args.checkpoint:
+        logger.info(f"加载模型: {args.checkpoint}")
+        try:
+            from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
+            from xiangqi.actions import ACTION_SPACE_SIZE
+            from networks.muzero import MuZeroNetwork
+            from mcts.search import MCTSConfig, run_mcts, select_action
+            from training.checkpoint import load_params
+            
+            # 创建网络
+            config = load_config(args.config)
+            net_config = config.get("network", {})
+            network = MuZeroNetwork(
+                observation_channels=net_config.get("observation_channels", NUM_OBSERVATION_CHANNELS),
+                hidden_dim=net_config.get("hidden_dim", 256),
+                action_space_size=net_config.get("action_space_size", ACTION_SPACE_SIZE),
+            )
+            
+            # 加载参数
+            params = load_params(args.checkpoint)
+            
+            # 创建环境
+            env = XiangqiEnv()
+            
+            # MCTS 配置
+            mcts_config = MCTSConfig(
+                num_simulations=args.simulations,
+                use_dirichlet_noise=False,
+            )
+            
+            def ai_move(board: np.ndarray, player: int):
+                """AI 走棋回调"""
+                # 转换为 JAX 状态
+                rng_key = jax.random.PRNGKey(42)
+                
+                # 创建环境状态 (简化)
+                state = env.init(rng_key)
+                # 用传入的 board 替换
+                state = state.replace(
+                    board=jnp.array(board, dtype=jnp.int8),
+                    current_player=jnp.int32(player),
+                )
+                # 重新计算合法动作
+                from xiangqi.rules import get_legal_moves_mask
+                legal_mask = get_legal_moves_mask(state.board, state.current_player)
+                state = state.replace(legal_action_mask=legal_mask)
+                
+                # 获取观察
+                obs = env.observe(state)
+                obs_batch = obs[jnp.newaxis, ...]
+                legal_mask_batch = state.legal_action_mask[jnp.newaxis, ...]
+                
+                # MCTS 搜索
+                rng_key, search_key = jax.random.split(rng_key)
+                policy_output = run_mcts(
+                    observation=obs_batch,
+                    legal_action_mask=legal_mask_batch,
+                    network_apply=network.apply,
+                    params=params,
+                    config=mcts_config,
+                    rng_key=search_key,
+                )
+                
+                # 选择动作
+                rng_key, action_key = jax.random.split(rng_key)
+                action = select_action(policy_output, temperature=0.0, rng_key=action_key)
+                action = int(action[0])
+                
+                # 转换为坐标
+                from xiangqi.actions import action_to_move
+                from_sq, to_sq = action_to_move(action)
+                from_row, from_col = int(from_sq) // 9, int(from_sq) % 9
+                to_row, to_col = int(to_sq) // 9, int(to_sq) % 9
+                
+                return ((from_row, from_col), (to_row, to_col))
+            
+            ai_callback = ai_move
+            logger.info("AI 模型加载成功")
+            
+        except Exception as e:
+            logger.error(f"加载 AI 失败: {e}")
+            logger.info("将以双人模式启动")
+    
+    logger.info("启动图形界面...")
+    logger.info("操作说明:")
+    logger.info("  - 点击棋子选中，再点击目标位置走棋")
+    logger.info("  - 右侧面板可导入/导出 FEN")
+    logger.info("  - 支持悔棋、换边等功能")
+    
+    run_gui(ai_callback=ai_callback, fen=args.fen)
+
+
+# ============================================================================
+# 评估命令
+# ============================================================================
+
+def cmd_eval(args):
+    """评估命令"""
+    from evaluation.arena import Arena
+    from evaluation.elo import ELOTracker
+    
+    logger.info("评估功能")
+    logger.info("使用: python main.py eval --checkpoint1 PATH1 --checkpoint2 PATH2")
+    
+    # 这里可以添加两个检查点之间的对弈评估
+    # 简化起见，只打印帮助信息
+
+
+# ============================================================================
+# 主入口
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ZeroForge - 中国象棋 Gumbel MuZero AI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python main.py train                         # 开始训练
+    python main.py train --config my_config.yaml # 使用自定义配置
+    python main.py play                          # CLI 人机对弈
+    python main.py gui                           # 图形界面 (推荐)
+    python main.py gui --checkpoint ckpt/        # 使用训练的模型对弈
+    python main.py gui --fen "FEN字符串"          # 导入指定局面
+""",
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+    
+    # 训练命令
+    train_parser = subparsers.add_parser("train", help="训练模型")
+    train_parser.add_argument(
+        "--config", type=str, default="configs/default.yaml",
+        help="配置文件路径"
+    )
+    train_parser.add_argument(
+        "--resume", action="store_true",
+        help="从检查点继续训练"
+    )
+    
+    # CLI 对弈命令
+    play_parser = subparsers.add_parser("play", help="CLI 人机对弈")
+    play_parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="模型检查点路径"
+    )
+    play_parser.add_argument(
+        "--simulations", type=int, default=800,
+        help="MCTS 模拟次数"
+    )
+    
+    # GUI 命令 (推荐)
+    gui_parser = subparsers.add_parser("gui", help="图形界面人机对弈 (推荐)")
+    gui_parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="模型检查点路径 (不提供则为双人模式)"
+    )
+    gui_parser.add_argument(
+        "--config", type=str, default="configs/default.yaml",
+        help="配置文件路径"
+    )
+    gui_parser.add_argument(
+        "--simulations", type=int, default=800,
+        help="MCTS 模拟次数"
+    )
+    gui_parser.add_argument(
+        "--fen", type=str, default=None,
+        help="初始 FEN 字符串 (用于导入指定局面测试)"
+    )
+    
+    # 评估命令
+    eval_parser = subparsers.add_parser("eval", help="评估模型")
+    eval_parser.add_argument(
+        "--checkpoint1", type=str,
+        help="模型1检查点路径"
+    )
+    eval_parser.add_argument(
+        "--checkpoint2", type=str,
+        help="模型2检查点路径"
+    )
+    eval_parser.add_argument(
+        "--games", type=int, default=100,
+        help="对局数"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.command == "train":
+        cmd_train(args)
+    elif args.command == "play":
+        cmd_play(args)
+    elif args.command == "gui":
+        cmd_gui(args)
+    elif args.command == "eval":
+        cmd_eval(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
