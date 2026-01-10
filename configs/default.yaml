@@ -1,178 +1,57 @@
 # ============================================================================
-# ZeroForge - 中国象棋 Gumbel MuZero 训练配置
-# 优化配置: 8×GPU (32GB) + 128核 CPU
+# ZeroForge - 中国象棋 Gumbel MuZero 配置
 # ============================================================================
 
-# 实验名称
-experiment_name: "xiangqi_muzero_v1"
-
-# 随机种子
 seed: 42
 
 # ============================================================================
-# 环境配置
-# ============================================================================
-env:
-  # 历史步数
-  num_history_steps: 16
-  # 最大游戏步数
-  max_steps: 200
-  # 无吃子最大步数 (和棋判定)
-  max_no_capture_steps: 120
-
-# ============================================================================
-# 网络配置 (大规模训练)
+# 网络
 # ============================================================================
 network:
-  # 隐藏层维度 (32GB 显存可以用更大)
-  hidden_dim: 384
-  # 观察通道数 (自动计算: (16+1)*14+2 = 240)
-  observation_channels: 240
-  # 动作空间大小 (自动从环境获取，无需配置)
-  # action_space_size: 会被 env.action_space_size 覆盖
-  
-  # Representation Network (加深)
-  repr_blocks: 12
-  
-  # Dynamics Network
-  dyn_blocks: 6
-  
-  # Prediction Network
-  pred_blocks: 6
-  
-  # 价值和奖励分布 (0=标量, >0=分类)
-  value_support_size: 0
-  reward_support_size: 0
-  
-  # Drop Path (正则化)
-  drop_path_rate: 0.1
+  hidden_dim: 256
 
 # ============================================================================
-# MCTS 配置
+# MCTS
 # ============================================================================
 mcts:
-  # 模拟次数 (Gumbel MuZero 不需要太多)
   num_simulations: 100
-  # Gumbel 采样的候选动作数
   max_num_considered_actions: 16
-  # Gumbel 缩放因子
-  gumbel_scale: 1.0
-  # 折扣因子 (棋类游戏用 1.0)
   discount: 1.0
-  
-  # 温度退火策略 (AlphaZero 风格)
-  temperature_threshold: 30    # 前 30 步用高温度
-  temperature_high: 1.0        # 高温度 (探索)
-  temperature_low: 0.25        # 低温度 (利用)
-  
-  # Dirichlet 噪声 (训练时增加探索)
-  dirichlet_alpha: 0.3
-  dirichlet_fraction: 0.25
 
 # ============================================================================
-# 训练配置 (8×GPU 优化)
+# 训练
 # ============================================================================
 training:
-  # 总训练步数
   num_training_steps: 1000000
-  
-  # 批次大小 (每个设备) - 8 GPU × 512 = 4096 total
   batch_size: 512
-  
-  # 学习率 (大 batch 需要更高 LR，使用 linear scaling)
-  # base_lr=0.0002 × (4096/256) ≈ 0.003
-  learning_rate: 0.003
-  lr_warmup_steps: 2000       # 大 batch 需要更长 warmup
-  lr_decay_steps: 200000
-  
-  # 权重衰减
-  weight_decay: 0.0001
-  
-  # 梯度裁剪
-  gradient_clip: 1.0
-  
-  # MuZero 展开步数
-  unroll_steps: 5
-  td_steps: 10
-  
-  # 损失权重 (棋类游戏 value 很重要，不要太低)
-  policy_loss_weight: 1.0
-  value_loss_weight: 1.0      # 棋类游戏用 1.0
-  reward_loss_weight: 1.0
-  
-  # EMA (指数移动平均)
-  use_ema: true
-  ema_decay: 0.9999           # 大 batch 可以用更高的 EMA
+  learning_rate: 0.0003
+  value_loss_weight: 1.0
 
 # ============================================================================
-# Replay Buffer 配置 (大容量)
-# ============================================================================
-replay_buffer:
-  # 容量 (位置数) - 增大到 50 万
-  capacity: 500000
-  # 最小采样所需的数据量
-  min_size: 5000
-  
-  # 优先级采样
-  alpha: 0.6
-  beta: 0.4
-  beta_increment: 0.0001      # 大 buffer 用更小的增量
-
-# ============================================================================
-# 自我对弈配置 (128 核 CPU 优化)
+# 自我对弈
 # ============================================================================
 self_play:
-  # 并行游戏数 (128 核可以跑更多)
-  num_parallel_games: 96
-  # Actor 数量 (使用多进程)
-  num_actors: 8
-  # 每次更新前的对局数
-  games_per_training_step: 2
-  
-  # 数据增强
-  use_mirror_augmentation: true
-  mirror_probability: 0.5
+  num_parallel_games: 512
+  max_steps: 200
 
 # ============================================================================
-# 评估配置
+# 评估
 # ============================================================================
 evaluation:
-  # 评估间隔 (大 batch 可以更频繁)
-  eval_interval: 2000
-  # 每次评估的对局数
-  num_eval_games: 100
-  
-  # 模型更新策略: Gumbel MuZero 推荐 "always"
-  update_strategy: "always"
-  
-  # 仅当 update_strategy="threshold" 时使用
-  win_threshold: 0.55
-  
-  # ELO 配置
-  elo_k_factor: 32.0
-  elo_k_factor_min: 16.0
-  elo_initial_rating: 1500.0
+  eval_interval: 5000
+  num_games: 100
 
 # ============================================================================
-# 日志和检查点配置
+# 日志
 # ============================================================================
 logging:
   log_dir: "logs"
-  console_interval: 50        # 更频繁的输出
-  tensorboard_interval: 10
+  console_interval: 100
 
+# ============================================================================
+# 检查点
+# ============================================================================
 checkpoint:
   checkpoint_dir: "checkpoints"
-  save_interval: 500          # 更频繁保存
-  max_to_keep: 10
-  keep_period: 5000
-
-# ============================================================================
-# 分布式训练配置
-# ============================================================================
-distributed:
-  # 使用 8 GPU 数据并行
-  multi_gpu: true
-  strategy: "data_parallel"
-  # GPU 数量 (JAX 会自动检测，这里仅供参考)
-  num_gpus: 8
+  save_interval: 1000
+  max_to_keep: 5

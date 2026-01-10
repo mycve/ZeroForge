@@ -43,6 +43,7 @@ dependencies = [
     
     # 日志和可视化
     "tensorboard>=2.15.0",
+    "tensorboardX>=2.6.0",
     "pillow",
     
     # Web GUI 人机对弈
@@ -66,10 +67,10 @@ dev = [
 Repository = "https://github.com/zeroforge/zeroforge"
 
 [tool.hatch.build.targets.wheel]
-packages = ["xiangqi", "networks", "mcts", "training", "evaluation", "cli", "gui"]
+packages = ["xiangqi", "networks", "gui"]
 
 [project.scripts]
-zeroforge = "main:main"
+zeroforge = "train:main"
 
 [tool.ruff]
 line-length = 100

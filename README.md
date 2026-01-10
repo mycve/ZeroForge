@@ -1,218 +1,109 @@
-# ZeroForge 🀄
+# ZeroForge - 中国象棋 Gumbel MuZero AI
 
-> **中国象棋 Gumbel MuZero AI** - 基于 JAX/Flax 的强化学习训练框架
+基于 JAX + mctx 的中国象棋 AI，使用 Gumbel MuZero 算法自我对弈进化。
 
 ## 特性
 
-- 🚀 **Gumbel MuZero** - 最先进算法，仅需 50-200 次模拟（传统需 800）
-- ⚡ **JAX 加速** - 纯 JAX 实现，支持 JIT 编译和多 GPU 数据并行
-- 🧠 **ConvNeXt 网络** - 现代卷积神经网络架构，16 步历史状态输入
-- 🎮 **完整规则** - 纯 JAX 实现的中国象棋引擎，支持长将、重复局面检测
-- 🌐 **Web 界面** - Gradio Web GUI，支持人机对弈、FEN 导入测试
-- 📊 **训练监控** - TensorBoard 集成、ELO 评分、检查点管理
-
-## 安装
-
-```bash
-# 克隆仓库
-git clone https://github.com/mycve/zeroforge.git
-cd zeroforge
-
-# 安装依赖 (GPU 版本)
-pip install -e .
-
-# 或 CPU 版本
-pip install -e ".[cpu]"
-```
+- **Gumbel MuZero**: 高效的 MCTS 搜索，100 次模拟即可达到好效果
+- **全 JAX JIT**: 自我对弈和训练完全 JIT 编译，GPU 高利用率
+- **批量并行**: 512 局游戏同时进行，充分利用 GPU
+- **完整象棋规则**: 将军、将死、长将、三次重复等
+- **ELO 评估**: 自动评估模型强度
+- **TensorBoard**: 实时监控训练进度
+- **断点继续**: 自动保存和恢复检查点
 
 ## 快速开始
 
-### 训练模型
-
 ```bash
-# 使用默认配置训练
-uv run python main.py train
+# 安装依赖
+pip install -e .
 
-# 使用自定义配置
-uv run python main.py train --config configs/default.yaml
+# 开始训练
+python train.py
 
-# 从检查点继续训练
-uv run python main.py train --resume
-```
-
-### Web 界面对弈 (推荐)
-
-```bash
-# 双人模式 - 打开 http://localhost:7860
-python main.py web
-
-# 使用训练好的模型对弈
-python main.py web --checkpoint checkpoints/
-
-# 分享到公网 (生成临时链接)
-python main.py web --share
-
-# 调整 AI 思考深度
-python main.py web --checkpoint checkpoints/ --simulations 400
-```
-
-### CLI 对弈
-
-```bash
-python main.py play --checkpoint checkpoints/
+# 查看训练日志
+tensorboard --logdir logs
 ```
 
 ## 项目结构
 
 ```
 ZeroForge/
-├── main.py                 # 主入口
+├── train.py           # 训练入口
 ├── configs/
-│   └── default.yaml        # 训练配置
-├── xiangqi/                # 中国象棋引擎 (纯 JAX)
-│   ├── env.py              # 游戏环境
-│   ├── rules.py            # 规则实现
-│   ├── actions.py          # 动作空间
-│   └── mirror.py           # 数据增强
-├── networks/               # 神经网络
-│   ├── muzero.py           # MuZero 网络
-│   ├── convnext.py         # ConvNeXt 骨干
-│   └── heads.py            # 输出头
-├── mcts/                   # 蒙特卡洛树搜索
-│   └── search.py           # Gumbel MCTS
-├── training/               # 训练模块
-│   ├── trainer.py          # 训练器
-│   ├── replay_buffer.py    # 经验回放
-│   ├── checkpoint.py       # 检查点
-│   └── logging.py          # 日志
-├── evaluation/             # 评估模块
-│   ├── arena.py            # 对弈竞技场
-│   └── elo.py              # ELO 评分
-├── gui/                    # Web 界面
-│   └── web_gui.py          # Gradio GUI
-└── cli/                    # 命令行界面
-    └── play.py             # CLI 对弈
+│   └── default.yaml   # 配置文件
+├── networks/          # 神经网络
+│   ├── muzero.py      # MuZero 网络
+│   ├── convnext.py    # ConvNeXt 骨干
+│   └── heads.py       # 输出头
+├── xiangqi/           # 象棋环境
+│   ├── env.py         # JAX 环境
+│   ├── rules.py       # 规则
+│   ├── actions.py     # 动作编码
+│   └── mirror.py      # 数据增强
+└── gui/
+    └── web_gui.py     # Gradio 人机对弈
+```
+
+## 配置
+
+编辑 `configs/default.yaml`:
+
+```yaml
+# 并行游戏数 (根据显存调整)
+self_play:
+  num_parallel_games: 512
+
+# MCTS 模拟次数
+mcts:
+  num_simulations: 100
+
+# 训练
+training:
+  batch_size: 512
+  learning_rate: 0.0003
+```
+
+## 训练输出
+
+```
+[2026-01-11] ZeroForge - 中国象棋 Gumbel MuZero
+[2026-01-11] 设备: [CudaDevice(id=0), ...]
+[2026-01-11] TensorBoard: tensorboard --logdir logs
+[2026-01-11] 开始训练...
+[2026-01-11] step=512, loss=2.34, samples=51200, elo=1500.0
+[2026-01-11] 评估: elo=1523.5, win_rate=54.00%
+[2026-01-11] 检查点已保存: step=1000, elo=1523.5
 ```
 
 ## 技术细节
 
-### Gumbel MuZero 优势
-
-| 特性 | AlphaZero/MuZero | Gumbel MuZero |
-|------|------------------|---------------|
-| MCTS 模拟次数 | 800 | **50-200** |
-| 策略改进 | 访问计数 | Sequential Halving |
-| 探索策略 | UCB | Gumbel-Top-k |
-
-### 观察空间
-
-- **形状**: `(240, 10, 9)`
-- **内容**: 
-  - 当前棋盘 + 16 步历史 (每步 14 通道 = 7 棋子类型 × 2 颜色)
-  - 当前玩家通道
-  - 步数通道
-
-### 动作空间
-
-- **大小**: 2086 个离散动作
-- **编码**: 压缩的 (起点, 终点) 对，仅包含合法移动模式
+### 算法
+- **Gumbel MuZero**: 使用 Gumbel-Top-k 技巧高效采样动作
+- **mctx**: Google DeepMind 的 MCTS 库
 
 ### 网络架构
+- **Representation**: ConvNeXt 编码器
+- **Dynamics**: 预测下一状态
+- **Prediction**: 策略和价值头
 
-```
-观察 (240, 10, 9)
-    │
-    ▼
-┌─────────────────┐
-│ Representation  │  ConvNeXt (12 blocks)
-│    Network      │  → 隐藏状态 (384, 10, 9)
-└─────────────────┘
-    │
-    ├─────────────────────┐
-    ▼                     ▼
-┌─────────────┐    ┌─────────────┐
-│  Dynamics   │    │ Prediction  │
-│   Network   │    │   Network   │
-│ (6 blocks)  │    │ (6 blocks)  │
-└─────────────┘    └─────────────┘
-    │                     │
-    ▼                     ├───────┬───────┐
- 下一状态              策略    价值    奖励
-```
+### 观察空间
+- 形状: `(240, 10, 9)`
+- 16 步历史 + 当前局面
+- 每步 14 个平面 (7 种棋子 × 2 方)
 
-### 规则实现
-
-- ✅ 所有棋子移动规则（将、士、象、马、车、炮、兵）
-- ✅ 蹩马腿、塞象眼
-- ✅ 将帅对面
-- ✅ 将军检测
-- ✅ 将死/困毙判定
-- ✅ 重复局面检测 (Zobrist 哈希，三次重复判和)
-- ✅ 长将检测 (连续将军 6 次判负)
-- ✅ 和棋规则 (200 步/120 步无吃子)
-
-## 配置说明
-
-默认配置针对 **8×GPU (32GB) + 128核 CPU** 优化:
-
-```yaml
-# 网络配置
-network:
-  hidden_dim: 384           # 隐藏层维度
-  repr_blocks: 12           # 表示网络深度
-  dyn_blocks: 6             # 动态网络深度
-  pred_blocks: 6            # 预测网络深度
-
-# MCTS 配置
-mcts:
-  num_simulations: 100      # Gumbel MuZero 不需要太多
-  discount: 1.0             # 棋类游戏用 1.0
-  temperature_threshold: 30 # 前 30 步高温度探索
-  temperature_high: 1.0     # 探索温度
-  temperature_low: 0.25     # 利用温度
-
-# 训练配置
-training:
-  batch_size: 512           # 每 GPU，8 GPU 总共 4096
-  learning_rate: 0.003      # 大 batch 需要更高 LR
-  value_loss_weight: 1.0    # 棋类游戏 value 重要
-```
-
-<details>
-<summary>小规模配置 (单 GPU)</summary>
-
-```yaml
-network:
-  hidden_dim: 256
-  repr_blocks: 8
-  dyn_blocks: 4
-  pred_blocks: 4
-
-training:
-  batch_size: 256
-  learning_rate: 0.0002
-
-self_play:
-  num_parallel_games: 32
-```
-
-</details>
+### 动作空间
+- 大小: 2550
+- 编码: 起点 (90) × 终点 (90) 的子集
 
 ## 依赖
 
-- Python >= 3.12
-- JAX >= 0.4.30 (支持 CUDA 12)
-- Flax >= 0.8.0
-- mctx >= 0.0.5
-- Gradio >= 4.0.0
-
-## 参考
-
-- [Gumbel MuZero (Danihelka et al., 2022)](https://arxiv.org/abs/2104.06303) - Policy improvement by planning with Gumbel
-- [MuZero (Schrittwieser et al., 2020)](https://arxiv.org/abs/1911.08265) - Mastering Atari, Go, Chess and Shogi
-- [AlphaZero (Silver et al., 2018)](https://arxiv.org/abs/1712.01815) - Mastering Chess and Shogi
-- [mctx - JAX MCTS Library](https://github.com/google-deepmind/mctx)
+- JAX + CUDA
+- Flax
+- mctx
+- Optax
+- TensorBoard
 
 ## License
 
-MIT License
+MIT

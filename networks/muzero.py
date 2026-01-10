@@ -447,3 +447,68 @@ if __name__ == "__main__":
     # 参数统计
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"\n总参数数量: {param_count:,}")
+
+
+# ============================================================================
+# TrainState 创建
+# ============================================================================
+
+from flax.training.train_state import TrainState
+import optax
+
+
+def create_train_state(
+    rng_key: jax.random.PRNGKey,
+    network: MuZeroNetwork,
+    input_shape: tuple,
+    learning_rate: float = 3e-4,
+) -> TrainState:
+    """
+    创建训练状态
+    
+    Args:
+        rng_key: 随机数密钥
+        network: MuZero 网络
+        input_shape: 输入形状 (batch, channels, height, width)
+        learning_rate: 学习率
+        
+    Returns:
+        TrainState
+    """
+    # 初始化参数
+    dummy_input = jnp.zeros(input_shape)
+    
+    # 需要初始化所有子网络 (representation + prediction + dynamics)
+    k1, k2 = jax.random.split(rng_key)
+    params = network.init(k1, dummy_input)
+    
+    # 初始化 dynamics (通过 recurrent_inference)
+    hidden_dim = network.hidden_dim
+    batch_size = input_shape[0]
+    dummy_hidden = jnp.zeros((batch_size, hidden_dim, 10, 9))
+    dummy_action = jnp.zeros((batch_size,), dtype=jnp.int32)
+    dyn_params = network.init(k2, dummy_hidden, dummy_action, method=network.recurrent_inference)
+    
+    # 合并参数
+    def merge_params(p1, p2):
+        import copy
+        result = copy.deepcopy(p1)
+        def merge(d1, d2):
+            for k, v in d2.items():
+                if k not in d1:
+                    d1[k] = v
+                elif isinstance(v, dict):
+                    merge(d1[k], v)
+        merge(result, p2)
+        return result
+    
+    params = merge_params(params, dyn_params)
+    
+    # 优化器
+    optimizer = optax.adam(learning_rate)
+    
+    return TrainState.create(
+        apply_fn=network.apply,
+        params=params,
+        tx=optimizer,
+    )
