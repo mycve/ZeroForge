@@ -8,6 +8,14 @@ ZeroForge - 中国象棋 Gumbel MuZero
 
 import os
 import signal
+
+# ============================================================================
+# 启用 JAX 持久化编译缓存（必须在 import jax 之前设置）
+# ============================================================================
+os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), ".jax_cache")
+os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"  # 缓存所有编译结果
+os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "0"  # 缓存所有编译结果
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -392,6 +400,7 @@ def main():
     print("=" * 60, flush=True)
     print(f"JAX 后端: {jax.default_backend()}", flush=True)
     print(f"设备数量: {n_devices}", flush=True)
+    print(f"编译缓存: {os.environ.get('JAX_COMPILATION_CACHE_DIR', '未启用')}", flush=True)
     
     # 检查配置
     global_batch = config["training"]["batch_size"]
