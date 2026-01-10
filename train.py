@@ -9,6 +9,9 @@ import jax
 import jax.numpy as jnp
 import optax
 import chex
+import inspect
+from flax import jax_utils
+from jax import lax
 from typing import NamedTuple
 from flax.training import checkpoints, train_state
 from flax.training.train_state import TrainState
@@ -68,6 +71,15 @@ def make_selfplay_fn(env, network, config: dict):
     max_actions = config["mcts"].get("max_num_considered_actions", 16)
     discount = config["mcts"].get("discount", 1.0)
     batch_size = config["training"]["batch_size"]
+
+    # 兼容不同 mctx 版本：有的版本支持 max_num_considered_actions，有的不支持
+    try:
+        _gumbel_sig = inspect.signature(mctx.gumbel_muzero_policy)
+        supports_max_actions = "max_num_considered_actions" in _gumbel_sig.parameters
+    except Exception as e:
+        # 避免因 inspect 在某些环境异常导致训练直接挂掉
+        logger.warning(f"无法检查 mctx.gumbel_muzero_policy 参数签名，将不传 max_num_considered_actions: {e}")
+        supports_max_actions = False
     
     def recurrent_fn(params, rng_key, action, embedding):
         next_state, reward, logits, value = network.apply(
@@ -98,15 +110,26 @@ def make_selfplay_fn(env, network, config: dict):
             value=output.value,
             embedding=output.hidden_state,
         )
-        
-        policy_output = mctx.gumbel_muzero_policy(
-            params=params,
-            rng_key=k0,
-            root=root,
-            recurrent_fn=recurrent_fn,
-            num_simulations=num_simulations,
-            invalid_actions=~state.legal_action_mask,
-        )
+
+        if supports_max_actions:
+            policy_output = mctx.gumbel_muzero_policy(
+                params=params,
+                rng_key=k0,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=num_simulations,
+                invalid_actions=~state.legal_action_mask,
+                max_num_considered_actions=max_actions,
+            )
+        else:
+            policy_output = mctx.gumbel_muzero_policy(
+                params=params,
+                rng_key=k0,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=num_simulations,
+                invalid_actions=~state.legal_action_mask,
+            )
         
         next_state = v_step(state, policy_output.action)
         reward = jax.vmap(lambda s, p: s.rewards[p])(next_state, player)
@@ -182,7 +205,7 @@ def make_train_step(network, config: dict):
     value_loss_weight = config["training"].get("value_loss_weight", 1.0)
     
     @jax.jit
-    def train_step(state, batch, mask):
+    def train_step(state, batch, mask, *, axis_name: str | None = None):
         def loss_fn(params):
             output = network.apply(params, batch.obs)
             
@@ -205,6 +228,13 @@ def make_train_step(network, config: dict):
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, (ploss, vloss)), grads = grad_fn(state.params)
         
+        # 多卡：跨设备平均梯度/指标（数据并行）
+        if axis_name is not None:
+            grads = lax.pmean(grads, axis_name=axis_name)
+            loss = lax.pmean(loss, axis_name=axis_name)
+            ploss = lax.pmean(ploss, axis_name=axis_name)
+            vloss = lax.pmean(vloss, axis_name=axis_name)
+
         # 梯度裁剪
         grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
         
@@ -357,10 +387,50 @@ def main():
     key = jax.random.PRNGKey(config.get("seed", 42))
     key, init_key = jax.random.split(key)
     
-    batch_size = config["training"]["batch_size"]
+    # ----------------------------
+    # 多卡配置（单机多卡数据并行）
+    # ----------------------------
+    devices = jax.local_devices()
+    n_devices = len(devices)
+    if n_devices <= 0:
+        raise RuntimeError("未检测到任何 JAX 设备（local_devices 为空），无法训练。")
+
+    requested_devices = config.get("training", {}).get("num_devices", None)
+    if requested_devices is not None:
+        if not isinstance(requested_devices, int) or requested_devices <= 0:
+            raise ValueError(f"training.num_devices 必须是正整数，当前={requested_devices!r}")
+        if requested_devices > n_devices:
+            raise ValueError(
+                f"training.num_devices={requested_devices} 超过可用设备数 n_devices={n_devices}。"
+            )
+        n_devices = requested_devices
+        devices = devices[:n_devices]
+
+    global_batch_size = int(config["training"]["batch_size"])
+    global_num_parallel = int(config["self_play"]["num_parallel_games"])
+    if global_batch_size % n_devices != 0:
+        raise ValueError(
+            f"training.batch_size={global_batch_size} 必须能被设备数 {n_devices} 整除，"
+            f"否则无法做数据并行。建议改为 {n_devices} 的倍数。"
+        )
+    if global_num_parallel % n_devices != 0:
+        raise ValueError(
+            f"self_play.num_parallel_games={global_num_parallel} 必须能被设备数 {n_devices} 整除，"
+            f"否则无法把自我对弈均匀分到每张卡。建议改为 {n_devices} 的倍数。"
+        )
+
+    per_device_batch_size = global_batch_size // n_devices
+    per_device_num_parallel = global_num_parallel // n_devices
+
+    logger.info(
+        f"多卡: n_devices={n_devices}, per_device_batch_size={per_device_batch_size}, "
+        f"per_device_num_parallel_games={per_device_num_parallel}"
+    )
+
     state = create_train_state(
         init_key, network,
-        input_shape=(batch_size, 240, 10, 9),
+        # 初始化用 per-device batch 即可（不影响参数形状）
+        input_shape=(per_device_batch_size, 240, 10, 9),
         learning_rate=config["training"]["learning_rate"],
     )
     
@@ -379,17 +449,37 @@ def main():
     logger.info(f"TensorBoard: tensorboard --logdir {log_dir}")
     
     # 创建函数
-    selfplay_fn = make_selfplay_fn(env, network, config)
+    # 自我对弈/训练函数：按每设备的并行度与 batch 来构造，便于 pmap
+    config_local = dict(config)
+    config_local["self_play"] = dict(config["self_play"])
+    config_local["training"] = dict(config["training"])
+    config_local["self_play"]["num_parallel_games"] = per_device_num_parallel
+    config_local["training"]["batch_size"] = per_device_batch_size
+
+    selfplay_fn = make_selfplay_fn(env, network, config_local)
     train_step = make_train_step(network, config)
     eval_fn = make_eval_fn(env, network, config)
+
+    # pmap 包装：自玩与训练都做数据并行
+    p_selfplay_fn = jax.pmap(selfplay_fn, axis_name="devices", in_axes=(0, 0), out_axes=(0, 0))
+    p_train_step = jax.pmap(
+        lambda s, b, m: train_step(s, b, m, axis_name="devices"),
+        axis_name="devices",
+        in_axes=(0, 0, 0),
+        out_axes=(0, 0),
+    )
+
+    # 参数/优化器状态复制到每张卡
+    state = jax_utils.replicate(state, devices=devices)
     
     # 训练配置
     save_interval = config["checkpoint"].get("save_interval", 1000)
     eval_interval = config["evaluation"].get("eval_interval", 5000)
     log_interval = config["logging"].get("console_interval", 100)
+    tb_interval = config["logging"].get("tensorboard_interval", 100)
     num_steps = config["training"]["num_training_steps"]
     
-    old_params = state.params  # 用于 ELO 评估
+    old_params = jax_utils.unreplicate(state.params)  # 用于 ELO 评估（单卡）
     best_elo = elo
     
     logger.info("开始训练...")
@@ -398,41 +488,57 @@ def main():
     # 训练循环
     while step < num_steps:
         iter_start = time.time()
+        step_at_iter_start = step
         key, k0, k1 = jax.random.split(key, 3)
+        # 每张卡一把 key，保证自玩随机性独立
+        device_keys = jax.random.split(k0, n_devices)
         
         # 自我对弈
-        data, data_mask = selfplay_fn(state.params, k0)
-        n_samples = data.obs.shape[0] * data.obs.shape[1]
+        data, data_mask = p_selfplay_fn(state.params, device_keys)
+        # data: (n_devices, n_batches, per_device_batch, ...)
+        n_batches = data.obs.shape[1]
+        n_samples = int(n_devices) * int(n_batches) * int(per_device_batch_size)
         
         # 训练
         total_loss = 0
-        for i in range(data.obs.shape[0]):
-            batch = jax.tree.map(lambda x: x[i], data)
-            mask = data_mask[i]
-            state, metrics = train_step(state, batch, mask)
-            total_loss += metrics["loss"]
+        for i in range(n_batches):
+            # 取出第 i 个 batch 的每卡分片: (n_devices, per_device_batch, ...)
+            batch = jax.tree.map(lambda x: x[:, i], data)
+            mask = data_mask[:, i]
+            state, metrics = p_train_step(state, batch, mask)
+            # metrics 在每张卡上相同（已 pmean），取 [0] 做 host 端累计/日志
+            total_loss += metrics["loss"][0]
             step += 1
             
-            # 记录到 TensorBoard
-            writer.add_scalar("loss/total", metrics["loss"], step)
-            writer.add_scalar("loss/policy", metrics["policy_loss"], step)
-            writer.add_scalar("loss/value", metrics["value_loss"], step)
+            # 记录到 TensorBoard（低频 + 显式 device_get，避免每步 host/device 同步拖慢）
+            if tb_interval > 0 and (step % tb_interval == 0):
+                m0 = jax.device_get(jax.tree.map(lambda x: x[0], metrics))
+                writer.add_scalar("loss/total", float(m0["loss"]), step)
+                writer.add_scalar("loss/policy", float(m0["policy_loss"]), step)
+                writer.add_scalar("loss/value", float(m0["value_loss"]), step)
         
-        avg_loss = total_loss / data.obs.shape[0]
+        # 显式同步：确保 iter_time 统计的是“真实计算耗时”（包含 XLA 执行）
+        avg_loss = total_loss / n_batches
+        avg_loss_host = float(jax.device_get(avg_loss))
         iter_time = time.time() - iter_start
         
         # 控制台日志
-        if step % log_interval < data.obs.shape[0]:
+        def _crossed_interval(prev_step: int, curr_step: int, interval: int) -> bool:
+            """判断本轮内是否跨过了 interval 的边界（用于只输出一次日志/评估/保存）。"""
+            return interval > 0 and (prev_step // interval) != (curr_step // interval)
+
+        if _crossed_interval(step_at_iter_start, step, log_interval):
             elapsed = time.time() - start_time
             logger.info(
-                f"step={step}, loss={avg_loss:.4f}, "
+                f"step={step}, loss={avg_loss_host:.4f}, "
                 f"samples={n_samples}, elo={elo:.1f}, "
                 f"time={iter_time:.1f}s, elapsed={elapsed/60:.1f}min"
             )
         
         # ELO 评估
-        if step % eval_interval < data.obs.shape[0]:
-            elo, win_rate = eval_fn(state.params, old_params, elo, k1)
+        if _crossed_interval(step_at_iter_start, step, eval_interval):
+            current_params = jax_utils.unreplicate(state.params)
+            elo, win_rate = eval_fn(current_params, old_params, elo, k1)
             elo = float(elo)
             win_rate = float(win_rate)
             
@@ -443,15 +549,15 @@ def main():
             
             if elo > best_elo:
                 best_elo = elo
-                old_params = state.params  # 更新对手
+                old_params = current_params  # 更新对手
                 logger.info(f"新最佳模型! elo={elo:.1f}")
         
         # 保存检查点
-        if step % save_interval < data.obs.shape[0]:
-            ckpt_manager.save(state, step, elo)
+        if _crossed_interval(step_at_iter_start, step, save_interval):
+            ckpt_manager.save(jax_utils.unreplicate(state), step, elo)
     
     # 最终保存
-    ckpt_manager.save(state, step, elo)
+    ckpt_manager.save(jax_utils.unreplicate(state), step, elo)
     writer.close()
     
     total_time = time.time() - start_time
