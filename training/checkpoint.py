@@ -82,7 +82,8 @@ class CheckpointManager:
             max_to_keep: 最多保留的检查点数量
             keep_period: 永久保留的检查点间隔 (步数)
         """
-        self.checkpoint_dir = Path(checkpoint_dir)
+        # Orbax 要求绝对路径
+        self.checkpoint_dir = Path(checkpoint_dir).resolve()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.max_to_keep = max_to_keep

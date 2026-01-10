@@ -137,11 +137,13 @@ def cmd_train(args):
     temp_high = mcts_cfg.get("temperature_high", 1.0)
     temp_low = mcts_cfg.get("temperature_low", 0.25)
     
-    # 创建目录
-    checkpoint_dir = config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")
-    log_dir = config.get("logging", {}).get("log_dir", "logs")
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    # 创建目录 (Orbax 要求绝对路径)
+    checkpoint_dir = Path(config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")).resolve()
+    log_dir = Path(config.get("logging", {}).get("log_dir", "logs")).resolve()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = str(checkpoint_dir)
+    log_dir = str(log_dir)
     
     # 创建训练器
     trainer = MuZeroTrainer(network, training_config, checkpoint_dir)
@@ -365,7 +367,9 @@ def cmd_web(args):
     ai_callback = None
     
     if args.checkpoint:
-        logger.info(f"加载检查点: {args.checkpoint}")
+        # 转换为绝对路径 (Orbax 要求)
+        checkpoint_path = str(Path(args.checkpoint).resolve())
+        logger.info(f"加载检查点: {checkpoint_path}")
         
         # 加载配置和模型
         with open(args.config, 'r') as f:
@@ -386,7 +390,7 @@ def cmd_web(args):
         )
         
         # 加载权重
-        ckpt_manager = CheckpointManager(args.checkpoint)
+        ckpt_manager = CheckpointManager(checkpoint_path)
         train_state = ckpt_manager.restore_latest(network)
         
         if train_state is None:
