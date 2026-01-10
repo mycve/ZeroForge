@@ -28,8 +28,18 @@ from xiangqi.env import XiangqiEnv
 from networks.muzero import MuZeroNetwork, create_train_state
 import mctx
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="[%(asctime)s] %(message)s",
+    handlers=[logging.StreamHandler()]  # 强制输出到 stderr
+)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 确保日志立即输出
+import sys
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
 
 
 # ============================================================================
@@ -81,7 +91,7 @@ def make_selfplay_fn(env, network, config: dict):
         _gumbel_sig = inspect.signature(mctx.gumbel_muzero_policy)
         supports_max_actions = "max_num_considered_actions" in _gumbel_sig.parameters
     except Exception as e:
-        logger.warning(f"无法检查 mctx.gumbel_muzero_policy 参数签名: {e}")
+        print(f"[警告] 无法检查 mctx.gumbel_muzero_policy 参数签名: {e}", flush=True)
         supports_max_actions = False
     
     def recurrent_fn(params, rng_key, action, embedding):
@@ -342,7 +352,7 @@ class CheckpointManager:
             step,
             keep=self.max_to_keep,
         )
-        logger.info(f"检查点已保存: step={step}, elo={elo:.1f}")
+        print(f"检查点已保存: step={step}, elo={elo:.1f}", flush=True)
         
     def restore(self, state: TrainState) -> tuple:
         ckpt = checkpoints.restore_checkpoint(str(self.checkpoint_dir), None)
@@ -375,12 +385,12 @@ def main():
     devices = jax.local_devices()
     n_devices = len(devices)
     
-    logger.info("=" * 60)
-    logger.info("ZeroForge - 中国象棋 Gumbel MuZero (多卡版)")
-    logger.info("=" * 60)
-    logger.info(f"JAX 后端: {jax.default_backend()}")
-    logger.info(f"设备数量: {n_devices}")
-    logger.info(f"设备列表: {devices}")
+    print("=" * 60, flush=True)
+    print("ZeroForge - 中国象棋 Gumbel MuZero (多卡版)", flush=True)
+    print("=" * 60, flush=True)
+    print(f"JAX 后端: {jax.default_backend()}", flush=True)
+    print(f"设备数量: {n_devices}", flush=True)
+    print(f"设备列表: {devices}", flush=True)
     
     # 检查配置是否能被设备数整除
     global_batch_size = config["training"]["batch_size"]
@@ -400,9 +410,9 @@ def main():
     per_device_batch = global_batch_size // n_devices
     per_device_parallel = global_num_parallel // n_devices
     
-    logger.info(f"全局 batch_size: {global_batch_size} (每卡 {per_device_batch})")
-    logger.info(f"全局 num_parallel_games: {global_num_parallel} (每卡 {per_device_parallel})")
-    logger.info(f"MCTS 模拟: {config['mcts']['num_simulations']}")
+    print(f"全局 batch_size: {global_batch_size} (每卡 {per_device_batch})", flush=True)
+    print(f"全局 num_parallel_games: {global_num_parallel} (每卡 {per_device_parallel})", flush=True)
+    print(f"MCTS 模拟: {config['mcts']['num_simulations']}", flush=True)
     
     # 环境和网络
     env = XiangqiEnv()
@@ -429,11 +439,11 @@ def main():
     state, step, elo = ckpt_manager.restore(state)
     
     if step > 0:
-        logger.info(f"从检查点恢复: step={step}, elo={elo:.1f}")
+        print(f"从检查点恢复: step={step}, elo={elo:.1f}", flush=True)
     
     # TensorBoard
     writer = SummaryWriter(log_dir)
-    logger.info(f"TensorBoard: tensorboard --logdir {log_dir}")
+    print(f"TensorBoard: tensorboard --logdir {log_dir}", flush=True)
     
     # ====================================================================
     # 创建每设备的配置和函数
@@ -454,8 +464,29 @@ def main():
     # 自玩: 每卡独立运行，不需要跨卡通信
     p_selfplay = jax.pmap(selfplay_fn, axis_name="devices")
     
-    # 训练: 每卡处理自己的数据，梯度跨卡平均
-    p_train_step = jax.pmap(train_step, axis_name="devices")
+    # 训练: 用 lax.scan 处理所有 batch，避免 Python 循环导致的 GPU 停顿
+    def train_epoch(state, data, data_mask):
+        """处理一个 epoch 的所有 batch（在设备上执行）"""
+        def train_one_batch(carry, batch_data):
+            s, = carry
+            batch, mask = batch_data
+            new_state, metrics = train_step(s, batch, mask)
+            return (new_state,), metrics
+        
+        # data: (n_batches, batch_size, ...)
+        # 用 scan 遍历所有 batch
+        (final_state,), all_metrics = lax.scan(
+            train_one_batch,
+            (state,),
+            (data, data_mask),
+        )
+        
+        # 计算平均 loss
+        avg_metrics = jax.tree.map(lambda x: x.mean(), all_metrics)
+        return final_state, avg_metrics
+    
+    # pmap: 每卡执行 train_epoch
+    p_train_epoch = jax.pmap(train_epoch, axis_name="devices")
     
     # 复制参数到所有设备
     state = jax_utils.replicate(state)
@@ -470,8 +501,8 @@ def main():
     old_params = jax_utils.unreplicate(state.params)
     best_elo = elo
     
-    logger.info("开始训练...")
-    logger.info("首次运行需要 JIT 编译，可能需要几分钟...")
+    print("开始训练...", flush=True)
+    print("首次运行需要 JIT 编译，可能需要几分钟...", flush=True)
     start_time = time.time()
     
     # ====================================================================
@@ -491,50 +522,41 @@ def main():
         n_batches = data.obs.shape[1]
         n_samples = n_devices * n_batches * per_device_batch
         
-        # ----- 多卡训练 -----
-        total_loss = 0.0
-        total_ploss = 0.0
-        total_vloss = 0.0
-        
-        for batch_idx in range(n_batches):
-            # 提取每卡的当前 batch: (n_devices, per_device_batch, ...)
-            batch = jax.tree.map(lambda x: x[:, batch_idx], data)
-            mask = data_mask[:, batch_idx]
-            
-            # pmap 训练
-            state, metrics = p_train_step(state, batch, mask)
-            
-            # metrics 在所有设备上相同（已 pmean），取第一个即可
-            total_loss += float(metrics["loss"][0])
-            total_ploss += float(metrics["policy_loss"][0])
-            total_vloss += float(metrics["value_loss"][0])
+        # ----- 多卡训练 (用 lax.scan，全部在 GPU 上执行) -----
+        state, metrics = p_train_epoch(state, data, data_mask)
         
         step += n_batches
-        
-        avg_loss = total_loss / n_batches
-        avg_ploss = total_ploss / n_batches
-        avg_vloss = total_vloss / n_batches
         iter_time = time.time() - iter_start
         
-        # 日志
+        # 日志（只在需要时才同步 GPU->CPU）
         def _crossed(prev, curr, interval):
             return interval > 0 and (prev // interval) != (curr // interval)
 
-        if _crossed(step_at_iter_start, step, log_interval):
-            elapsed = time.time() - start_time
-            samples_per_sec = n_samples / iter_time if iter_time > 0 else 0
-            logger.info(
-                f"step={step}, loss={avg_loss:.4f}, ploss={avg_ploss:.4f}, vloss={avg_vloss:.4f}, "
-                f"samples={n_samples} ({n_devices}卡×{n_batches}批×{per_device_batch}), "
-                f"time={iter_time:.1f}s ({samples_per_sec:.0f}/s), elapsed={elapsed/60:.1f}min"
-            )
+        need_log = _crossed(step_at_iter_start, step, log_interval)
+        need_tb = _crossed(step_at_iter_start, step, tb_interval)
+        
+        if need_log or need_tb:
+            # 只在需要时才从 GPU 取值
+            avg_loss = float(metrics["loss"][0])
+            avg_ploss = float(metrics["policy_loss"][0])
+            avg_vloss = float(metrics["value_loss"][0])
+            
+            if need_log:
+                elapsed = time.time() - start_time
+                samples_per_sec = n_samples / iter_time if iter_time > 0 else 0
+                print(
+                    f"step={step}, loss={avg_loss:.4f}, ploss={avg_ploss:.4f}, vloss={avg_vloss:.4f}, "
+                    f"samples={n_samples} ({n_devices}卡×{n_batches}批×{per_device_batch}), "
+                    f"time={iter_time:.1f}s ({samples_per_sec:.0f}/s), elapsed={elapsed/60:.1f}min",
+                    flush=True
+                )
 
-        if _crossed(step_at_iter_start, step, tb_interval):
-            writer.add_scalar("loss/total", avg_loss, step)
-            writer.add_scalar("loss/policy", avg_ploss, step)
-            writer.add_scalar("loss/value", avg_vloss, step)
-            writer.add_scalar("perf/samples_per_iter", n_samples, step)
-            writer.add_scalar("perf/samples_per_sec", n_samples / iter_time, step)
+            if need_tb:
+                writer.add_scalar("loss/total", avg_loss, step)
+                writer.add_scalar("loss/policy", avg_ploss, step)
+                writer.add_scalar("loss/value", avg_vloss, step)
+                writer.add_scalar("perf/samples_per_iter", n_samples, step)
+                writer.add_scalar("perf/samples_per_sec", n_samples / iter_time, step)
         
         # ELO 评估 (单卡运行)
         if _crossed(step_at_iter_start, step, eval_interval):
@@ -546,12 +568,12 @@ def main():
             writer.add_scalar("eval/elo", elo, step)
             writer.add_scalar("eval/win_rate", win_rate, step)
             
-            logger.info(f"评估: elo={elo:.1f}, win_rate={win_rate:.2%}")
+            print(f"评估: elo={elo:.1f}, win_rate={win_rate:.2%}", flush=True)
             
             if elo > best_elo:
                 best_elo = elo
                 old_params = current_params
-                logger.info(f"新最佳模型! elo={elo:.1f}")
+                print(f"新最佳模型! elo={elo:.1f}", flush=True)
         
         # 保存检查点
         if _crossed(step_at_iter_start, step, save_interval):
@@ -562,7 +584,7 @@ def main():
     writer.close()
     
     total_time = time.time() - start_time
-    logger.info(f"训练完成! 总时间: {total_time/3600:.1f}小时")
+    print(f"训练完成! 总时间: {total_time/3600:.1f}小时", flush=True)
 
 
 if __name__ == "__main__":
