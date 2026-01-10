@@ -19,11 +19,31 @@ def _load_config(path: str = "configs/default.yaml") -> dict:
 
 CONFIG = _load_config()
 
-# 启用 JAX 持久化编译缓存
+# ============================================================================
+# JAX/XLA 优化设置（必须在 import jax 之前）
+# ============================================================================
+
+# 1. 持久化编译缓存 - 避免重复编译
 _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".jax_cache")
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _cache_dir)
 os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
 os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+
+# 2. XLA 多线程编译加速
+# 获取 CPU 核心数，用于并行编译
+_num_cpus = os.cpu_count() or 16
+os.environ.setdefault("XLA_FLAGS", (
+    f"--xla_cpu_multi_thread_eigen=true "
+    f"--xla_backend_optimization_level=3 "
+    f"--xla_gpu_enable_fast_min_max=true "
+))
+# TensorFlow/XLA 线程设置
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", str(_num_cpus))
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(_num_cpus))
+
+# 3. 禁用不必要的日志
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("JAX_PLATFORMS", "cuda")  # 优先使用 CUDA
 
 import jax
 import jax.numpy as jnp
