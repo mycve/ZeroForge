@@ -99,7 +99,7 @@ def make_selfplay_fn(env, network, config: dict):
     
     def selfplay_step(carry, key):
         state, params = carry
-        k0, k1 = jax.random.split(key)
+        k_policy, k_reset = jax.random.split(key)
         
         obs = v_observe(state)
         player = state.current_player
@@ -114,7 +114,7 @@ def make_selfplay_fn(env, network, config: dict):
         if supports_max_actions:
             policy_output = mctx.gumbel_muzero_policy(
                 params=params,
-                rng_key=k0,
+                rng_key=k_policy,
                 root=root,
                 recurrent_fn=recurrent_fn,
                 num_simulations=num_simulations,
@@ -124,7 +124,7 @@ def make_selfplay_fn(env, network, config: dict):
         else:
             policy_output = mctx.gumbel_muzero_policy(
                 params=params,
-                rng_key=k0,
+                rng_key=k_policy,
                 root=root,
                 recurrent_fn=recurrent_fn,
                 num_simulations=num_simulations,
@@ -133,6 +133,19 @@ def make_selfplay_fn(env, network, config: dict):
         
         next_state = v_step(state, policy_output.action)
         reward = jax.vmap(lambda s, p: s.rewards[p])(next_state, player)
+
+        # auto-reset：终局后立即重置该局面，保证 scan 中持续产出有效对局
+        reset_state = v_init(jax.random.split(k_reset, num_parallel))
+        term = next_state.terminated
+
+        def _select(ns, rs):
+            # term: (B,) -> broadcast 到字段的 batch 维
+            if ns.ndim == 0:
+                return jnp.where(term, rs, ns)
+            shape = (term.shape[0],) + (1,) * (ns.ndim - 1)
+            return jnp.where(term.reshape(shape), rs, ns)
+
+        state_after = jax.tree.map(_select, next_state, reset_state)
         
         traj = Trajectory(
             obs=obs,
@@ -141,7 +154,7 @@ def make_selfplay_fn(env, network, config: dict):
             terminated=next_state.terminated,
             player=player,
         )
-        return (next_state, params), traj
+        return (state_after, params), traj
     
     @jax.jit
     def selfplay_fn(params, key):

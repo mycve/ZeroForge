@@ -244,140 +244,143 @@ class XiangqiEnv:
         Returns:
             新状态
         """
-        # 如果游戏已结束，直接返回
-        # (实际使用中应该在外部处理，这里作为安全检查)
-        
-        # 解码动作
-        from_sq, to_sq = action_to_move(action)
-        
-        # 检查是否吃子
-        to_row = to_sq // BOARD_WIDTH
-        to_col = to_sq % BOARD_WIDTH
-        captured_piece = state.board[to_row, to_col]
-        is_capture = captured_piece != EMPTY
-        
-        # 更新历史
-        # 将当前棋盘推入历史，移除最老的一步
-        new_history = jnp.concatenate([
-            state.board[jnp.newaxis, :, :],
-            state.history[:-1, :, :]
-        ], axis=0)
-        
-        # 执行移动
-        new_board = apply_move(state.board, from_sq, to_sq)
-        
-        # 切换玩家
-        new_player = 1 - state.current_player
-        
-        # 更新步数
-        new_step_count = state.step_count + 1
-        new_no_capture = jnp.where(is_capture, 0, state.no_capture_count + 1)
-        
-        # ========== 违规检测 ==========
-        
-        # 1. 计算新局面哈希
-        new_hash = compute_position_hash(new_board, new_player)
-        
-        # 2. 更新哈希历史 (循环缓冲区)
-        hash_idx = state.hash_count % POSITION_HISTORY_SIZE
-        new_position_hashes = state.position_hashes.at[hash_idx].set(new_hash)
-        new_hash_count = jnp.minimum(state.hash_count + 1, POSITION_HISTORY_SIZE)
-        
-        # 3. 检测重复局面
-        repetitions = count_repetitions(new_hash, state.position_hashes, state.hash_count)
-        is_threefold_repetition = repetitions >= REPETITION_THRESHOLD
-        
-        # 4. 检测将军状态 (对方是否被将军)
-        is_check = is_in_check(new_board, new_player)
-        
-        # 5. 更新连续将军计数
-        # 如果红方走棋后黑方被将军，红方连续将军+1
-        # 如果红方走棋后黑方没被将军，红方连续将军清零
-        new_red_checks = jnp.where(
-            state.current_player == 0,  # 红方刚走
-            jnp.where(is_check, state.red_consecutive_checks + 1, jnp.int32(0)),
-            state.red_consecutive_checks
-        )
-        new_black_checks = jnp.where(
-            state.current_player == 1,  # 黑方刚走
-            jnp.where(is_check, state.black_consecutive_checks + 1, jnp.int32(0)),
-            state.black_consecutive_checks
-        )
-        
-        # 6. 检测长将 (连续将军超过阈值)
-        red_perpetual_check = new_red_checks >= PERPETUAL_CHECK_THRESHOLD
-        black_perpetual_check = new_black_checks >= PERPETUAL_CHECK_THRESHOLD
-        
-        # ========== 游戏结束判断 ==========
-        
-        # 检查基本游戏结束条件 (将死/困毙)
-        game_over, winner = is_game_over(new_board, new_player)
-        
-        # 检查和棋条件: 步数限制、无吃子限制、三次重复
-        is_draw = (new_step_count >= MAX_STEPS) | \
-                  (new_no_capture >= MAX_NO_CAPTURE_STEPS) | \
-                  is_threefold_repetition
-        
-        # 检查长将判负
-        # 红方长将 -> 红方负 (黑方胜)
-        # 黑方长将 -> 黑方负 (红方胜)
-        perpetual_check_loss = red_perpetual_check | black_perpetual_check
-        perpetual_winner = jnp.where(red_perpetual_check, 1, jnp.where(black_perpetual_check, 0, -1))
-        
-        # 综合判断
-        game_over = game_over | is_draw | perpetual_check_loss
-        
-        # 确定最终胜者
-        # 优先级: 将死 > 长将判负 > 和棋
-        winner = jnp.where(
-            winner != -1,
-            winner,  # 已有胜者 (将死)
-            jnp.where(
-                perpetual_check_loss,
-                perpetual_winner,  # 长将判负
-                jnp.where(is_draw, -1, -1)  # 和棋
+        # 如果游戏已结束，直接返回（安全保护）
+        # 注意：自我对弈通常会做 auto-reset；但这里仍需要兜底，
+        # 否则终局后 legal_action_mask 全 False，MCTS 可能出现全 invalid 的异常行为。
+        def _do_step() -> XiangqiState:
+            # 解码动作
+            from_sq, to_sq = action_to_move(action)
+            
+            # 检查是否吃子
+            to_row = to_sq // BOARD_WIDTH
+            to_col = to_sq % BOARD_WIDTH
+            captured_piece = state.board[to_row, to_col]
+            is_capture = captured_piece != EMPTY
+            
+            # 更新历史
+            # 将当前棋盘推入历史，移除最老的一步
+            new_history = jnp.concatenate([
+                state.board[jnp.newaxis, :, :],
+                state.history[:-1, :, :]
+            ], axis=0)
+            
+            # 执行移动
+            new_board = apply_move(state.board, from_sq, to_sq)
+            
+            # 切换玩家
+            new_player = 1 - state.current_player
+            
+            # 更新步数
+            new_step_count = state.step_count + 1
+            new_no_capture = jnp.where(is_capture, 0, state.no_capture_count + 1)
+            
+            # ========== 违规检测 ==========
+            
+            # 1. 计算新局面哈希
+            new_hash = compute_position_hash(new_board, new_player)
+            
+            # 2. 更新哈希历史 (循环缓冲区)
+            hash_idx = state.hash_count % POSITION_HISTORY_SIZE
+            new_position_hashes = state.position_hashes.at[hash_idx].set(new_hash)
+            new_hash_count = jnp.minimum(state.hash_count + 1, POSITION_HISTORY_SIZE)
+            
+            # 3. 检测重复局面
+            repetitions = count_repetitions(new_hash, state.position_hashes, state.hash_count)
+            is_threefold_repetition = repetitions >= REPETITION_THRESHOLD
+            
+            # 4. 检测将军状态 (对方是否被将军)
+            is_check = is_in_check(new_board, new_player)
+            
+            # 5. 更新连续将军计数
+            # 如果红方走棋后黑方被将军，红方连续将军+1
+            # 如果红方走棋后黑方没被将军，红方连续将军清零
+            new_red_checks = jnp.where(
+                state.current_player == 0,  # 红方刚走
+                jnp.where(is_check, state.red_consecutive_checks + 1, jnp.int32(0)),
+                state.red_consecutive_checks
             )
-        )
-        
-        # 计算奖励
-        # 胜: +1, 负: -1, 平: 0, 未结束: 0
-        rewards = jnp.where(
-            game_over,
-            jnp.where(
-                winner == -1,
-                jnp.zeros(2),  # 平局
+            new_black_checks = jnp.where(
+                state.current_player == 1,  # 黑方刚走
+                jnp.where(is_check, state.black_consecutive_checks + 1, jnp.int32(0)),
+                state.black_consecutive_checks
+            )
+            
+            # 6. 检测长将 (连续将军超过阈值)
+            red_perpetual_check = new_red_checks >= PERPETUAL_CHECK_THRESHOLD
+            black_perpetual_check = new_black_checks >= PERPETUAL_CHECK_THRESHOLD
+            
+            # ========== 游戏结束判断 ==========
+            
+            # 检查基本游戏结束条件 (将死/困毙)
+            game_over, winner = is_game_over(new_board, new_player)
+            
+            # 检查和棋条件: 步数限制、无吃子限制、三次重复
+            is_draw = (new_step_count >= MAX_STEPS) | \
+                      (new_no_capture >= MAX_NO_CAPTURE_STEPS) | \
+                      is_threefold_repetition
+            
+            # 检查长将判负
+            # 红方长将 -> 红方负 (黑方胜)
+            # 黑方长将 -> 黑方负 (红方胜)
+            perpetual_check_loss = red_perpetual_check | black_perpetual_check
+            perpetual_winner = jnp.where(red_perpetual_check, 1, jnp.where(black_perpetual_check, 0, -1))
+            
+            # 综合判断
+            game_over = game_over | is_draw | perpetual_check_loss
+            
+            # 确定最终胜者
+            # 优先级: 将死 > 长将判负 > 和棋
+            winner = jnp.where(
+                winner != -1,
+                winner,  # 已有胜者 (将死)
                 jnp.where(
-                    winner == 0,
-                    jnp.array([1.0, -1.0]),  # 红胜
-                    jnp.array([-1.0, 1.0])   # 黑胜
+                    perpetual_check_loss,
+                    perpetual_winner,  # 长将判负
+                    jnp.where(is_draw, -1, -1)  # 和棋
                 )
-            ),
-            jnp.zeros(2)
-        )
+            )
+            
+            # 计算奖励
+            # 胜: +1, 负: -1, 平: 0, 未结束: 0
+            rewards = jnp.where(
+                game_over,
+                jnp.where(
+                    winner == -1,
+                    jnp.zeros(2),  # 平局
+                    jnp.where(
+                        winner == 0,
+                        jnp.array([1.0, -1.0]),  # 红胜
+                        jnp.array([-1.0, 1.0])   # 黑胜
+                    )
+                ),
+                jnp.zeros(2)
+            )
+            
+            # 获取新的合法动作
+            new_legal_mask = jnp.where(
+                game_over,
+                jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
+                get_legal_moves_mask(new_board, new_player)
+            )
+            
+            return XiangqiState(
+                board=new_board,
+                history=new_history,
+                current_player=new_player,
+                legal_action_mask=new_legal_mask,
+                rewards=rewards,
+                terminated=game_over,
+                step_count=new_step_count,
+                no_capture_count=new_no_capture,
+                winner=winner,
+                # 违规检测状态
+                position_hashes=new_position_hashes,
+                hash_count=new_hash_count,
+                red_consecutive_checks=new_red_checks,
+                black_consecutive_checks=new_black_checks,
+            )
         
-        # 获取新的合法动作
-        new_legal_mask = jnp.where(
-            game_over,
-            jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
-            get_legal_moves_mask(new_board, new_player)
-        )
-        
-        return XiangqiState(
-            board=new_board,
-            history=new_history,
-            current_player=new_player,
-            legal_action_mask=new_legal_mask,
-            rewards=rewards,
-            terminated=game_over,
-            step_count=new_step_count,
-            no_capture_count=new_no_capture,
-            winner=winner,
-            # 违规检测状态
-            position_hashes=new_position_hashes,
-            hash_count=new_hash_count,
-            red_consecutive_checks=new_red_checks,
-            black_consecutive_checks=new_black_checks,
-        )
+        return jax.lax.cond(state.terminated, lambda: state, _do_step)
     
     @partial(jax.jit, static_argnums=(0,))
     def observe(self, state: XiangqiState) -> jnp.ndarray:
