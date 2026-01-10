@@ -462,8 +462,23 @@ def main():
 
     # pmap 包装：自玩与训练都做数据并行
     p_selfplay_fn = jax.pmap(selfplay_fn, axis_name="devices", in_axes=(0, 0), out_axes=(0, 0))
-    p_train_step = jax.pmap(
-        lambda s, b, m: train_step(s, b, m, axis_name="devices"),
+
+    # 训练：把“每 batch 一次 dispatch”变成“设备内 scan”，显著提升 GPU 利用率
+    @jax.jit
+    def _train_epoch_single_device(s, data_batches, mask_batches):
+        """
+        单卡：对 (n_batches, per_device_batch, ...) 执行一轮训练，返回最后 state 和每步 metrics 序列
+        注意：这个函数会被 pmap 包裹，内部会用 pmean 做跨卡平均。
+        """
+        def body_fn(carry, xs):
+            b, m = xs
+            new_state, metrics = train_step(carry, b, m, axis_name="devices")
+            return new_state, metrics
+
+        return lax.scan(body_fn, s, (data_batches, mask_batches))
+
+    p_train_epoch = jax.pmap(
+        _train_epoch_single_device,
         axis_name="devices",
         in_axes=(0, 0, 0),
         out_axes=(0, 0),
@@ -499,27 +514,17 @@ def main():
         n_batches = data.obs.shape[1]
         n_samples = int(n_devices) * int(n_batches) * int(per_device_batch_size)
         
-        # 训练
-        total_loss = 0
-        for i in range(n_batches):
-            # 取出第 i 个 batch 的每卡分片: (n_devices, per_device_batch, ...)
-            batch = jax.tree.map(lambda x: x[:, i], data)
-            mask = data_mask[:, i]
-            state, metrics = p_train_step(state, batch, mask)
-            # metrics 在每张卡上相同（已 pmean），取 [0] 做 host 端累计/日志
-            total_loss += metrics["loss"][0]
-            step += 1
-            
-            # 记录到 TensorBoard（低频 + 显式 device_get，避免每步 host/device 同步拖慢）
-            if tb_interval > 0 and (step % tb_interval == 0):
-                m0 = jax.device_get(jax.tree.map(lambda x: x[0], metrics))
-                writer.add_scalar("loss/total", float(m0["loss"]), step)
-                writer.add_scalar("loss/policy", float(m0["policy_loss"]), step)
-                writer.add_scalar("loss/value", float(m0["value_loss"]), step)
+        # 训练（设备内 scan 一次跑完 n_batches，减少 host 调度开销）
+        state, metrics_seq = p_train_epoch(state, data, data_mask)
+        # metrics_seq: (n_devices, n_batches) 的标量序列；已 pmean，取 [0] 即可
+        metrics_mean = jax.tree.map(lambda x: jnp.mean(x[0], axis=0), metrics_seq)
+
+        # step 按 batch 计数：一轮自玩会产生 n_batches 个更新
+        step += int(n_batches)
         
         # 显式同步：确保 iter_time 统计的是“真实计算耗时”（包含 XLA 执行）
-        avg_loss = total_loss / n_batches
-        avg_loss_host = float(jax.device_get(avg_loss))
+        metrics_host = jax.device_get(metrics_mean)
+        avg_loss_host = float(metrics_host["loss"])
         iter_time = time.time() - iter_start
         
         # 控制台日志
@@ -534,6 +539,12 @@ def main():
                 f"samples={n_samples}, elo={elo:.1f}, "
                 f"time={iter_time:.1f}s, elapsed={elapsed/60:.1f}min"
             )
+
+        # TensorBoard（低频写入，避免 device↔host 同步抖动）
+        if _crossed_interval(step_at_iter_start, step, tb_interval):
+            writer.add_scalar("loss/total", float(metrics_host["loss"]), step)
+            writer.add_scalar("loss/policy", float(metrics_host["policy_loss"]), step)
+            writer.add_scalar("loss/value", float(metrics_host["value_loss"]), step)
         
         # ELO 评估
         if _crossed_interval(step_at_iter_start, step, eval_interval):
