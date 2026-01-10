@@ -324,7 +324,8 @@ class CheckpointManager:
     """检查点管理"""
     
     def __init__(self, checkpoint_dir: str, max_to_keep: int = 5):
-        self.checkpoint_dir = Path(checkpoint_dir)
+        # 使用绝对路径
+        self.checkpoint_dir = Path(checkpoint_dir).resolve()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.max_to_keep = max_to_keep
         
@@ -336,7 +337,7 @@ class CheckpointManager:
             "elo": elo,
         }
         checkpoints.save_checkpoint(
-            str(self.checkpoint_dir),
+            str(self.checkpoint_dir),  # 已是绝对路径
             ckpt,
             step,
             keep=self.max_to_keep,
