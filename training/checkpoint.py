@@ -100,6 +100,8 @@ class CheckpointManager:
             options=self.options,
         )
         
+        self._closed = False
+        
         # 元数据文件
         self.metadata_file = self.checkpoint_dir / 'metadata.json'
         self._load_metadata()
@@ -121,6 +123,25 @@ class CheckpointManager:
         """保存元数据"""
         with open(self.metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=2)
+    
+    def wait_until_finished(self):
+        """等待所有异步保存完成"""
+        if not self._closed:
+            self.manager.wait_until_finished()
+    
+    def close(self):
+        """关闭检查点管理器，等待所有保存完成"""
+        if not self._closed:
+            self._closed = True
+            self.manager.wait_until_finished()
+            self.manager.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
     
     def save(
         self,

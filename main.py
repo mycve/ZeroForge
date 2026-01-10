@@ -326,10 +326,16 @@ def cmd_train(args):
     
     except KeyboardInterrupt:
         logger.info("训练被用户中断")
-    
+
     finally:
         # 保存最终检查点
+        logger.info("保存最终检查点...")
         trainer.save_checkpoint(state)
+        
+        # 等待所有异步保存完成
+        logger.info("等待检查点保存完成...")
+        trainer.close()
+        
         train_logger.close()
         logger.info("训练完成!")
 

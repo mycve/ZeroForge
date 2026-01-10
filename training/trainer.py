@@ -450,6 +450,10 @@ class MuZeroTrainer:
             is_best=is_best,
         )
     
+    def close(self):
+        """关闭训练器，等待所有异步操作完成"""
+        self.checkpoint_manager.close()
+    
     def add_trajectory(self, trajectory):
         """添加轨迹到 replay buffer"""
         self.replay_buffer.add(trajectory)
