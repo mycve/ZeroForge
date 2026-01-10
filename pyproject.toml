@@ -45,8 +45,8 @@ dependencies = [
     "tensorboard>=2.15.0",
     "pillow",
     
-    # GUI 人机对弈
-    "pygame>=2.5.0",
+    # Web GUI 人机对弈
+    "gradio>=4.0.0",
 ]
 
 [project.optional-dependencies]

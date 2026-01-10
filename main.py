@@ -343,107 +343,73 @@ def cmd_play(args):
 
 
 # ============================================================================
-# GUI 命令
+# Web GUI 命令
 # ============================================================================
 
-def cmd_gui(args):
-    """图形界面人机对弈"""
-    from gui.xiangqi_gui import run_gui
+def cmd_web(args):
+    """Web 图形界面 (Gradio)"""
+    from gui.web_gui import run_web_gui
     import numpy as np
     
     ai_callback = None
     
-    # 如果提供了检查点，加载 AI
     if args.checkpoint:
-        logger.info(f"加载模型: {args.checkpoint}")
-        try:
-            from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
-            from xiangqi.actions import ACTION_SPACE_SIZE
-            from networks.muzero import MuZeroNetwork
-            from mcts.search import MCTSConfig, run_mcts, select_action
-            from training.checkpoint import load_params
+        logger.info(f"加载检查点: {args.checkpoint}")
+        
+        # 加载配置和模型
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        import jax
+        import jax.numpy as jnp
+        from networks.muzero import MuZeroNetwork
+        from mcts.search import gumbel_muzero_policy
+        from training.checkpoint import CheckpointManager
+        from xiangqi.env import XiangqiEnv
+        
+        # 初始化
+        env = XiangqiEnv()
+        network = MuZeroNetwork(
+            action_dim=env.num_actions,
+            **config.get('network', {})
+        )
+        
+        # 加载权重
+        ckpt_manager = CheckpointManager(args.checkpoint)
+        train_state = ckpt_manager.restore_latest(network)
+        
+        if train_state is None:
+            logger.warning("未找到检查点，使用随机初始化")
+            rng = jax.random.PRNGKey(0)
+            params = network.init(rng, jnp.zeros((1, 10, 9, 119)))
+        else:
+            params = train_state.params
+            logger.info("检查点加载成功")
+        
+        # 创建 AI 回调
+        def ai_callback(state):
+            obs = jnp.expand_dims(state.observation, 0)
+            root = network.apply(params, obs, method=network.initial_inference)
             
-            # 创建网络
-            config = load_config(args.config)
-            net_config = config.get("network", {})
-            network = MuZeroNetwork(
-                observation_channels=net_config.get("observation_channels", NUM_OBSERVATION_CHANNELS),
-                hidden_dim=net_config.get("hidden_dim", 256),
-                action_space_size=net_config.get("action_space_size", ACTION_SPACE_SIZE),
-            )
-            
-            # 加载参数
-            params = load_params(args.checkpoint)
-            
-            # 创建环境
-            env = XiangqiEnv()
-            
-            # MCTS 配置
-            mcts_config = MCTSConfig(
+            policy_output = gumbel_muzero_policy(
+                params=params,
+                rng_key=jax.random.PRNGKey(np.random.randint(0, 2**31)),
+                root=root,
+                recurrent_fn=lambda p, k, a, e: network.apply(p, e, a, method=network.recurrent_inference),
                 num_simulations=args.simulations,
-                use_dirichlet_noise=False,
+                invalid_actions=~state.legal_action_mask,
+                max_num_considered_actions=16,
             )
             
-            def ai_move(board: np.ndarray, player: int):
-                """AI 走棋回调"""
-                # 转换为 JAX 状态
-                rng_key = jax.random.PRNGKey(42)
-                
-                # 创建环境状态 (简化)
-                state = env.init(rng_key)
-                # 用传入的 board 替换
-                state = state.replace(
-                    board=jnp.array(board, dtype=jnp.int8),
-                    current_player=jnp.int32(player),
-                )
-                # 重新计算合法动作
-                from xiangqi.rules import get_legal_moves_mask
-                legal_mask = get_legal_moves_mask(state.board, state.current_player)
-                state = state.replace(legal_action_mask=legal_mask)
-                
-                # 获取观察
-                obs = env.observe(state)
-                obs_batch = obs[jnp.newaxis, ...]
-                legal_mask_batch = state.legal_action_mask[jnp.newaxis, ...]
-                
-                # MCTS 搜索
-                rng_key, search_key = jax.random.split(rng_key)
-                policy_output = run_mcts(
-                    observation=obs_batch,
-                    legal_action_mask=legal_mask_batch,
-                    network_apply=network.apply,
-                    params=params,
-                    config=mcts_config,
-                    rng_key=search_key,
-                )
-                
-                # 选择动作
-                rng_key, action_key = jax.random.split(rng_key)
-                action = select_action(policy_output, temperature=0.0, rng_key=action_key)
-                action = int(action[0])
-                
-                # 转换为坐标
-                from xiangqi.actions import action_to_move
-                from_sq, to_sq = action_to_move(action)
-                from_row, from_col = int(from_sq) // 9, int(from_sq) % 9
-                to_row, to_col = int(to_sq) // 9, int(to_sq) % 9
-                
-                return ((from_row, from_col), (to_row, to_col))
-            
-            ai_callback = ai_move
-            logger.info("AI 模型加载成功")
-            
-        except Exception as e:
-            logger.error(f"加载 AI 失败: {e}")
-            logger.info("将以双人模式启动")
+            action = int(policy_output.action[0])
+            return action
     
-    logger.info("启动图形界面...")
-    logger.info("操作说明:")
-    logger.info("  - 点击棋子选中，再点击目标位置走棋")
-    logger.info("  - 右侧面板可导入/导出 FEN")
-    logger.info("  - 支持悔棋、换边等功能")
+    logger.info("启动 Web 图形界面...")
+    logger.info("浏览器访问: http://localhost:7860")
+    if args.share:
+        logger.info("将创建公网分享链接")
     
-    run_gui(ai_callback=ai_callback, fen=args.fen)
+    run_web_gui(ai_callback=ai_callback, share=args.share)
 
 
 # ============================================================================
@@ -505,23 +471,23 @@ def main():
         help="MCTS 模拟次数"
     )
     
-    # GUI 命令 (推荐)
-    gui_parser = subparsers.add_parser("gui", help="图形界面人机对弈 (推荐)")
-    gui_parser.add_argument(
+    # Web GUI 命令 (推荐)
+    web_parser = subparsers.add_parser("web", help="Web 图形界面 (Gradio)")
+    web_parser.add_argument(
         "--checkpoint", type=str, default=None,
         help="模型检查点路径 (不提供则为双人模式)"
     )
-    gui_parser.add_argument(
+    web_parser.add_argument(
         "--config", type=str, default="configs/default.yaml",
         help="配置文件路径"
     )
-    gui_parser.add_argument(
+    web_parser.add_argument(
         "--simulations", type=int, default=800,
         help="MCTS 模拟次数"
     )
-    gui_parser.add_argument(
-        "--fen", type=str, default=None,
-        help="初始 FEN 字符串 (用于导入指定局面测试)"
+    web_parser.add_argument(
+        "--share", action="store_true",
+        help="创建公网分享链接"
     )
     
     # 评估命令
@@ -545,8 +511,8 @@ def main():
         cmd_train(args)
     elif args.command == "play":
         cmd_play(args)
-    elif args.command == "gui":
-        cmd_gui(args)
+    elif args.command == "web":
+        cmd_web(args)
     elif args.command == "eval":
         cmd_eval(args)
     else:

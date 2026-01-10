@@ -1,7 +1,7 @@
 """
-图形化人机对弈界面 (Pygame)
+Web 图形界面 (Gradio)
 """
 
-from gui.xiangqi_gui import XiangqiGUI, run_gui
+from gui.web_gui import run_web_gui, create_gui, ChessGame
 
-__all__ = ['XiangqiGUI', 'run_gui']
+__all__ = ['run_web_gui', 'create_gui', 'ChessGame']
