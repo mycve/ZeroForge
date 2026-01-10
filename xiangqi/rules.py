@@ -436,11 +436,10 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
         是否被将军
     """
     king_row, king_col = find_king(board, player)
-    king_sq = king_row * BOARD_WIDTH + king_col
     enemy = 1 - player
     
     # 检查所有敌方棋子是否能攻击到将/帅
-    in_check = False
+    in_check = jnp.bool_(False)
     
     for sq in range(NUM_SQUARES):
         row = sq // BOARD_WIDTH
@@ -461,19 +460,24 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
         
         in_check = in_check | (is_enemy & can_attack)
     
-    # 检查将帅对面（王见王）
+    # 检查将帅对面（王见王）- 使用纯 JAX 操作，避免 Python if
     enemy_king_row, enemy_king_col = find_king(board, enemy)
-    if king_col == enemy_king_col:
-        # 检查中间是否有棋子
-        min_row = jnp.minimum(king_row, enemy_king_row)
-        max_row = jnp.maximum(king_row, enemy_king_row)
-        pieces_between = 0
-        for r in range(10):
-            is_between = (r > min_row) & (r < max_row)
-            has_piece = board[r, king_col] != EMPTY
-            pieces_between = pieces_between + jnp.where(is_between & has_piece, 1, 0)
-        face_to_face = (pieces_between == 0) & (king_col == enemy_king_col)
-        in_check = in_check | face_to_face
+    same_col = (king_col == enemy_king_col)
+    
+    # 检查中间是否有棋子
+    min_row = jnp.minimum(king_row, enemy_king_row)
+    max_row = jnp.maximum(king_row, enemy_king_row)
+    
+    # 统计两王之间的棋子数量
+    pieces_between = jnp.int32(0)
+    for r in range(10):
+        is_between = (r > min_row) & (r < max_row)
+        has_piece = board[r, king_col] != EMPTY
+        pieces_between = pieces_between + jnp.where(is_between & has_piece, 1, 0)
+    
+    # 同列且中间无子则对面
+    face_to_face = same_col & (pieces_between == 0)
+    in_check = in_check | face_to_face
     
     return in_check
 
