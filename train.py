@@ -156,7 +156,8 @@ def make_selfplay_fn(env, network, config: dict):
         )
         return (state_after, params), traj
     
-    @jax.jit
+    # 注意：不要加 @jax.jit，因为外层会用 pmap 包裹，pmap 自带 JIT 编译
+    # 如果加了 @jax.jit，会导致函数被编译到默认设备，pmap 无法正确分发到多卡
     def selfplay_fn(params, key):
         k0, k1, k2 = jax.random.split(key, 3)
         
