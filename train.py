@@ -142,29 +142,32 @@ def make_selfplay_fn(env, network, config: dict):
             reverse=True,
         )
         
+        # 有效样本掩码 (游戏结束前的步骤)
         mask = jnp.cumsum(traj.terminated[::-1], axis=0)[::-1] == 0
         
+        # 展平 (T, B, ...) -> (T*B, ...)
+        total_samples = num_steps * num_parallel
         sample = Sample(
-            obs=traj.obs.reshape(-1, *traj.obs.shape[2:]),
-            policy=traj.policy.reshape(-1, *traj.policy.shape[2:]),
-            value=target_value.reshape(-1),
+            obs=traj.obs.reshape(total_samples, *traj.obs.shape[2:]),
+            policy=traj.policy.reshape(total_samples, *traj.policy.shape[2:]),
+            value=target_value.reshape(total_samples),
         )
-        mask = mask.reshape(-1)
+        mask = mask.reshape(total_samples)
         
-        n_valid = mask.sum()
-        idx = jnp.where(mask, jnp.arange(mask.shape[0]), mask.shape[0])
-        idx = jnp.sort(idx)[:n_valid]
-        sample = jax.tree.map(lambda x: x[idx], sample)
-        
-        perm = jax.random.permutation(k2, n_valid)
+        # 打乱顺序
+        perm = jax.random.permutation(k2, total_samples)
         sample = jax.tree.map(lambda x: x[perm], sample)
+        mask = mask[perm]
         
-        n_batches = n_valid // batch_size
+        # 分成 minibatch (固定大小)
+        n_batches = total_samples // batch_size
         sample = jax.tree.map(
             lambda x: x[:n_batches * batch_size].reshape(n_batches, batch_size, *x.shape[1:]),
             sample
         )
-        return sample
+        batch_mask = mask[:n_batches * batch_size].reshape(n_batches, batch_size)
+        
+        return sample, batch_mask
     
     return selfplay_fn
 
@@ -179,17 +182,22 @@ def make_train_step(network, config: dict):
     value_loss_weight = config["training"].get("value_loss_weight", 1.0)
     
     @jax.jit
-    def train_step(state, batch):
+    def train_step(state, batch, mask):
         def loss_fn(params):
             output = network.apply(params, batch.obs)
             
-            policy_loss = optax.losses.softmax_cross_entropy(
+            # 使用 mask 加权损失 (只计算有效样本)
+            policy_loss_per_sample = optax.losses.softmax_cross_entropy(
                 output.policy_logits, batch.policy
-            ).mean()
-            
-            value_loss = optax.losses.squared_error(
+            )
+            value_loss_per_sample = optax.losses.squared_error(
                 output.value, batch.value
-            ).mean()
+            )
+            
+            # 加权平均
+            mask_sum = mask.sum() + 1e-8
+            policy_loss = (policy_loss_per_sample * mask).sum() / mask_sum
+            value_loss = (value_loss_per_sample * mask).sum() / mask_sum
             
             total_loss = policy_loss + value_loss_weight * value_loss
             return total_loss, (policy_loss, value_loss)
@@ -393,14 +401,15 @@ def main():
         key, k0, k1 = jax.random.split(key, 3)
         
         # 自我对弈
-        data = selfplay_fn(state.params, k0)
+        data, data_mask = selfplay_fn(state.params, k0)
         n_samples = data.obs.shape[0] * data.obs.shape[1]
         
         # 训练
         total_loss = 0
         for i in range(data.obs.shape[0]):
             batch = jax.tree.map(lambda x: x[i], data)
-            state, metrics = train_step(state, batch)
+            mask = data_mask[i]
+            state, metrics = train_step(state, batch, mask)
             total_loss += metrics["loss"]
             step += 1
             
