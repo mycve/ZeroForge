@@ -7,11 +7,14 @@ MCTS 搜索模块
 
 from __future__ import annotations
 from typing import NamedTuple, Callable, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import mctx
 from functools import partial
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -261,6 +264,167 @@ def run_mcts(
     )
     
     return policy_output
+
+
+# ============================================================================
+# MCTS Runner (缓存 JIT 编译)
+# ============================================================================
+
+class MCTSRunner:
+    """
+    MCTS 搜索运行器
+    
+    缓存 JIT 编译的函数，避免重复编译开销
+    在自我对弈中复用同一个实例
+    """
+    
+    def __init__(self, network, config: MCTSConfig, action_space_size: int):
+        """
+        初始化 MCTS Runner
+        
+        Args:
+            network: MuZero 网络对象
+            config: MCTS 配置
+            action_space_size: 动作空间大小
+        """
+        self.network = network
+        self.config = config
+        self.action_space_size = action_space_size
+        self._jit_fn = None
+        self._compiled = False
+        
+    def _compile(self):
+        """编译 JIT 函数"""
+        if self._compiled:
+            return
+            
+        logger.info("编译 MCTS 推理函数 (GPU 加速)...")
+        
+        network = self.network
+        config = self.config
+        action_space_size = self.action_space_size
+        
+        # 创建闭包并 JIT 编译
+        @jax.jit
+        def _mcts_fn(
+            params: dict,
+            observation: jnp.ndarray,
+            legal_action_mask: jnp.ndarray,
+            rng_key: jax.random.PRNGKey,
+        ) -> mctx.PolicyOutput:
+            """JIT 编译的 MCTS 函数"""
+            batch_size = observation.shape[0]
+            
+            # === Root Function ===
+            output = network.apply(params, observation)
+            hidden_state = output.hidden_state
+            policy_logits = output.policy_logits
+            value = output.value
+            
+            # 处理价值
+            if config.value_support_size > 0:
+                from networks.heads import logits_to_scalar
+                value = logits_to_scalar(value, config.value_support_size)
+            
+            # 应用合法动作掩码
+            masked_logits = jnp.where(
+                legal_action_mask,
+                policy_logits,
+                jnp.full_like(policy_logits, -1e9)
+            )
+            
+            # Dirichlet 噪声
+            def add_noise(carry, _):
+                logits, key = carry
+                key, noise_key = jax.random.split(key)
+                noise = jax.random.dirichlet(
+                    noise_key,
+                    alpha=jnp.full(logits.shape[-1], config.dirichlet_alpha),
+                    shape=(batch_size,)
+                )
+                noise = jnp.where(legal_action_mask, noise, 0.0)
+                noise = noise / (jnp.sum(noise, axis=-1, keepdims=True) + 1e-8)
+                priors = jax.nn.softmax(logits / config.temperature)
+                priors = (1 - config.dirichlet_fraction) * priors + config.dirichlet_fraction * noise
+                return (jnp.log(priors + 1e-8), key), None
+            
+            rng_key, noise_key = jax.random.split(rng_key)
+            if config.use_dirichlet_noise:
+                (masked_logits, _), _ = add_noise((masked_logits, noise_key), None)
+            
+            root = mctx.RootFnOutput(
+                prior_logits=masked_logits,
+                value=value,
+                embedding=hidden_state,
+            )
+            
+            # === Recurrent Function ===
+            def recurrent_fn(params, rng_key, action, embedding):
+                # 动作需要保持整数类型
+                action = action.astype(jnp.int32)
+                
+                # 调用网络的 recurrent_inference
+                next_hidden, reward, policy_logits, value = network.apply(
+                    params, embedding, action,
+                    method=network.recurrent_inference
+                )
+                
+                # 处理价值
+                if config.value_support_size > 0:
+                    from networks.heads import logits_to_scalar
+                    value = logits_to_scalar(value, config.value_support_size)
+                    reward = logits_to_scalar(reward, config.reward_support_size)
+                
+                # 创建 RecurrentFnOutput
+                recurrent_output = mctx.RecurrentFnOutput(
+                    reward=reward,
+                    discount=jnp.full_like(reward, config.discount),
+                    prior_logits=policy_logits,
+                    value=value,
+                )
+                
+                return recurrent_output, next_hidden
+            
+            # === 执行 MCTS ===
+            rng_key, search_key = jax.random.split(rng_key)
+            policy_output = mctx.gumbel_muzero_policy(
+                params=params,
+                rng_key=search_key,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=config.num_simulations,
+                max_num_considered_actions=config.max_num_considered_actions,
+                gumbel_scale=config.gumbel_scale,
+                invalid_actions=~legal_action_mask,
+            )
+            
+            return policy_output
+        
+        self._jit_fn = _mcts_fn
+        self._compiled = True
+        logger.info("MCTS 推理函数编译完成")
+        
+    def run(
+        self,
+        params: dict,
+        observation: jnp.ndarray,
+        legal_action_mask: jnp.ndarray,
+        rng_key: jax.random.PRNGKey,
+    ) -> mctx.PolicyOutput:
+        """
+        执行 MCTS 搜索 (GPU 加速)
+        
+        Args:
+            params: 网络参数
+            observation: 观察张量 (batch, channels, height, width)
+            legal_action_mask: 合法动作掩码 (batch, action_space)
+            rng_key: 随机数密钥
+            
+        Returns:
+            mctx.PolicyOutput
+        """
+        self._compile()
+        return self._jit_fn(params, observation, legal_action_mask, rng_key)
 
 
 # ============================================================================

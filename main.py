@@ -137,6 +137,10 @@ def cmd_train(args):
     temp_high = mcts_cfg.get("temperature_high", 1.0)
     temp_low = mcts_cfg.get("temperature_low", 0.25)
     
+    # 创建 MCTS Runner (缓存 JIT 编译)
+    from mcts.search import MCTSRunner
+    mcts_runner = MCTSRunner(network, mcts_config, env.action_space_size)
+    
     # 创建目录 (Orbax 要求绝对路径)
     checkpoint_dir = Path(config.get("checkpoint", {}).get("checkpoint_dir", "checkpoints")).resolve()
     log_dir = Path(config.get("logging", {}).get("log_dir", "logs")).resolve()
@@ -193,19 +197,17 @@ def cmd_train(args):
             obs = env.observe(game_state)
             observations.append(np.array(obs))
             
-            # MCTS 搜索
+            # MCTS 搜索 (使用 GPU 加速的 MCTSRunner)
             obs_batch = obs[jnp.newaxis, ...]
             legal_mask_batch = game_state.legal_action_mask[jnp.newaxis, ...]
             
             rng_key, search_key = jax.random.split(rng_key)
             
-            from mcts.search import run_mcts, get_improved_policy, select_action
-            policy_output = run_mcts(
+            from mcts.search import get_improved_policy, select_action
+            policy_output = mcts_runner.run(
+                params=params,
                 observation=obs_batch,
                 legal_action_mask=legal_mask_batch,
-                network=network,
-                params=params,
-                config=mcts_config,
                 rng_key=search_key,
             )
             
@@ -244,21 +246,38 @@ def cmd_train(args):
         return trajectory
     
     # 主训练循环
-    logger.info("开始训练...")
-    
     save_interval = config.get("checkpoint", {}).get("save_interval", 1000)
     eval_interval = config.get("evaluation", {}).get("eval_interval", 5000)
     
     best_elo = 1500.0
+    games_played = 0
+    
+    # 预热信息
+    logger.info(f"Replay Buffer 最小数据量: {training_config.min_replay_size}")
+    logger.info(f"开始自我对弈预热...")
     
     try:
         while state.step < training_config.num_training_steps:
             # 自我对弈生成数据
-            if len(trainer.replay_buffer) < training_config.min_replay_size or \
-               state.step % 10 == 0:  # 每10步补充数据
+            buffer_size = len(trainer.replay_buffer)
+            need_more_data = buffer_size < training_config.min_replay_size or state.step % 10 == 0
+            
+            if need_more_data:
                 rng_key, play_key = jax.random.split(rng_key)
                 trajectory = run_self_play_game(state.params, play_key)
                 trainer.add_trajectory(trajectory)
+                games_played += 1
+                
+                # 预热期间显示进度
+                if buffer_size < training_config.min_replay_size:
+                    if games_played % 5 == 0:  # 每5局显示一次
+                        logger.info(
+                            f"预热中: {buffer_size}/{training_config.min_replay_size} 步 "
+                            f"({games_played} 局, {len(trajectory.observations)} 步/局)"
+                        )
+                elif state.step == 0:
+                    logger.info(f"预热完成! 开始训练... (共 {games_played} 局)")
+                    logger.info("开始训练...")
                 
                 # 数据增强
                 if config.get("self_play", {}).get("use_mirror_augmentation", True):

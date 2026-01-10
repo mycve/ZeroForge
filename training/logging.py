@@ -362,8 +362,9 @@ def setup_logging(
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     
-    # 根日志器
+    # 根日志器 - 先清除已有的 handlers 避免重复
     root_logger = logging.getLogger()
+    root_logger.handlers.clear()
     root_logger.setLevel(getattr(logging, log_level.upper()))
     root_logger.addHandler(console_handler)
     
