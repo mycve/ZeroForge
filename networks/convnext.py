@@ -5,6 +5,7 @@ ConvNeXt 网络模块
 
 from __future__ import annotations
 from typing import Sequence, Optional
+import numpy as np
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -182,9 +183,10 @@ class ConvNeXtBackbone(nn.Module):
         x = nn.LayerNorm(epsilon=1e-6, name='stem_norm')(x)
         
         # 计算 drop path rates (线性增加)
+        # 使用 numpy 而不是 jax.numpy，因为这些是模型构建时的常量
         total_blocks = sum(self.depths)
-        dp_rates = jnp.linspace(0, self.drop_path_rate, total_blocks)
-        
+        dp_rates = np.linspace(0, self.drop_path_rate, total_blocks)
+
         # Stages
         cur = 0
         for i, depth in enumerate(self.depths):
