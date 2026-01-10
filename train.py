@@ -7,6 +7,7 @@ ZeroForge - 中国象棋 Gumbel MuZero
 """
 
 import os
+import signal
 import jax
 import jax.numpy as jnp
 import optax
@@ -23,6 +24,23 @@ import logging
 import time
 import yaml
 from pathlib import Path
+
+# 全局标志，用于优雅退出
+_SHOULD_EXIT = False
+
+def _signal_handler(signum, frame):
+    """处理 Ctrl+C 信号"""
+    global _SHOULD_EXIT
+    if _SHOULD_EXIT:
+        print("\n强制退出...", flush=True)
+        os._exit(1)
+    else:
+        _SHOULD_EXIT = True
+        print("\n收到退出信号，将在当前迭代结束后保存并退出...", flush=True)
+        print("再按一次 Ctrl+C 强制退出", flush=True)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 from xiangqi.env import XiangqiEnv
 from networks.muzero import MuZeroNetwork, create_train_state
@@ -508,7 +526,8 @@ def main():
     # ====================================================================
     # 训练循环
     # ====================================================================
-    while step < num_training_steps:
+    global _SHOULD_EXIT
+    while step < num_training_steps and not _SHOULD_EXIT:
         iter_start = time.time()
         step_at_iter_start = step
         key, k0, k1 = jax.random.split(key, 3)
@@ -584,7 +603,10 @@ def main():
     writer.close()
     
     total_time = time.time() - start_time
-    print(f"训练完成! 总时间: {total_time/3600:.1f}小时", flush=True)
+    if _SHOULD_EXIT:
+        print(f"训练被中断，已保存检查点。总时间: {total_time/3600:.1f}小时", flush=True)
+    else:
+        print(f"训练完成! 总时间: {total_time/3600:.1f}小时", flush=True)
 
 
 if __name__ == "__main__":
