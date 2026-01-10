@@ -31,13 +31,13 @@ pip install -e ".[cpu]"
 
 ```bash
 # 使用默认配置训练
-python main.py train
+uv run python main.py train
 
 # 使用自定义配置
-python main.py train --config configs/default.yaml
+uv run python main.py train --config configs/default.yaml
 
 # 从检查点继续训练
-python main.py train --resume
+uv run python main.py train --resume
 ```
 
 ### Web 界面对弈 (推荐)

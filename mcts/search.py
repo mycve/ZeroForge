@@ -52,7 +52,7 @@ class MCTSConfig:
 # ============================================================================
 
 def create_root_fn(
-    network_apply: Callable,
+    network,
     params: dict,
     config: MCTSConfig,
 ) -> Callable:
@@ -62,7 +62,7 @@ def create_root_fn(
     root_fn 用于初始化 MCTS 树的根节点
     
     Args:
-        network_apply: 网络的 apply 函数
+        network: MuZero 网络对象
         params: 网络参数
         config: MCTS 配置
         
@@ -88,15 +88,13 @@ def create_root_fn(
         """
         batch_size = observation.shape[0]
         
-        # 网络推理
-        hidden_state = network_apply(
-            params, observation, method='represent'
-        )
+        # 使用网络的 __call__ 进行初始推理
+        # 返回 NetworkOutput(hidden_state, policy_logits, value)
+        output = network.apply(params, observation)
         
-        # 获取策略和价值
-        policy_logits, value = network_apply(
-            params, hidden_state, method='prediction'
-        )
+        hidden_state = output.hidden_state
+        policy_logits = output.policy_logits
+        value = output.value
         
         # 处理价值 (如果是分类分布)
         if config.value_support_size > 0:
@@ -143,7 +141,7 @@ def create_root_fn(
 # ============================================================================
 
 def create_recurrent_fn(
-    network_apply: Callable,
+    network,
     params: dict,
     config: MCTSConfig,
     action_space_size: int,
@@ -154,7 +152,7 @@ def create_recurrent_fn(
     recurrent_fn 用于 MCTS 树的展开
     
     Args:
-        network_apply: 网络的 apply 函数
+        network: MuZero 网络对象
         params: 网络参数
         config: MCTS 配置
         action_space_size: 动作空间大小
@@ -173,7 +171,7 @@ def create_recurrent_fn(
         展开树节点
         
         Args:
-            params: 网络参数 (mctx 传递，这里忽略使用外部 params)
+            params: 网络参数 (mctx 传递)
             rng_key: 随机数密钥
             action: 选择的动作 (batch,)
             embedding: 当前隐藏状态 (batch, hidden_dim, H, W)
@@ -181,9 +179,9 @@ def create_recurrent_fn(
         Returns:
             (RecurrentFnOutput, next_embedding)
         """
-        # 网络循环推理
-        next_hidden, reward, policy_logits, value = network_apply(
-            params, embedding, action, method='recurrent_inference'
+        # 使用网络的 recurrent_inference 方法
+        next_hidden, reward, policy_logits, value = network.apply(
+            params, embedding, action, method=network.recurrent_inference
         )
         
         # 处理价值和奖励 (如果是分类分布)
@@ -216,7 +214,7 @@ def create_recurrent_fn(
 def run_mcts(
     observation: jnp.ndarray,
     legal_action_mask: jnp.ndarray,
-    network_apply: Callable,
+    network,
     params: dict,
     config: MCTSConfig,
     rng_key: jax.random.PRNGKey,
@@ -227,7 +225,7 @@ def run_mcts(
     Args:
         observation: 观察张量 (batch, channels, height, width)
         legal_action_mask: 合法动作掩码 (batch, action_space)
-        network_apply: 网络的 apply 函数
+        network: MuZero 网络对象
         params: 网络参数
         config: MCTS 配置
         rng_key: 随机数密钥
@@ -241,8 +239,8 @@ def run_mcts(
     action_space_size = legal_action_mask.shape[-1]
     
     # 创建 root 和 recurrent 函数
-    root_fn = create_root_fn(network_apply, params, config)
-    recurrent_fn = create_recurrent_fn(network_apply, params, config, action_space_size)
+    root_fn = create_root_fn(network, params, config)
+    recurrent_fn = create_recurrent_fn(network, params, config, action_space_size)
     
     # 分割随机数密钥
     rng_key, root_key, search_key = jax.random.split(rng_key, 3)

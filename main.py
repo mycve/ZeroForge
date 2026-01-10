@@ -203,7 +203,7 @@ def cmd_train(args):
             policy_output = run_mcts(
                 observation=obs_batch,
                 legal_action_mask=legal_mask_batch,
-                network_apply=network.apply,
+                network=network,
                 params=params,
                 config=mcts_config,
                 rng_key=search_key,
