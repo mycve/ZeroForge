@@ -44,18 +44,18 @@ class AlphaZeroNetwork(nn.Module):
         for _ in range(self.num_blocks):
             x = ResBlock(self.channels)(x, train)
         
-        # 策略头
-        p = nn.Conv(32, (1, 1), use_bias=False)(x)
+        # 策略头 (AlphaZero 标配通常是 2 通道)
+        p = nn.Conv(2, (1, 1), use_bias=False)(x)
         p = nn.BatchNorm(use_running_average=not train)(p)
         p = nn.relu(p)
-        p = p.reshape(p.shape[0], -1)
+        p = p.reshape((p.shape[0], -1))  # 显式使用 tuple 形状
         p = nn.Dense(self.action_space_size)(p)
         
-        # 价值头
-        v = nn.Conv(32, (1, 1), use_bias=False)(x)
+        # 价值头 (AlphaZero 标配通常是 1 通道)
+        v = nn.Conv(1, (1, 1), use_bias=False)(x)
         v = nn.BatchNorm(use_running_average=not train)(v)
         v = nn.relu(v)
-        v = v.reshape(v.shape[0], -1)
+        v = v.reshape((v.shape[0], -1))  # 显式使用 tuple 形状
         v = nn.Dense(256)(v)
         v = nn.relu(v)
         v = nn.Dense(1)(v)
