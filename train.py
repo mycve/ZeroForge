@@ -270,8 +270,8 @@ def selfplay(model, rng_key):
     batch_size = config.selfplay_batch_size // num_devices
     
     def step_fn(state, key):
-        # 为 batch 里的每个环境分配独立的种子
-        batch_keys = jax.random.split(key, batch_size)
+        # 分配各种用途的单一种子，mctx 和 vmap 内部会自动处理 batch
+        key_noise, key_search, key_sample, key_next = jax.random.split(key, 4)
         
         obs = jax.vmap(env.observe)(state)
         (logits, value), _ = forward(params, batch_stats, obs)
@@ -285,13 +285,13 @@ def selfplay(model, rng_key):
             logits[:, rotated_idx]
         )
         
-        # 添加 Dirichlet 噪声
+        # 添加 Dirichlet 噪声 (需要 vmap 处理 batch 噪声)
         def _add_noise(l, k):
             noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
             p = jax.nn.softmax(l)
             return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
         
-        noise_keys = jax.random.split(key, batch_size)
+        noise_keys = jax.random.split(key_noise, batch_size)
         logits = jax.vmap(_add_noise)(logits, noise_keys)
 
         # 准备 MCTS 根节点
@@ -301,12 +301,12 @@ def selfplay(model, rng_key):
         is_weak_step = ((state.power_mode == 1) & (state.current_player == 1)) | \
                        ((state.power_mode == 2) & (state.current_player == 0))
         
-        # 强/弱搜索使用不同的 batch_keys
-        search_keys = jax.random.split(key, batch_size)
+        # 搜索 (mctx 内部会自动处理 root 的 batch_size)
+        key_s1, key_s2 = jax.random.split(key_search)
         
         policy_output_strong = mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=search_keys, # 关键：传入 batch 种子
+            rng_key=key_s1, # 传入单一种子
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
@@ -316,7 +316,7 @@ def selfplay(model, rng_key):
         
         policy_output_weak = mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=search_keys,
+            rng_key=key_s2, # 传入单一种子
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.weak_simulations,
@@ -327,25 +327,21 @@ def selfplay(model, rng_key):
         # 合并结果
         action_weights = jnp.where(is_weak_step[:, None], policy_output_weak.action_weights, policy_output_strong.action_weights)
         
-        # --- 温度采样选择最终 Action ---
-        # 这里的温度只影响动作选择，不干扰 MCTS 先验
+        # 温度采样选择最终 Action
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, 
                          config.temperature_final)
         
         def _sample_action(w, t, k):
-            # 防止除零
             t = jnp.maximum(t, 1e-3)
-            # 对 weights 进行温度缩放
-            w_temp = jnp.power(w, 1.0 / t)
+            w_temp = jnp.power(w + 1e-10, 1.0 / t) # 加上 epsilon 防止 weights 为 0
             w_temp = w_temp / jnp.sum(w_temp)
             return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp)
         
-        select_keys = jax.random.split(key, batch_size)
-        action = jax.vmap(_sample_action)(action_weights, temp, select_keys)
+        sample_keys = jax.random.split(key_sample, batch_size)
+        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
 
         actor = state.current_player
-        keys = jax.random.split(key, batch_size)
         
         # 执行一步动作
         next_state = jax.vmap(env.step)(state, action)
@@ -370,18 +366,14 @@ def selfplay(model, rng_key):
         
         # 检查是否需要 reset
         def _reset_fn(s, k):
-            # reset 时重新随机算力模式
-            new_key, _ = jax.random.split(k)
-            new_mode_key, _ = jax.random.split(new_key)
-            
-            # 随机分配模式: 0 (正常), 1 (红强), 2 (黑强)
-            r = jax.random.uniform(new_mode_key)
+            k1, k2 = jax.random.split(k)
+            r = jax.random.uniform(k1)
             new_mode = jnp.where(r < config.asymmetric_ratio / 2, 1, 
                                 jnp.where(r < config.asymmetric_ratio, 2, 0))
-            
-            return jax.lax.cond(s.terminated, lambda: env.init(k, new_mode), lambda: s)
+            return jax.lax.cond(s.terminated, lambda: env.init(k2, new_mode), lambda: s)
         
-        next_state_reset = jax.vmap(_reset_fn)(next_state, keys)
+        reset_keys = jax.random.split(key_next, batch_size)
+        next_state_reset = jax.vmap(_reset_fn)(next_state, reset_keys)
         
         return next_state_reset, data
     
