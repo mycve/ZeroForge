@@ -60,6 +60,10 @@ class Config:
     temperature_initial: float = 1.0
     temperature_final: float = 0.01
     
+    # 非对称自对弈 (破局核心)
+    asymmetric_ratio: float = 0.5   # 50% 的对局使用非对称算力
+    weak_simulations: int = 1       # 弱方模拟次数
+    
     # 环境规则 (统一管理)
     max_steps: int = 400            # 总步数限制
     max_no_capture_steps: int = 60  # 无吃子步数限制 (强制进攻)
@@ -248,6 +252,7 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
+    power_mode: jnp.ndarray
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -282,21 +287,24 @@ def selfplay(model, rng_key):
         # 添加 Dirichlet 噪声 (AlphaZero 标准探索)
         noise = jax.random.dirichlet(key_noise, jnp.ones(ACTION_SPACE_SIZE) * 0.3, shape=(batch_size,))
         probs = jax.nn.softmax(logits)
-        # 仅在合法动作上加噪声
         noise_probs = 0.75 * probs + 0.25 * noise
         logits = jnp.log(noise_probs + 1e-10)
 
-        # 温度采样：前 N 步加大探索
-        # Gumbel MuZero 通过调整 logits 来实现类似温度的效果
+        # 温度采样
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, 
                          config.temperature_final)
-        # 注意：temp 为 0 会导致除零，所以用 jnp.where 保护
         logits = logits / jnp.maximum(temp[:, None], 1e-3)
 
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
-        policy_output = mctx.gumbel_muzero_policy(
+        # --- 非对称算力分流 ---
+        # 模式 1: 红强黑弱, 模式 2: 红弱黑强
+        is_weak_step = ((state.power_mode == 1) & (state.current_player == 1)) | \
+                       ((state.power_mode == 2) & (state.current_player == 0))
+        
+        # 强搜索
+        policy_output_strong = mctx.gumbel_muzero_policy(
             params=model,
             rng_key=key1,
             root=root,
@@ -306,19 +314,37 @@ def selfplay(model, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
+        # 弱搜索 (如果 weak_simulations > 1 则调用 mctx，如果是 1 则直接用网络输出)
+        # 这里为了简单，如果 weak_simulations=1，我们模拟一个 policy_output
+        def get_weak_search():
+            return mctx.gumbel_muzero_policy(
+                params=model,
+                rng_key=key1,
+                root=root,
+                recurrent_fn=recurrent_fn,
+                num_simulations=config.weak_simulations,
+                max_num_considered_actions=config.max_num_considered_actions,
+                invalid_actions=~state.legal_action_mask,
+            )
+        
+        policy_output_weak = get_weak_search()
+        
+        # 合并结果
+        action = jnp.where(is_weak_step, policy_output_weak.action, policy_output_strong.action)
+        action_weights = jnp.where(is_weak_step[:, None], policy_output_weak.action_weights, policy_output_strong.action_weights)
+
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
         
         # 执行一步动作
-        next_state = jax.vmap(env.step)(state, policy_output.action)
+        next_state = jax.vmap(env.step)(state, action)
         
         # 记录数据
         # 关键修正：将 policy 目标转回视角坐标系，以匹配归一化的 obs
-        # 只有这样，网络学习到的才是通用视角的“我该怎么下”
         normalized_action_weights = jnp.where(
             state.current_player[:, None] == 0,
-            policy_output.action_weights,
-            policy_output.action_weights[:, rotated_idx]
+            action_weights,
+            action_weights[:, rotated_idx]
         )
 
         data = SelfplayOutput(
@@ -329,11 +355,21 @@ def selfplay(model, rng_key):
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner,
             draw_reason=next_state.draw_reason,
+            power_mode=state.power_mode,
         )
         
         # 检查是否需要 reset
         def _reset_fn(s, k):
-            return jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s)
+            # reset 时重新随机算力模式
+            new_key, _ = jax.random.split(k)
+            new_mode_key, _ = jax.random.split(new_key)
+            
+            # 随机分配模式: 0 (正常), 1 (红强), 2 (黑强)
+            r = jax.random.uniform(new_mode_key)
+            new_mode = jnp.where(r < config.asymmetric_ratio / 2, 1, 
+                                jnp.where(r < config.asymmetric_ratio, 2, 0))
+            
+            return jax.lax.cond(s.terminated, lambda: env.init(k, new_mode), lambda: s)
         
         next_state_reset = jax.vmap(_reset_fn)(next_state, keys)
         
@@ -341,7 +377,14 @@ def selfplay(model, rng_key):
     
     rng_key, subkey = jax.random.split(rng_key)
     keys = jax.random.split(subkey, batch_size)
-    state = jax.vmap(env.init)(keys)
+    
+    # 初始算力模式分配
+    mode_key, _ = jax.random.split(rng_key)
+    r = jax.random.uniform(mode_key, (batch_size,))
+    init_modes = jnp.where(r < config.asymmetric_ratio / 2, 1, 
+                          jnp.where(r < config.asymmetric_ratio, 2, 0))
+    
+    state = jax.vmap(env.init)(keys, init_modes)
     
     _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
     return data
@@ -445,11 +488,21 @@ def main():
         data_np = jax.device_get(data)
         term = data_np.terminated  # (D, T, B)
         winner = data_np.winner    # (D, T, B)
+        p_mode = data_np.power_mode # (D, T, B)
+        
         # 沿时间轴找第一次结束
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         r = int((first_term & (winner == 0)).sum())
         b = int((first_term & (winner == 1)).sum())
         d = int((first_term & (winner == -1)).sum())
+        
+        # 统计非对称局的胜率
+        # 模式 1 (强红弱黑) 下红胜
+        mode1_r_wins = int((first_term & (p_mode == 1) & (winner == 0)).sum())
+        mode1_total = int((first_term & (p_mode == 1)).sum())
+        # 模式 2 (弱红强黑) 下黑胜
+        mode2_b_wins = int((first_term & (p_mode == 2) & (winner == 1)).sum())
+        mode2_total = int((first_term & (p_mode == 2)).sum())
         
         # 细分和棋原因
         reason = data_np.draw_reason
@@ -512,6 +565,13 @@ def main():
         writer.add_scalar("selfplay/draw_threefold", d_three, iteration)
         writer.add_scalar("selfplay/draw_perpetual", d_perp, iteration)
         writer.add_scalar("selfplay/avg_steps", avg_steps, iteration)
+        
+        # 记录非对称局表现
+        if mode1_total > 0:
+            writer.add_scalar("asymmetric/strong_red_win_rate", mode1_r_wins / mode1_total, iteration)
+        if mode2_total > 0:
+            writer.add_scalar("asymmetric/strong_black_win_rate", mode2_b_wins / mode2_total, iteration)
+        
         writer.add_scalar("stats/frames", frames, iteration)
         
         # 保存

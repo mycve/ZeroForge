@@ -77,6 +77,9 @@ class XiangqiState:
     # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=三次重复, 4=长将
     draw_reason: jnp.int32
     
+    # 算力模式 (用于非对称自对弈): 0=双方正常, 1=强红弱黑, 2=弱红强黑
+    power_mode: jnp.int32
+    
     # === 违规检测相关 ===
     
     # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32 - 用于重复局面检测
@@ -194,12 +197,13 @@ class XiangqiEnv:
         self.perpetual_check_threshold = perpetual_check_threshold
     
     @partial(jax.jit, static_argnums=(0,))
-    def init(self, key: jax.random.PRNGKey) -> XiangqiState:
+    def init(self, key: jax.random.PRNGKey, power_mode: jnp.int32 = 0) -> XiangqiState:
         """
         初始化游戏状态
         
         Args:
-            key: JAX 随机数密钥 (当前未使用，但保持接口兼容)
+            key: JAX 随机数密钥
+            power_mode: 算力模式
             
         Returns:
             初始游戏状态
@@ -225,6 +229,7 @@ class XiangqiEnv:
             no_capture_count=jnp.int32(0),
             winner=jnp.int32(-1),
             draw_reason=jnp.int32(0),
+            power_mode=power_mode,
             # 违规检测
             position_hashes=position_hashes,
             hash_count=jnp.int32(1),
@@ -398,6 +403,7 @@ class XiangqiEnv:
                 no_capture_count=new_no_capture,
                 winner=winner,
                 draw_reason=jnp.where(game_over, new_draw_reason, jnp.int32(0)),
+                power_mode=state.power_mode,
                 # 违规检测状态
                 position_hashes=new_position_hashes,
                 hash_count=new_hash_count,
@@ -545,10 +551,12 @@ class VectorizedXiangqiEnv:
         self.v_observe = jax.vmap(self.env.observe)
     
     @partial(jax.jit, static_argnums=(0,))
-    def init(self, key: jax.random.PRNGKey) -> XiangqiState:
+    def init(self, key: jax.random.PRNGKey, power_modes: Optional[jnp.ndarray] = None) -> XiangqiState:
         """批量初始化"""
         keys = jax.random.split(key, self.batch_size)
-        return self.v_init(keys)
+        if power_modes is None:
+            power_modes = jnp.zeros(self.batch_size, dtype=jnp.int32)
+        return self.v_init(keys, power_modes)
     
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: XiangqiState, actions: jnp.ndarray) -> XiangqiState:
