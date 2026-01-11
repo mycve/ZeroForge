@@ -27,11 +27,18 @@ network:
 # ============================================================================
 mcts:
   # MCTS 模拟次数
-  # 训练时 50-100 足够，推理/对战时可以调高到 200-800
-  num_simulations: 100
-  # 每步考虑的最大动作数（Gumbel MuZero 特性）
-  max_num_considered_actions: 16
+  num_simulations: 120
+  # 每步考虑的最大动作数
+  max_num_considered_actions: 32
   discount: 1.0
+  
+  # 温度采样：增加探索多样性
+  # temperature > 1：更随机探索
+  # temperature = 1：标准采样
+  # temperature < 1：更确定（接近 argmax）
+  temperature: 1.5
+  # 前 N 步使用高温度，之后用低温度
+  temp_threshold_steps: 30
 
 # ============================================================================
 # 训练

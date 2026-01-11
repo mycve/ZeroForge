@@ -81,8 +81,11 @@ PER_DEVICE_PARALLEL = GLOBAL_NUM_PARALLEL // NUM_DEVICES
 
 # MCTS 配置
 NUM_SIMULATIONS = CONFIG["mcts"]["num_simulations"]
-MAX_ACTIONS = CONFIG["mcts"].get("max_num_considered_actions", 16)
+MAX_ACTIONS = CONFIG["mcts"].get("max_num_considered_actions", 32)  # 增加到 32
 DISCOUNT = CONFIG["mcts"].get("discount", 1.0)
+# 探索参数：Dirichlet 噪声
+ROOT_DIRICHLET_ALPHA = CONFIG["mcts"].get("root_dirichlet_alpha", 0.3)
+ROOT_EXPLORATION_FRACTION = CONFIG["mcts"].get("root_exploration_fraction", 0.25)
 MAX_STEPS = CONFIG["self_play"].get("max_steps", 200)
 VALUE_LOSS_WEIGHT = CONFIG["training"].get("value_loss_weight", 1.0)
 
@@ -176,11 +179,18 @@ _v_step = jax.vmap(ENV.step)
 _v_observe = jax.vmap(ENV.observe)
 
 
+# 温度采样参数
+TEMPERATURE = CONFIG["mcts"].get("temperature", 1.0)  # 训练时温度（>1 更随机）
+TEMP_THRESHOLD_STEPS = CONFIG["mcts"].get("temp_threshold_steps", 30)  # 前 N 步用高温度
+
+
 def _selfplay_core(params, key):
-    """单设备自我对弈"""
+    """单设备自我对弈（带温度采样）"""
     
-    def selfplay_step(state, key):
-        k_policy, k_reset = jax.random.split(key)
+    def selfplay_step(carry, rng_data):
+        state, step_idx = carry
+        key = rng_data
+        k_policy, k_sample, k_reset = jax.random.split(key, 3)
         
         obs = _v_observe(state)
         player = state.current_player
@@ -192,27 +202,40 @@ def _selfplay_core(params, key):
             embedding=output.hidden_state,
         )
 
-        if SUPPORTS_MAX_ACTIONS:
-            policy_output = mctx.gumbel_muzero_policy(
-                params=params,
-                rng_key=k_policy,
-                root=root,
-                recurrent_fn=_recurrent_fn,
-                num_simulations=NUM_SIMULATIONS,
-                invalid_actions=~state.legal_action_mask,
-                max_num_considered_actions=MAX_ACTIONS,
-            )
-        else:
-            policy_output = mctx.gumbel_muzero_policy(
-                params=params,
-                rng_key=k_policy,
-                root=root,
-                recurrent_fn=_recurrent_fn,
-                num_simulations=NUM_SIMULATIONS,
-                invalid_actions=~state.legal_action_mask,
-            )
+        # Gumbel MuZero 策略
+        policy_output = mctx.gumbel_muzero_policy(
+            params=params,
+            rng_key=k_policy,
+            root=root,
+            recurrent_fn=_recurrent_fn,
+            num_simulations=NUM_SIMULATIONS,
+            invalid_actions=~state.legal_action_mask,
+            max_num_considered_actions=MAX_ACTIONS,
+            gumbel_scale=1.0,
+        )
         
-        next_state = _v_step(state, policy_output.action)
+        # === 温度采样：前 N 步用高温度增加探索 ===
+        # action_weights 是 MCTS 输出的访问概率
+        weights = policy_output.action_weights  # (batch, num_actions)
+        
+        # 温度调整：前 TEMP_THRESHOLD_STEPS 步用高温度，之后用贪婪
+        use_temperature = step_idx < TEMP_THRESHOLD_STEPS
+        
+        # 对 log-probs 应用温度
+        log_weights = jnp.log(weights + 1e-8)
+        # 高温度时 (T>1)：分布更平坦，探索更多
+        # 低温度时 (T→0)：接近 argmax，利用最优
+        temp = jnp.where(use_temperature, TEMPERATURE, 0.1)
+        adjusted_logits = log_weights / temp
+        
+        # 确保非法动作不被选中
+        adjusted_logits = jnp.where(state.legal_action_mask, adjusted_logits, -1e9)
+        
+        # 从调整后的分布中采样
+        sampled_action = jax.random.categorical(k_sample, adjusted_logits, axis=-1)
+        
+        # 执行动作
+        next_state = _v_step(state, sampled_action)
         reward = jax.vmap(lambda s, p: s.rewards[p])(next_state, player)
 
         reset_state = _v_init(jax.random.split(k_reset, PER_DEVICE_PARALLEL))
@@ -226,19 +249,25 @@ def _selfplay_core(params, key):
 
         state_after = jax.tree.map(_select, next_state, reset_state)
         
+        # 重置后 step_idx 归零
+        new_step_idx = jnp.where(term, 0, step_idx + 1)
+        # 对于每个并行游戏，需要单独的 step_idx
+        # 这里简化处理：用全局 step_idx（每个游戏共享，重置时清零）
+        
         traj = Trajectory(
             obs=obs,
             policy=policy_output.action_weights,
             reward=reward,
             terminated=next_state.terminated,
             player=player,
-            winner=next_state.winner,  # 记录胜者
+            winner=next_state.winner,
         )
-        return state_after, traj
+        return (state_after, step_idx + 1), traj
     
-    k0, k1, k2, k3 = jax.random.split(key, 4)
+    k0, k1, k2 = jax.random.split(key, 3)
     state = _v_init(jax.random.split(k0, PER_DEVICE_PARALLEL))
-    _, traj = jax.lax.scan(selfplay_step, state, jax.random.split(k1, MAX_STEPS))
+    init_step_idx = jnp.int32(0)
+    (_, _), traj = jax.lax.scan(selfplay_step, (state, init_step_idx), jax.random.split(k1, MAX_STEPS))
     
     # === 统计自对弈结果 ===
     # traj.terminated: (T, B), traj.winner: (T, B)
@@ -275,37 +304,10 @@ def _selfplay_core(params, key):
     
     _, target_value = jax.lax.scan(compute_value, jnp.zeros(PER_DEVICE_PARALLEL), traj, reverse=True)
     
-    # === 和棋样本控制：保留胜负样本的 1/10 ===
-    # 获取每局游戏的胜者
-    final_winner = jnp.where(first_term, traj.winner, 0).sum(axis=0)  # (B,)
-    # 判断是否为和棋 (winner == -1) 或未结束
-    is_draw_game = (final_winner == -1) | (~games_finished)  # (B,)
-    is_decisive_game = ~is_draw_game  # 有胜负的游戏
-    
-    # 计算要保留的和棋数量：胜负数 / 10
-    num_decisive = is_decisive_game.sum()
-    num_draw_to_keep = jnp.maximum(num_decisive // 10, 1)  # 至少保留 1 局
-    
-    # 随机选择要保留的和棋
-    # 给每个和棋游戏分配随机数，选择最小的 num_draw_to_keep 个
-    draw_random = jax.random.uniform(k3, (PER_DEVICE_PARALLEL,))
-    # 非和棋设为无穷大，这样排序时会排在后面
-    draw_random = jnp.where(is_draw_game, draw_random, jnp.float32(1e9))
-    # 找到阈值：第 num_draw_to_keep 小的随机数
-    sorted_random = jnp.sort(draw_random)
-    threshold = sorted_random[num_draw_to_keep - 1]
-    # 保留随机数 <= 阈值的和棋
-    keep_draw = is_draw_game & (draw_random <= threshold)
-    
-    # 最终保留的游戏：有胜负 OR 被选中的和棋
-    keep_game = is_decisive_game | keep_draw  # (B,)
-    
-    # 基础掩码：游戏结束后的样本无效
-    base_mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1  # (T, B)
-    # 丢弃掩码：未被保留的游戏
-    discard_mask = jnp.broadcast_to((~keep_game)[None, :], base_mask.shape)  # (T, B)
-    # 合并掩码
-    mask = base_mask | discard_mask
+    # === 样本掩码：游戏结束后的步骤无效 ===
+    # 注意：暂时不过滤和棋，让所有样本参与训练
+    # 等模型学会分出胜负后，再启用和棋过滤
+    mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1  # (T, B)
     
     # 统计有效样本数
     valid_samples = (~mask).sum()
