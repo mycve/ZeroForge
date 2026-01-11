@@ -26,23 +26,30 @@ from networks.alphazero import AlphaZeroNetwork
 # ============================================================================
 
 class Config:
+    # 基础配置
     seed: int = 42
-    num_channels: int = 128
-    num_blocks: int = 12  # 稍微增加深度
-    selfplay_batch_size: int = 256
-    num_simulations: int = 64  # 增加模拟次数
-    max_num_steps: int = 400  # 匹配环境最大步数
-    training_batch_size: int = 256
-    learning_rate: float = 2e-4
     ckpt_dir: str = "checkpoints"
+    
+    # 网络架构
+    num_channels: int = 128
+    num_blocks: int = 12
+    
+    # 训练超参数
+    learning_rate: float = 2e-4
+    training_batch_size: int = 256
+    
+    # 自对弈与搜索
+    selfplay_batch_size: int = 256
+    num_simulations: int = 64
+    max_num_considered_actions: int = 16
+    
+    # 环境规则 (统一管理)
+    max_steps: int = 400            # 总步数限制
+    max_no_capture_steps: int = 60  # 无吃子步数限制 (强制进攻)
+    repetition_threshold: int = 3   # 重复局面阈值
+    perpetual_check_threshold: int = 6 # 连续将军阈值
 
-# 解析命令行参数
 config = Config()
-for arg in sys.argv[1:]:
-    if '=' in arg:
-        k, v = arg.split('=')
-        if hasattr(config, k):
-            setattr(config, k, type(getattr(config, k))(v))
 
 # ============================================================================
 # 环境和设备
@@ -51,7 +58,13 @@ for arg in sys.argv[1:]:
 devices = jax.local_devices()
 num_devices = len(devices)
 
-env = XiangqiEnv()
+# 使用统一配置初始化环境
+env = XiangqiEnv(
+    max_steps=config.max_steps,
+    max_no_capture_steps=config.max_no_capture_steps,
+    repetition_threshold=config.repetition_threshold,
+    perpetual_check_threshold=config.perpetual_check_threshold
+)
 
 net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
@@ -133,6 +146,7 @@ def selfplay(model, rng_key):
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
+            max_num_considered_actions=config.max_num_considered_actions,
             invalid_actions=~state.legal_action_mask,
         )
         
@@ -142,7 +156,7 @@ def selfplay(model, rng_key):
         # 先执行一步动作，不立即 reset
         next_state = jax.vmap(env.step)(state, policy_output.action)
         
-        # 记录数据（此时 next_state 包含真实的 terminated 信息）
+        # 记录数据
         data = SelfplayOutput(
             obs=obs,
             action_weights=policy_output.action_weights,
@@ -152,7 +166,7 @@ def selfplay(model, rng_key):
             winner=next_state.winner,
         )
         
-        # 检查是否需要 reset 并更新 next_state 用于下一轮循环
+        # 检查是否需要 reset
         def _reset_fn(s, k):
             return jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s)
         
@@ -164,7 +178,7 @@ def selfplay(model, rng_key):
     keys = jax.random.split(subkey, batch_size)
     state = jax.vmap(env.init)(keys)
     
-    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_num_steps))
+    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
     return data
 
 @jax.pmap

@@ -36,44 +36,8 @@ CHANNELS_PER_STEP = 14
 # 总观察通道数: (16历史 + 1当前) × 14棋子 + 1当前玩家 + 1步数 = 240
 NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP + 2
 
-# 最大步数限制 (象棋通常在 40-100 回合结束，设为 400 步比较充裕)
-MAX_STEPS = 400
-
-# 无吃子步数限制 (通常 60 步无吃子判和，120 步稍微宽松一点)
-MAX_NO_CAPTURE_STEPS = 120
-
 # 重复局面检测: 保存最近 N 步的局面哈希
 POSITION_HISTORY_SIZE = 256
-
-# 重复次数阈值 (中国象棋通常是三次重复)
-REPETITION_THRESHOLD = 3
-
-# 长将检测: 连续将军次数阈值 (超过判负)
-PERPETUAL_CHECK_THRESHOLD = 6
-
-# ============================================================================
-# 辅助奖励：吃子得分
-# ============================================================================
-# 降低吃子奖励，避免模型过于贪吃，主要以胜负为准
-# 象棋中胜负奖励是 ±1，吃子奖励之和不应超过胜负的影响
-PIECE_VALUES = jnp.array([
-    0.0,    # 0: EMPTY
-    0.0,    # 1: R_KING
-    0.01,   # 2: R_ADVISOR
-    0.01,   # 3: R_BISHOP
-    0.02,   # 4: R_KNIGHT
-    0.04,   # 5: R_ROOK
-    0.02,   # 6: R_CANNON
-    0.005,  # 7: R_PAWN
-], dtype=jnp.float32)
-
-def get_piece_value(piece: jnp.int32) -> jnp.float32:
-    """获取棋子价值（红黑方棋子价值相同）"""
-    abs_piece = jnp.abs(piece)
-    # 确保索引在范围内
-    idx = jnp.clip(abs_piece, 0, 7)
-    return PIECE_VALUES[idx]
-
 
 # ============================================================================
 # 状态定义
@@ -207,17 +171,24 @@ def count_repetitions(position_hash: jnp.int32,
 class XiangqiEnv:
     """
     中国象棋环境
-    
-    遵循 pgx 风格的接口:
-    - init(key) -> State
-    - step(state, action) -> State
-    - observe(state) -> observation
     """
     
-    def __init__(self):
+    def __init__(
+        self, 
+        max_steps: int = 400,
+        max_no_capture_steps: int = 60,
+        repetition_threshold: int = 3,
+        perpetual_check_threshold: int = 6
+    ):
         self.num_players = 2
         self.action_space_size = ACTION_SPACE_SIZE
         self.observation_shape = (NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH)
+        
+        # 统一配置参数
+        self.max_steps = max_steps
+        self.max_no_capture_steps = max_no_capture_steps
+        self.repetition_threshold = repetition_threshold
+        self.perpetual_check_threshold = perpetual_check_threshold
     
     @partial(jax.jit, static_argnums=(0,))
     def init(self, key: jax.random.PRNGKey) -> XiangqiState:
@@ -311,7 +282,7 @@ class XiangqiEnv:
             
             # 3. 检测重复局面
             repetitions = count_repetitions(new_hash, state.position_hashes, state.hash_count)
-            is_threefold_repetition = repetitions >= REPETITION_THRESHOLD
+            is_threefold_repetition = repetitions >= self.repetition_threshold
             
             # 4. 检测将军状态 (对方是否被将军)
             is_check = is_in_check(new_board, new_player)
@@ -331,8 +302,8 @@ class XiangqiEnv:
             )
             
             # 6. 检测长将 (连续将军超过阈值)
-            red_perpetual_check = new_red_checks >= PERPETUAL_CHECK_THRESHOLD
-            black_perpetual_check = new_black_checks >= PERPETUAL_CHECK_THRESHOLD
+            red_perpetual_check = new_red_checks >= self.perpetual_check_threshold
+            black_perpetual_check = new_black_checks >= self.perpetual_check_threshold
             
             # ========== 游戏结束判断 ==========
             
@@ -340,8 +311,8 @@ class XiangqiEnv:
             game_over, winner = is_game_over(new_board, new_player)
             
             # 检查和棋条件: 步数限制、无吃子限制、三次重复
-            is_draw = (new_step_count >= MAX_STEPS) | \
-                      (new_no_capture >= MAX_NO_CAPTURE_STEPS) | \
+            is_draw = (new_step_count >= self.max_steps) | \
+                      (new_no_capture >= self.max_no_capture_steps) | \
                       is_threefold_repetition
             
             # 检查长将判负
@@ -354,43 +325,32 @@ class XiangqiEnv:
             game_over = game_over | is_draw | perpetual_check_loss
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 和棋
+            # 优先级: 将死 > 长将判负 > 重复局面判负 > 其他和棋
+            # 注意：将重复局面设为判负，是强制模型在训练初期探索新局面的最强手段
             winner = jnp.where(
                 winner != -1,
                 winner,  # 已有胜者 (将死)
                 jnp.where(
                     perpetual_check_loss,
                     perpetual_winner,  # 长将判负
-                    jnp.where(is_draw, -1, -1)  # 和棋
+                    jnp.where(
+                        is_threefold_repetition,
+                        1 - state.current_player,  # 谁造成的重复谁负 (即对方胜)
+                        jnp.where(is_draw, -1, -1)  # 步数到限的和棋
+                    )
                 )
             )
             
             # ========== 计算奖励 ==========
             
-            # 1. 吃子即时奖励
-            # 当前玩家吃掉对方棋子，获得正奖励
-            capture_value = get_piece_value(captured_piece)
-            # 红方 (player=0) 吃子: 红方 +value, 黑方 -value
-            # 黑方 (player=1) 吃子: 红方 -value, 黑方 +value
-            capture_reward = jnp.where(
-                is_capture,
-                jnp.where(
-                    state.current_player == 0,
-                    jnp.array([capture_value, -capture_value]),  # 红方吃子
-                    jnp.array([-capture_value, capture_value])   # 黑方吃子
-                ),
-                jnp.zeros(2)
-            )
-            
             # 2. 终局奖励
             # 胜: +1, 负: -1
-            # 和棋: 给一个轻微的惩罚（例如 -0.5），而不是直接判定为输(-1.0)
-            # 这样模型在必败时会主动追求和棋，但在势均力敌时不会乱求和
+            # 和棋: 0.0
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([-0.5, -0.5]),  # 和棋：轻微惩罚
+                    jnp.array([0.0, 0.0]),  # 和棋：零奖励
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
@@ -400,8 +360,8 @@ class XiangqiEnv:
                 jnp.zeros(2)
             )
             
-            # 3. 总奖励 = 终局奖励 + 吃子奖励
-            rewards = terminal_reward + capture_reward
+            # 3. 总奖励 = 终局奖励
+            rewards = terminal_reward
             
             # 获取新的合法动作
             new_legal_mask = jnp.where(
@@ -473,7 +433,7 @@ class XiangqiEnv:
         # 步数 (归一化到 0-1)
         step_plane = jnp.full(
             (1, BOARD_HEIGHT, BOARD_WIDTH),
-            state.step_count / MAX_STEPS,
+            state.step_count / self.max_steps,
             dtype=jnp.float32
         )
         
