@@ -4,12 +4,19 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 参考: https://github.com/zjjMaiMai/GumbelAlphaZero
 
 用法: 
-  python train.py                    # 正常训练
-  JAX_DISABLE_JIT=1 python train.py  # 禁用编译调试
+  python train.py           # 正常训练
+  python train.py --debug   # 禁用编译调试
 """
 
 import os
 import sys
+
+# 调试模式：禁用 JIT 编译
+DEBUG_MODE = '--debug' in sys.argv
+if DEBUG_MODE:
+    os.environ['JAX_DISABLE_JIT'] = '1'
+    os.environ['JAX_PLATFORMS'] = 'cpu'  # 强制 CPU，避免 GPU 编译
+
 import yaml
 import jax
 import jax.numpy as jnp
@@ -37,8 +44,8 @@ NUM_BLOCKS = 10             # 残差块数量
 # 设备配置
 # ============================================================================
 
-NUM_DEVICES = jax.device_count()
-TOTAL_BATCH = BATCH_SIZE * NUM_DEVICES  # 总批大小
+NUM_DEVICES = 1 if DEBUG_MODE else jax.device_count()
+TOTAL_BATCH = BATCH_SIZE * NUM_DEVICES
 
 # ============================================================================
 # 动态配置
@@ -173,26 +180,11 @@ def _self_play_single(model, key):
     return sample, stats
 
 
-# 多卡并行
-@partial(jax.pmap, axis_name='devices')
-def self_play_pmap(model, key):
-    sample, stats = _self_play_single(model, key)
-    # 汇总统计
-    stats = SelfPlayStats(
-        red_wins=jax.lax.psum(stats.red_wins, 'devices'),
-        black_wins=jax.lax.psum(stats.black_wins, 'devices'),
-        draws=jax.lax.psum(stats.draws, 'devices'),
-        avg_length=jax.lax.pmean(stats.avg_length, 'devices'),
-    )
-    return sample, stats
-
-
 # ============================================================================
 # 训练
 # ============================================================================
 
-@partial(jax.pmap, axis_name='devices')
-def train_step_pmap(model, batch):
+def _train_step_single(model, batch):
     def loss_fn(params):
         (logits, value), updates = model.apply_fn(
             {'params': params, 'batch_stats': model.batch_stats},
@@ -203,13 +195,35 @@ def train_step_pmap(model, batch):
         return policy_loss + value_loss, (updates['batch_stats'], policy_loss, value_loss)
     
     (loss, (batch_stats, ploss, vloss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(model.params)
-    
-    # 跨卡同步梯度
-    grads = jax.lax.pmean(grads, 'devices')
-    batch_stats = jax.lax.pmean(batch_stats, 'devices')
-    
     model = model.apply_gradients(grads=grads, batch_stats=batch_stats)
-    return model, jax.lax.pmean(ploss, 'devices'), jax.lax.pmean(vloss, 'devices')
+    return model, ploss, vloss
+
+
+if DEBUG_MODE:
+    # 调试模式：不编译
+    self_play = _self_play_single
+    train_step = _train_step_single
+else:
+    # 正常模式：多卡并行
+    @partial(jax.pmap, axis_name='devices')
+    def self_play_pmap(model, key):
+        sample, stats = _self_play_single(model, key)
+        stats = SelfPlayStats(
+            red_wins=jax.lax.psum(stats.red_wins, 'devices'),
+            black_wins=jax.lax.psum(stats.black_wins, 'devices'),
+            draws=jax.lax.psum(stats.draws, 'devices'),
+            avg_length=jax.lax.pmean(stats.avg_length, 'devices'),
+        )
+        return sample, stats
+    
+    @partial(jax.pmap, axis_name='devices')
+    def train_step_pmap(model, batch):
+        model, ploss, vloss = _train_step_single(model, batch)
+        grads_synced = jax.lax.pmean(model.params, 'devices')  # 同步参数
+        return model, jax.lax.pmean(ploss, 'devices'), jax.lax.pmean(vloss, 'devices')
+    
+    self_play = self_play_pmap
+    train_step = train_step_pmap
 
 
 # ============================================================================
@@ -269,14 +283,12 @@ def main():
     print("=" * 50)
     print("ZeroForge - 中国象棋 Gumbel AlphaZero")
     print("=" * 50)
+    print(f"模式: {'调试(无编译)' if DEBUG_MODE else '正常'}")
     print(f"JAX 后端: {jax.default_backend()}")
     print(f"设备数量: {NUM_DEVICES}")
-    print(f"总批大小: {TOTAL_BATCH} ({BATCH_SIZE} x {NUM_DEVICES})")
+    print(f"总批大小: {TOTAL_BATCH}")
     print(f"网络: {CHANNELS}ch x {NUM_BLOCKS}blocks")
     print(f"MCTS: {NUM_SIMULATIONS} sims")
-    
-    if os.environ.get('JAX_DISABLE_JIT'):
-        print("⚠️  JIT 已禁用（调试模式）")
     
     key = jax.random.PRNGKey(seed)
     key, subkey = jax.random.split(key)
@@ -298,38 +310,48 @@ def main():
         elo = restored['elo']
         print(f"从检查点恢复: step={model.step}, elo={elo:.1f}")
     
-    # 复制到所有设备
-    model = replicate(model)
+    if not DEBUG_MODE:
+        model = replicate(model)
     
     print("开始训练...")
     
     while True:
         key, k0, k1 = jax.random.split(key, 3)
         
-        # 多卡自玩
-        keys = jax.random.split(k0, NUM_DEVICES)
-        data, stats = self_play_pmap(model, keys)
+        if DEBUG_MODE:
+            # 调试模式：单卡无编译
+            data, stats = self_play(model, k0)
+            n_batches = data.obs.shape[0]
+            for i in range(n_batches):
+                batch = jax.tree.map(lambda x: x[i], data)
+                model, ploss, vloss = train_step(model, batch)
+            model_single = model
+            r, b, d = int(stats.red_wins), int(stats.black_wins), int(stats.draws)
+            avg_len = float(stats.avg_length)
+            ploss_val, vloss_val = float(ploss), float(vloss)
+        else:
+            # 正常模式：多卡并行
+            keys = jax.random.split(k0, NUM_DEVICES)
+            data, stats = self_play(model, keys)
+            n_batches = data.obs.shape[1]
+            for i in range(n_batches):
+                batch = jax.tree.map(lambda x: x[:, i], data)
+                model, ploss, vloss = train_step(model, batch)
+            model_single = unreplicate(model)
+            r, b, d = int(stats.red_wins[0]), int(stats.black_wins[0]), int(stats.draws[0])
+            avg_len = float(stats.avg_length[0])
+            ploss_val, vloss_val = float(ploss[0]), float(vloss[0])
         
-        # 训练（每卡独立 batch）
-        n_batches = data.obs.shape[1]
-        for i in range(n_batches):
-            batch = jax.tree.map(lambda x: x[:, i], data)
-            model, ploss, vloss = train_step_pmap(model, batch)
-        
-        # 评估（单卡）
-        model_single = unreplicate(model)
+        # 评估
         elo, win_rate = eval_step(model_single, model_single, elo, k1)
-        
-        # 统计（从第一个设备取）
-        r, b, d = int(stats.red_wins[0]), int(stats.black_wins[0]), int(stats.draws[0])
         total = r + b + d
         
         print(
             f"step={int(model_single.step)}, "
-            f"ploss={float(ploss[0]):.4f}, "
-            f"vloss={float(vloss[0]):.4f}, "
+            f"ploss={ploss_val:.4f}, "
+            f"vloss={vloss_val:.4f}, "
             f"elo={float(elo):.1f} | "
-            f"自玩: {total}局 红{r} 黑{b} 和{d} 均长{float(stats.avg_length[0]):.0f}"
+            f"自玩: {total}局 红{r} 黑{b} 和{d} 均长{avg_len:.0f}"
         )
         
         # 保存
