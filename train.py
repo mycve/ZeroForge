@@ -187,11 +187,11 @@ def compute_targets(data: SelfplayOutput):
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
     def body_fn(carry, i):
-        ix = config.max_num_steps - i - 1
+        ix = config.max_steps - i - 1
         v = data.reward[ix] + data.discount[ix] * carry
         return v, v
     
-    _, value_tgt = jax.lax.scan(body_fn, jnp.zeros(batch_size), jnp.arange(config.max_num_steps))
+    _, value_tgt = jax.lax.scan(body_fn, jnp.zeros(batch_size), jnp.arange(config.max_steps))
     value_tgt = value_tgt[::-1, :]
     
     return Sample(obs=data.obs, policy_tgt=data.action_weights, value_tgt=value_tgt, mask=value_mask)
@@ -263,7 +263,7 @@ def main():
         data = selfplay(model, keys)
         samples = compute_targets(data)
         
-        # 统计（data 形状: num_devices, max_num_steps, batch_size）
+        # 统计（data 形状: num_devices, max_steps, batch_size）
         data_np = jax.device_get(data)
         term = data_np.terminated  # (D, T, B)
         winner = data_np.winner    # (D, T, B)
