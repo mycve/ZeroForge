@@ -36,11 +36,11 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 256
+    training_batch_size: int = 512
     
     # 自对弈与搜索
-    selfplay_batch_size: int = 256
-    num_simulations: int = 64
+    selfplay_batch_size: int = 512
+    num_simulations: int = 96
     max_num_considered_actions: int = 16
     
     # 环境规则 (统一管理)
