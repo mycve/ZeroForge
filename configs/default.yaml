@@ -1,23 +1,11 @@
 # ZeroForge 配置
+# 注意：静态配置在 train.py 顶部修改（改了会重新编译）
 
 seed: 42
 
-# 网络
-network:
-  channels: 128
-  num_blocks: 10
-
-# MCTS
-mcts:
-  num_simulations: 32
-
-# 训练
 training:
-  batch_size: 256
   learning_rate: 0.0002
-  selfplay_steps: 100
 
-# 检查点
 checkpoint:
   dir: "checkpoints"
   keep: 5
