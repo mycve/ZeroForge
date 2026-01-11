@@ -309,13 +309,14 @@ def _selfplay_core(params, key):
     
     _, target_value = jax.lax.scan(compute_value, jnp.zeros(PER_DEVICE_PARALLEL), traj, reverse=True)
     
-    # === 样本掩码：游戏结束后的步骤无效 ===
-    # 注意：暂时不过滤和棋，让所有样本参与训练
-    # 等模型学会分出胜负后，再启用和棋过滤
-    mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1  # (T, B)
+    # === 样本掩码 ===
+    # 由于游戏会自动重置，所有样本都是有效的
+    # 只有最后一步（如果游戏未结束）可能需要特殊处理
+    # 简化起见：让所有样本都参与训练
+    mask = jnp.zeros((MAX_STEPS, PER_DEVICE_PARALLEL), dtype=jnp.bool_)
     
     # 统计有效样本数
-    valid_samples = (~mask).sum()
+    valid_samples = (~mask).sum()  # 应该是 MAX_STEPS * PER_DEVICE_PARALLEL
     
     stats = SelfPlayStats(
         num_games=num_games,
