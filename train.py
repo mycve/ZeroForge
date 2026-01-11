@@ -149,6 +149,7 @@ class SelfPlayStats(NamedTuple):
     black_wins: chex.Array     # 黑方胜利数
     draws: chex.Array          # 和棋数
     avg_game_length: chex.Array  # 平均游戏长度
+    valid_samples: chex.Array  # 有效样本数（非和棋）
 
 
 # ============================================================================
@@ -235,7 +236,7 @@ def _selfplay_core(params, key):
         )
         return state_after, traj
     
-    k0, k1, k2 = jax.random.split(key, 3)
+    k0, k1, k2, k3 = jax.random.split(key, 4)
     state = _v_init(jax.random.split(k0, PER_DEVICE_PARALLEL))
     _, traj = jax.lax.scan(selfplay_step, state, jax.random.split(k1, MAX_STEPS))
     
@@ -267,14 +268,6 @@ def _selfplay_core(params, key):
         jnp.float32(MAX_STEPS)
     )
     
-    stats = SelfPlayStats(
-        num_games=num_games,
-        red_wins=red_wins,
-        black_wins=black_wins,
-        draws=draws,
-        avg_game_length=avg_game_length,
-    )
-    
     # 计算价值目标
     def compute_value(carry, t):
         value = t.reward + DISCOUNT * carry * (1 - t.terminated.astype(jnp.float32))
@@ -282,8 +275,49 @@ def _selfplay_core(params, key):
     
     _, target_value = jax.lax.scan(compute_value, jnp.zeros(PER_DEVICE_PARALLEL), traj, reverse=True)
     
-    # 掩码
-    mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1
+    # === 和棋样本控制：保留胜负样本的 1/10 ===
+    # 获取每局游戏的胜者
+    final_winner = jnp.where(first_term, traj.winner, 0).sum(axis=0)  # (B,)
+    # 判断是否为和棋 (winner == -1) 或未结束
+    is_draw_game = (final_winner == -1) | (~games_finished)  # (B,)
+    is_decisive_game = ~is_draw_game  # 有胜负的游戏
+    
+    # 计算要保留的和棋数量：胜负数 / 10
+    num_decisive = is_decisive_game.sum()
+    num_draw_to_keep = jnp.maximum(num_decisive // 10, 1)  # 至少保留 1 局
+    
+    # 随机选择要保留的和棋
+    # 给每个和棋游戏分配随机数，选择最小的 num_draw_to_keep 个
+    draw_random = jax.random.uniform(k3, (PER_DEVICE_PARALLEL,))
+    # 非和棋设为无穷大，这样排序时会排在后面
+    draw_random = jnp.where(is_draw_game, draw_random, jnp.float32(1e9))
+    # 找到阈值：第 num_draw_to_keep 小的随机数
+    sorted_random = jnp.sort(draw_random)
+    threshold = sorted_random[num_draw_to_keep - 1]
+    # 保留随机数 <= 阈值的和棋
+    keep_draw = is_draw_game & (draw_random <= threshold)
+    
+    # 最终保留的游戏：有胜负 OR 被选中的和棋
+    keep_game = is_decisive_game | keep_draw  # (B,)
+    
+    # 基础掩码：游戏结束后的样本无效
+    base_mask = jnp.flip(jnp.cumsum(jnp.flip(traj.terminated, 0), 0), 0) >= 1  # (T, B)
+    # 丢弃掩码：未被保留的游戏
+    discard_mask = jnp.broadcast_to((~keep_game)[None, :], base_mask.shape)  # (T, B)
+    # 合并掩码
+    mask = base_mask | discard_mask
+    
+    # 统计有效样本数
+    valid_samples = (~mask).sum()
+    
+    stats = SelfPlayStats(
+        num_games=num_games,
+        red_wins=red_wins,
+        black_wins=black_wins,
+        draws=draws,
+        avg_game_length=avg_game_length,
+        valid_samples=valid_samples,
+    )
     
     sample = Sample(obs=traj.obs, policy=traj.policy, value=target_value, mask=mask)
     
@@ -316,6 +350,7 @@ def selfplay_pmap(params, key):
         black_wins=jax.lax.psum(stats.black_wins, axis_name="devices"),
         draws=jax.lax.psum(stats.draws, axis_name="devices"),
         avg_game_length=jax.lax.pmean(stats.avg_game_length, axis_name="devices"),
+        valid_samples=jax.lax.psum(stats.valid_samples, axis_name="devices"),
     )
     return sample, stats
 
@@ -336,7 +371,7 @@ class TrainMetrics(NamedTuple):
 
 
 def _train_core(params, opt_state, batch):
-    """训练核心逻辑，返回更多统计指标"""
+    """训练核心逻辑"""
     def loss_fn(p):
         output = NETWORK.apply(p, batch.obs)
         
@@ -353,13 +388,13 @@ def _train_core(params, opt_state, batch):
         
         total_loss = policy_loss_mean + VALUE_LOSS_WEIGHT * value_loss_mean
         
-        # --- 额外统计指标 ---
-        # 策略熵：衡量预测的确定性（低=确定，高=分散）
+        # --- 统计指标 ---
+        # 策略熵
         policy_probs = jax.nn.softmax(output.policy_logits, axis=-1)
         entropy = -jnp.sum(policy_probs * jnp.log(policy_probs + 1e-8), axis=-1)
         entropy_mean = (entropy * valid).sum() / mask_sum
         
-        # 策略准确率：预测动作与 MCTS 选择的 top-1 是否一致
+        # 策略准确率
         pred_action = jnp.argmax(output.policy_logits, axis=-1)
         target_action = jnp.argmax(batch.policy, axis=-1)
         accuracy = (pred_action == target_action).astype(jnp.float32)
@@ -389,6 +424,13 @@ def _train_core(params, opt_state, batch):
     )
 
 
+def _clip_grads_by_global_norm(grads, max_norm=1.0):
+    """全局梯度范数裁剪（比逐元素裁剪更稳定）"""
+    grad_norm = jnp.sqrt(sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
+    scale = jnp.minimum(1.0, max_norm / (grad_norm + 1e-8))
+    return jax.tree.map(lambda g: g * scale, grads)
+
+
 @partial(jax.pmap, axis_name="devices")
 def train_step_pmap(state, batch):
     """多设备并行训练"""
@@ -398,7 +440,8 @@ def train_step_pmap(state, batch):
     grads = jax.lax.pmean(grads, axis_name="devices")
     metrics = jax.tree.map(lambda x: jax.lax.pmean(x, axis_name="devices"), metrics)
     
-    grads = jax.tree.map(lambda g: jnp.clip(g, -1.0, 1.0), grads)
+    # 全局梯度范数裁剪（防止梯度爆炸）
+    grads = _clip_grads_by_global_norm(grads, max_norm=1.0)
     new_state = state.apply_gradients(grads=grads)
     return new_state, metrics
 
@@ -580,10 +623,12 @@ def main():
                 f"samples={n_samples} ({samples_per_sec:.0f}/s), elapsed={elapsed/60:.1f}min",
                 flush=True
             )
+            valid_ratio = sp['valid_samples'] / (n_samples + 1e-8) * 100
             print(
                 f"  自对弈: {int(sp['num_games'])}局, "
                 f"红胜={red_rate:.1f}%, 黑胜={black_rate:.1f}%, 和棋={draw_rate:.1f}%, "
-                f"平均步数={sp['avg_game_length']:.1f}",
+                f"平均步数={sp['avg_game_length']:.1f}, "
+                f"有效样本={int(sp['valid_samples'])} ({valid_ratio:.1f}%)",
                 flush=True
             )
             

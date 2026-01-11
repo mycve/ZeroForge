@@ -42,7 +42,8 @@ training:
   # 8卡配置: batch_size 和 learning_rate 成比例
   # 每卡 batch = 1024 / 8 = 128
   batch_size: 1024
-  learning_rate: 0.0006
+  # 降低学习率，防止策略崩溃
+  learning_rate: 0.0002
   
   value_loss_weight: 1.0
 
