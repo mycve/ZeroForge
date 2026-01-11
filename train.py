@@ -13,11 +13,16 @@ import yaml
 # ============================================================================
 # 加载配置（必须在 import jax 之前，因为要设置环境变量）
 # ============================================================================
+import sys
+
 def _load_config(path: str = "configs/default.yaml") -> dict:
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
-CONFIG = _load_config()
+# 支持命令行指定配置: python train.py configs/debug.yaml
+_config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/default.yaml"
+CONFIG = _load_config(_config_path)
+print(f"加载配置: {_config_path}", flush=True)
 
 # ============================================================================
 # JAX/XLA 优化设置（必须在 import jax 之前）

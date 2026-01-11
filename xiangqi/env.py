@@ -44,7 +44,8 @@ MAX_NO_CAPTURE_STEPS = 120
 POSITION_HISTORY_SIZE = 100
 
 # 重复次数阈值 (三次重复判和)
-REPETITION_THRESHOLD = 3
+# 训练时设高一点，避免模型学会"重复走棋"逃避胜负
+REPETITION_THRESHOLD = 999  # 暂时禁用，强制分出胜负
 
 # 长将检测: 连续将军次数阈值 (超过判负)
 PERPETUAL_CHECK_THRESHOLD = 6

@@ -36,9 +36,9 @@ mcts:
   # temperature > 1：更随机探索
   # temperature = 1：标准采样
   # temperature < 1：更确定（接近 argmax）
-  temperature: 1.5
-  # 前 N 步使用高温度，之后用低温度
-  temp_threshold_steps: 30
+  temperature: 2.0
+  # 前 N 步使用高温度（设为 999 = 全程高温度）
+  temp_threshold_steps: 999
 
 # ============================================================================
 # 训练
