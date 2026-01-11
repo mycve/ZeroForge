@@ -1,5 +1,4 @@
 # ZeroForge 配置
-# 大部分参数已硬编码在 train.py 中
 
 seed: 42
 
@@ -10,13 +9,13 @@ network:
 
 # MCTS
 mcts:
-  num_simulations: 64
+  num_simulations: 32
 
 # 训练
 training:
-  batch_size: 1024
+  batch_size: 256
   learning_rate: 0.0002
-  selfplay_steps: 200
+  selfplay_steps: 100
 
 # 检查点
 checkpoint:
