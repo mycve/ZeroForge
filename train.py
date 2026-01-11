@@ -51,7 +51,9 @@ TOTAL_BATCH = BATCH_SIZE * NUM_DEVICES
 # 动态配置
 # ============================================================================
 
-config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/default.yaml"
+# 解析参数（排除 --debug）
+args = [a for a in sys.argv[1:] if not a.startswith('--')]
+config_path = args[0] if args else "configs/default.yaml"
 with open(config_path) as f:
     cfg = yaml.safe_load(f)
 
