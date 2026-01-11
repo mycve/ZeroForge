@@ -14,6 +14,8 @@ from xiangqi.actions import (
     ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH, NUM_SQUARES,
     action_to_move, move_to_action,
     EMPTY, R_KING, B_KING,
+    R_ADVISOR, R_BISHOP, R_KNIGHT, R_ROOK, R_CANNON, R_PAWN,
+    B_ADVISOR, B_BISHOP, B_KNIGHT, B_ROOK, B_CANNON, B_PAWN,
     PIECE_SYMBOLS,
 )
 from xiangqi.rules import (
@@ -49,6 +51,29 @@ REPETITION_THRESHOLD = 999  # 暂时禁用，强制分出胜负
 
 # 长将检测: 连续将军次数阈值 (超过判负)
 PERPETUAL_CHECK_THRESHOLD = 6
+
+# ============================================================================
+# 辅助奖励：吃子得分
+# ============================================================================
+# 棋子价值（归一化到 0.01-0.1 范围，避免压过最终胜负奖励）
+# 车=0.09, 马=0.04, 炮=0.045, 士=0.02, 象=0.02, 兵=0.01
+PIECE_VALUES = jnp.array([
+    0.0,    # 0: EMPTY
+    0.0,    # 1: R_KING (不能被吃)
+    0.02,   # 2: R_ADVISOR
+    0.02,   # 3: R_BISHOP
+    0.04,   # 4: R_KNIGHT
+    0.09,   # 5: R_ROOK
+    0.045,  # 6: R_CANNON
+    0.01,   # 7: R_PAWN
+], dtype=jnp.float32)
+
+def get_piece_value(piece: jnp.int32) -> jnp.float32:
+    """获取棋子价值（红黑方棋子价值相同）"""
+    abs_piece = jnp.abs(piece)
+    # 确保索引在范围内
+    idx = jnp.clip(abs_piece, 0, 7)
+    return PIECE_VALUES[idx]
 
 
 # ============================================================================
@@ -341,9 +366,26 @@ class XiangqiEnv:
                 )
             )
             
-            # 计算奖励
-            # 胜: +1, 负: -1, 平: 0, 未结束: 0
-            rewards = jnp.where(
+            # ========== 计算奖励 ==========
+            
+            # 1. 吃子即时奖励
+            # 当前玩家吃掉对方棋子，获得正奖励
+            capture_value = get_piece_value(captured_piece)
+            # 红方 (player=0) 吃子: 红方 +value, 黑方 -value
+            # 黑方 (player=1) 吃子: 红方 -value, 黑方 +value
+            capture_reward = jnp.where(
+                is_capture,
+                jnp.where(
+                    state.current_player == 0,
+                    jnp.array([capture_value, -capture_value]),  # 红方吃子
+                    jnp.array([-capture_value, capture_value])   # 黑方吃子
+                ),
+                jnp.zeros(2)
+            )
+            
+            # 2. 终局奖励
+            # 胜: +1, 负: -1, 平: 0
+            terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
@@ -356,6 +398,9 @@ class XiangqiEnv:
                 ),
                 jnp.zeros(2)
             )
+            
+            # 3. 总奖励 = 终局奖励 + 吃子奖励
+            rewards = terminal_reward + capture_reward
             
             # 获取新的合法动作
             new_legal_mask = jnp.where(
