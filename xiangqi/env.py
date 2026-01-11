@@ -74,6 +74,9 @@ class XiangqiState:
     # 胜者: -1=未结束/平局, 0=红胜, 1=黑胜
     winner: jnp.int32
     
+    # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=三次重复, 4=长将
+    draw_reason: jnp.int32
+    
     # === 违规检测相关 ===
     
     # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32 - 用于重复局面检测
@@ -221,6 +224,7 @@ class XiangqiEnv:
             step_count=jnp.int32(0),
             no_capture_count=jnp.int32(0),
             winner=jnp.int32(-1),
+            draw_reason=jnp.int32(0),
             # 违规检测
             position_hashes=position_hashes,
             hash_count=jnp.int32(1),
@@ -311,9 +315,21 @@ class XiangqiEnv:
             game_over, winner = is_game_over(new_board, new_player)
             
             # 检查和棋条件: 步数限制、无吃子限制、三次重复
-            is_draw = (new_step_count >= self.max_steps) | \
-                      (new_no_capture >= self.max_no_capture_steps) | \
-                      is_threefold_repetition
+            is_max_steps = new_step_count >= self.max_steps
+            is_no_capture = new_no_capture >= self.max_no_capture_steps
+            
+            is_draw = is_max_steps | is_no_capture | is_threefold_repetition
+            
+            # 记录和棋原因
+            new_draw_reason = jnp.where(
+                is_max_steps, 1,
+                jnp.where(
+                    is_no_capture, 2,
+                    jnp.where(is_threefold_repetition, 3, 0)
+                )
+            )
+            # 长将也算一种和棋形式的终结（虽然有胜负）
+            new_draw_reason = jnp.where(perpetual_check_loss, 4, new_draw_reason)
             
             # 检查长将判负
             # 红方长将 -> 红方负 (黑方胜)
@@ -380,6 +396,7 @@ class XiangqiEnv:
                 step_count=new_step_count,
                 no_capture_count=new_no_capture,
                 winner=winner,
+                draw_reason=jnp.where(game_over, new_draw_reason, jnp.int32(0)),
                 # 违规检测状态
                 position_hashes=new_position_hashes,
                 hash_count=new_hash_count,
@@ -392,7 +409,8 @@ class XiangqiEnv:
     @partial(jax.jit, static_argnums=(0,))
     def observe(self, state: XiangqiState) -> jnp.ndarray:
         """
-        将状态转换为观察张量
+        将状态转换为观察张量 (视角归一化)
+        始终让当前玩家在棋盘下方，且当前玩家棋子为正
         
         Args:
             state: 游戏状态
@@ -400,30 +418,48 @@ class XiangqiEnv:
         Returns:
             观察张量 (NUM_OBSERVATION_CHANNELS, 10, 9)
         """
+        # 1. 视角变换
+        # 如果是黑方 (1)，则旋转 180 度并翻转棋子符号
+        # 红方 (0) 保持不变
+        is_black = state.current_player == 1
+        
+        board = jnp.where(
+            is_black,
+            -jnp.flip(state.board, axis=(0, 1)),
+            state.board
+        )
+        
+        history = jnp.where(
+            is_black,
+            -jnp.flip(state.history, axis=(1, 2)),
+            state.history
+        )
+        
         # 编码当前棋盘和历史
-        def encode_board(board: jnp.ndarray) -> jnp.ndarray:
+        def encode_board(b: jnp.ndarray) -> jnp.ndarray:
             """将棋盘编码为 14 通道的 one-hot 表示"""
             channels = []
-            # 红方 7 种棋子
+            # 己方 7 种棋子 (视角归一化后始终为正)
             for piece_type in range(1, 8):
-                channels.append((board == piece_type).astype(jnp.float32))
-            # 黑方 7 种棋子
+                channels.append((b == piece_type).astype(jnp.float32))
+            # 对方 7 种棋子 (视角归一化后始终为负)
             for piece_type in range(-7, 0):
-                channels.append((board == piece_type).astype(jnp.float32))
+                channels.append((b == piece_type).astype(jnp.float32))
             return jnp.stack(channels, axis=0)
         
         # 编码当前棋盘
-        current_encoded = encode_board(state.board)
+        current_encoded = encode_board(board)
         
         # 编码历史棋盘
-        history_encoded = jax.vmap(encode_board)(state.history)
+        history_encoded = jax.vmap(encode_board)(history)
         history_flat = history_encoded.reshape(-1, BOARD_HEIGHT, BOARD_WIDTH)
         
         # 合并
         board_planes = jnp.concatenate([current_encoded, history_flat], axis=0)
         
         # 添加元信息平面
-        # 当前玩家 (全 0 或全 1)
+        # 注意：视角归一化后，当前玩家“视角上”永远是 0 号玩家（红方位置）
+        # 但我们仍然保留一个平面，或者用它标记原始身份
         player_plane = jnp.full(
             (1, BOARD_HEIGHT, BOARD_WIDTH),
             state.current_player,

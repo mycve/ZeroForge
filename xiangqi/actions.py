@@ -146,6 +146,24 @@ _ACTION_TO_MOVE = {idx: move for idx, move in enumerate(_ALL_MOVES)}
 _ACTION_TO_FROM_SQ = jnp.array([move[0] for move in _ALL_MOVES], dtype=jnp.int32)
 _ACTION_TO_TO_SQ = jnp.array([move[1] for move in _ALL_MOVES], dtype=jnp.int32)
 
+# 180度旋转动作映射表 (用于视角归一化)
+def _build_action_rotate_table():
+    rotate_table = jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.int32)
+    # 预计算 from-to 到 action 的查找表 (90 x 90)
+    temp_table = jnp.full((NUM_SQUARES, NUM_SQUARES), -1, dtype=jnp.int32)
+    for i, (f, t) in enumerate(_ALL_MOVES):
+        temp_table = temp_table.at[f, t].set(i)
+        
+    for action_id in range(ACTION_SPACE_SIZE):
+        from_sq, to_sq = _ACTION_TO_MOVE[action_id]
+        # 180度旋转: row, col -> 9-row, 8-col => index -> 89-index
+        r_f = (NUM_SQUARES - 1) - from_sq
+        r_t = (NUM_SQUARES - 1) - to_sq
+        rotate_table = rotate_table.at[action_id].set(temp_table[r_f, r_t])
+    return rotate_table
+
+_ACTION_ROTATE_TABLE = _build_action_rotate_table()
+
 # 创建 from-to 到 action 的查找表 (90 x 90 -> action_id, -1 表示无效)
 _FROM_TO_ACTION_TABLE = jnp.full((NUM_SQUARES, NUM_SQUARES), -1, dtype=jnp.int32)
 for action_id, (from_sq, to_sq) in enumerate(_ALL_MOVES):
@@ -155,6 +173,14 @@ for action_id, (from_sq, to_sq) in enumerate(_ALL_MOVES):
 # ============================================================================
 # 公开 API
 # ============================================================================
+
+@jax.jit
+def rotate_action(action: jnp.ndarray) -> jnp.ndarray:
+    """
+    将动作索引进行180度旋转 (用于视角切换)
+    """
+    return _ACTION_ROTATE_TABLE[action]
+
 
 @jax.jit
 def action_to_move(action: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:

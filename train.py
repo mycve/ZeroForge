@@ -18,7 +18,19 @@ import jax.numpy as jnp
 import optax
 import mctx
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    try:
+        from tensorboardX import SummaryWriter
+    except ImportError:
+        class SummaryWriter:
+            def __init__(self, *args, **kwargs): pass
+            def add_scalar(self, *args, **kwargs): pass
+            def close(self): pass
+
 from xiangqi.env import XiangqiEnv
+from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
 from networks.alphazero import AlphaZeroNetwork
 
 # ============================================================================
@@ -43,11 +55,23 @@ class Config:
     num_simulations: int = 96
     max_num_considered_actions: int = 16
     
+    # 探索策略 (新增加)
+    temperature_steps: int = 30      # 前 N 步进行大温度采样
+    temperature_initial: float = 1.0
+    temperature_final: float = 0.01
+    
     # 环境规则 (统一管理)
     max_steps: int = 400            # 总步数限制
     max_no_capture_steps: int = 60  # 无吃子步数限制 (强制进攻)
     repetition_threshold: int = 3   # 重复局面阈值
     perpetual_check_threshold: int = 6 # 连续将军阈值
+    
+    # 日志
+    log_dir: str = "logs"
+    
+    # ELO 评估
+    eval_interval: int = 20          # 每隔多少 iteration 评估一次
+    eval_games: int = 64            # 评估对局数
 
 config = Config()
 
@@ -89,22 +113,128 @@ def forward(params, batch_stats, obs, is_training=False):
 
 def recurrent_fn(model, rng_key, action, state):
     params, batch_stats = model
-    current_player = state.current_player
+    # 记录执行动作前的玩家，用于计算奖励
+    prev_player = state.current_player
+    
+    # 执行动作
     state = jax.vmap(env.step)(state, action)
     
+    # 获取观察（视角归一化已在 env.observe 中完成）
     obs = jax.vmap(env.observe)(state)
     (logits, value), _ = forward(params, batch_stats, obs)
+    
+    # --- 视角修正：将网络输出的视角 logits 转回真实坐标 ---
+    # 如果执行完动作后的玩家是黑方 (1)，则网络输出的是基于旋转 180 度视角的 logits
+    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+    rotated_idx = rotate_action(rotate_idx)
+    
+    logits = jnp.where(
+        state.current_player[:, None] == 0,
+        logits,
+        logits[:, rotated_idx]
+    )
     
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
     
-    reward = state.rewards[jnp.arange(state.rewards.shape[0]), current_player]
+    # 奖励需要根据执行动作前的玩家来取
+    reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
     value = jnp.where(state.terminated, 0.0, value)
     discount = jnp.where(state.terminated, 0.0, -1.0)
     
     return mctx.RecurrentFnOutput(
         reward=reward, discount=discount, prior_logits=logits, value=value
     ), state
+
+@jax.pmap
+def evaluate(model_red, model_black, rng_key):
+    params_r, stats_r = model_red
+    params_b, stats_b = model_black
+    batch_size = config.eval_games // num_devices
+    
+    def step_fn(state, key):
+        key1, key2 = jax.random.split(key)
+        obs = jax.vmap(env.observe)(state)
+        
+        # 根据当前玩家选择模型
+        is_red = state.current_player == 0
+        # 这里需要处理 batch，比较麻烦。简化方案：在 evaluate 中
+        # 我们让 red 永远是 model_red, black 永远是 model_black
+        
+        # 获取红方视角的预测
+        (logits_r, value_r), _ = forward(params_r, stats_r, obs)
+        # 获取黑方视角的预测
+        (logits_b, value_b), _ = forward(params_b, stats_b, obs)
+        
+        # 混合 logits 和 value
+        logits = jnp.where(is_red[:, None], logits_r, logits_b)
+        value = jnp.where(is_red, value_r, value_b)
+        
+        # 视角修正 (因为 env.observe 已经处理了视角，网络输出也是视角下的)
+        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+        rotated_idx = rotate_action(rotate_idx)
+        logits = jnp.where(is_red[:, None], logits, logits[:, rotated_idx])
+
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        
+        policy_output = mctx.gumbel_muzero_policy(
+            params=(model_red, model_black), # 传个元组，recurrent_fn 里再分
+            rng_key=key1,
+            root=root,
+            recurrent_fn=recurrent_fn_eval,
+            num_simulations=config.num_simulations,
+            max_num_considered_actions=config.max_num_considered_actions,
+            invalid_actions=~state.legal_action_mask,
+        )
+        
+        next_state = jax.vmap(env.step)(state, policy_output.action)
+        return next_state, next_state.terminated
+    
+    def recurrent_fn_eval(models, rng_key, action, state):
+        model_r, model_b = models
+        prev_player = state.current_player
+        state = jax.vmap(env.step)(state, action)
+        obs = jax.vmap(env.observe)(state)
+        
+        is_red = state.current_player == 0
+        (logits_r, value_r), _ = forward(model_r[0], model_r[1], obs)
+        (logits_b, value_b), _ = forward(model_b[0], model_b[1], obs)
+        
+        logits = jnp.where(is_red[:, None], logits_r, logits_b)
+        value = jnp.where(is_red, value_r, value_b)
+        
+        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+        rotated_idx = rotate_action(rotate_idx)
+        logits = jnp.where(is_red[:, None], logits, logits[:, rotated_idx])
+        
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        
+        reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
+        value = jnp.where(state.terminated, 0.0, value)
+        discount = jnp.where(state.terminated, 0.0, -1.0)
+        
+        return mctx.RecurrentFnOutput(
+            reward=reward, discount=discount, prior_logits=logits, value=value
+        ), state
+
+    rng_key, subkey = jax.random.split(rng_key)
+    keys = jax.random.split(subkey, batch_size)
+    state = jax.vmap(env.init)(keys)
+    
+    # eval 不使用 scan 记录轨迹以节省显存，直接运行到结束
+    def cond_fn(args):
+        state, terminated, _ = args
+        return ~jnp.all(terminated)
+    
+    def body_fn(args):
+        state, terminated, key = args
+        key, subkey = jax.random.split(key)
+        new_state, new_term = step_fn(state, subkey)
+        return new_state, terminated | new_term, key
+
+    state, _, _ = jax.lax.while_loop(cond_fn, body_fn, (state, jnp.zeros(batch_size, dtype=jnp.bool_), rng_key))
+    return state.winner
 
 # ============================================================================
 # 数据结构
@@ -117,6 +247,7 @@ class SelfplayOutput(NamedTuple):
     action_weights: jnp.ndarray
     discount: jnp.ndarray
     winner: jnp.ndarray
+    draw_reason: jnp.ndarray
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -134,10 +265,35 @@ def selfplay(model, rng_key):
     batch_size = config.selfplay_batch_size // num_devices
     
     def step_fn(state, key):
-        key1, key2 = jax.random.split(key)
+        key1, key2, key_noise = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
         
         (logits, value), _ = forward(params, batch_stats, obs)
+        
+        # --- 视角修正：将视角 logits 转回真实坐标 ---
+        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+        rotated_idx = rotate_action(rotate_idx)
+        logits = jnp.where(
+            state.current_player[:, None] == 0,
+            logits,
+            logits[:, rotated_idx]
+        )
+        
+        # 添加 Dirichlet 噪声 (AlphaZero 标准探索)
+        noise = jax.random.dirichlet(key_noise, jnp.ones(ACTION_SPACE_SIZE) * 0.3, shape=(batch_size,))
+        probs = jax.nn.softmax(logits)
+        # 仅在合法动作上加噪声
+        noise_probs = 0.75 * probs + 0.25 * noise
+        logits = jnp.log(noise_probs + 1e-10)
+
+        # 温度采样：前 N 步加大探索
+        # Gumbel MuZero 通过调整 logits 来实现类似温度的效果
+        temp = jnp.where(state.step_count < config.temperature_steps, 
+                         config.temperature_initial, 
+                         config.temperature_final)
+        # 注意：temp 为 0 会导致除零，所以用 jnp.where 保护
+        logits = logits / jnp.maximum(temp[:, None], 1e-3)
+
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
         policy_output = mctx.gumbel_muzero_policy(
@@ -153,17 +309,26 @@ def selfplay(model, rng_key):
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
         
-        # 先执行一步动作，不立即 reset
+        # 执行一步动作
         next_state = jax.vmap(env.step)(state, policy_output.action)
         
         # 记录数据
+        # 关键修正：将 policy 目标转回视角坐标系，以匹配归一化的 obs
+        # 只有这样，网络学习到的才是通用视角的“我该怎么下”
+        normalized_action_weights = jnp.where(
+            state.current_player[:, None] == 0,
+            policy_output.action_weights,
+            policy_output.action_weights[:, rotated_idx]
+        )
+
         data = SelfplayOutput(
             obs=obs,
-            action_weights=policy_output.action_weights,
+            action_weights=normalized_action_weights,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner,
+            draw_reason=next_state.draw_reason,
         )
         
         # 检查是否需要 reset
@@ -202,10 +367,18 @@ def compute_targets(data: SelfplayOutput):
 
 def loss_fn(params, batch_stats, samples: Sample):
     (logits, value), new_batch_stats = forward(params, batch_stats, samples.obs, is_training=True)
+    
+    # 策略损失
     policy_loss = jnp.mean(optax.softmax_cross_entropy(logits, samples.policy_tgt))
-    # 修复掩码：只在有效步数上计算损失 (mask 为 True 的地方)
-    value_loss = jnp.mean(optax.l2_loss(value, samples.value_tgt) * samples.mask)
-    return policy_loss + value_loss, (new_batch_stats, policy_loss, value_loss)
+    
+    # 价值损失：修正稀释问题，只在有效步数上平均
+    num_valid = jnp.maximum(jnp.sum(samples.mask), 1.0)
+    value_loss = jnp.sum(optax.l2_loss(value, samples.value_tgt) * samples.mask) / num_valid
+    
+    # 总损失 (价值权重设为 0.5 稍微平衡一下，防止过早塌陷)
+    total_loss = policy_loss + 0.5 * value_loss
+    
+    return total_loss, (new_batch_stats, policy_loss, value_loss)
 
 # ============================================================================
 # 主函数
@@ -228,6 +401,9 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     model = (variables['params'], variables['batch_stats'])
     
+    # 保存初始模型作为评估基准
+    initial_model = jax.device_put_replicated(model, devices)
+    
     # 优化器
     optimizer = optax.adam(config.learning_rate)
     opt_state = optimizer.init(model[0])
@@ -237,6 +413,8 @@ def main():
     opt_state = jax.device_put_replicated(opt_state, devices)
     
     os.makedirs(config.ckpt_dir, exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
+    writer = SummaryWriter(config.log_dir)
     
     iteration = 0
     frames = 0
@@ -273,6 +451,17 @@ def main():
         b = int((first_term & (winner == 1)).sum())
         d = int((first_term & (winner == -1)).sum())
         
+        # 细分和棋原因
+        reason = data_np.draw_reason
+        d_steps = int((first_term & (reason == 1)).sum())
+        d_no_cap = int((first_term & (reason == 2)).sum())
+        d_three = int((first_term & (reason == 3)).sum())
+        d_perp = int((first_term & (reason == 4)).sum())
+        
+        # 计算平均对局长度
+        game_lengths = jnp.argmax(first_term, axis=1)
+        avg_steps = float(game_lengths[first_term.any(axis=1)].mean()) if first_term.any() else 0.0
+        
         # 处理样本
         samples_np = jax.device_get(samples)
         samples_flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), samples_np)
@@ -300,15 +489,30 @@ def main():
         
         et = time.time()
         total = r + b + d
+        avg_ploss = sum(policy_losses)/len(policy_losses)
+        avg_vloss = sum(value_losses)/len(value_losses)
         
         print(
             f"iter={iteration}, "
-            f"ploss={sum(policy_losses)/len(policy_losses):.4f}, "
-            f"vloss={sum(value_losses)/len(value_losses):.4f}, "
+            f"ploss={avg_ploss:.4f}, "
+            f"vloss={avg_vloss:.4f}, "
             f"frames={frames}, "
             f"time={et-st:.1f}s | "
             f"自玩: {total}局 红{r} 黑{b} 和{d}"
         )
+        
+        # 记录到 TensorBoard
+        writer.add_scalar("train/policy_loss", avg_ploss, iteration)
+        writer.add_scalar("train/value_loss", avg_vloss, iteration)
+        writer.add_scalar("selfplay/red_wins", r, iteration)
+        writer.add_scalar("selfplay/black_wins", b, iteration)
+        writer.add_scalar("selfplay/draws", d, iteration)
+        writer.add_scalar("selfplay/draw_max_steps", d_steps, iteration)
+        writer.add_scalar("selfplay/draw_no_capture", d_no_cap, iteration)
+        writer.add_scalar("selfplay/draw_threefold", d_three, iteration)
+        writer.add_scalar("selfplay/draw_perpetual", d_perp, iteration)
+        writer.add_scalar("selfplay/avg_steps", avg_steps, iteration)
+        writer.add_scalar("stats/frames", frames, iteration)
         
         # 保存
         if iteration % 10 == 0:
@@ -318,6 +522,31 @@ def main():
             with open(path, 'wb') as f:
                 pickle.dump(ckpt, f)
             print(f"已保存: {path}")
+            writer.flush()
+            
+        # 评估
+        if iteration % config.eval_interval == 0:
+            print(f"正在评估 (vs 随机基准)...", end="", flush=True)
+            rng_key, subkey = jax.random.split(rng_key)
+            eval_keys = jax.random.split(subkey, num_devices)
+            
+            # 1. 当前模型执红
+            winners_r = evaluate(model, initial_model, eval_keys)
+            # 2. 当前模型执黑
+            winners_b = evaluate(initial_model, model, eval_keys)
+            
+            wr = int((winners_r == 0).sum())
+            wb = int((winners_b == 1).sum())
+            dr = int((winners_r == -1).sum())
+            db = int((winners_b == -1).sum())
+            total_wins = wr + wb
+            total_draws = dr + db
+            total_games = config.eval_games
+            
+            win_rate = total_wins / total_games
+            print(f" 胜率: {win_rate:.2%}")
+            writer.add_scalar("eval/win_rate_vs_random", win_rate, iteration)
+            writer.add_scalar("eval/draw_rate_vs_random", total_draws / total_games, iteration)
 
 
 if __name__ == "__main__":
