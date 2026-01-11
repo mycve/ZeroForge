@@ -229,12 +229,12 @@ def eval_step(model, old_model, old_elo, key):
     state = jax.vmap(env.init)(jax.random.split(k1, num_eval))
     
     def cond(val):
-        s, k, r = val
+        s, k = val
         return ~s.terminated.all()
     
     def body(val):
-        s, k, r = val
-        k, k0, k1, k2 = jax.random.split(k, 4)
+        s, k = val
+        k, k0 = jax.random.split(k)
         
         obs = jax.vmap(env.observe)(s)
         (logits_new, _), _ = model.apply_fn(
@@ -254,20 +254,25 @@ def eval_step(model, old_model, old_elo, key):
         action = jnp.argmax(logits, axis=-1)
         
         s = jax.vmap(env.step)(s, action)
-        r = r + s.rewards
-        return s, k, r
+        return s, k
     
-    _, _, rewards = jax.lax.while_loop(cond, body, (state, k2, state.rewards))
-    results = jax.vmap(lambda x, i: x[i])(rewards, model_player) * 0.5 + 0.5
+    final_state, _ = jax.lax.while_loop(cond, body, (state, k2))
     
-    # 更新 ELO
-    def update_elo(elo, result):
-        expected = 1 / (1 + 10 ** ((old_elo - elo) / 400))
-        elo = elo + 32 * (result - expected)
-        return elo, elo
+    # 用 winner 判断胜负，不用 rewards（避免和棋惩罚影响）
+    # winner: 0=红胜, 1=黑胜, -1=和棋
+    # model_player: 新模型执哪方
+    # 新模型胜=1, 和棋=0.5, 负=0
+    new_model_wins = (final_state.winner == model_player).astype(jnp.float32)
+    draws = (final_state.winner == -1).astype(jnp.float32)
+    results = new_model_wins + 0.5 * draws
     
-    elo, _ = jax.lax.scan(update_elo, old_elo, results)
-    return elo
+    # 计算胜率
+    win_rate = results.mean()
+    
+    # 简单 ELO 更新
+    elo = old_elo + 400 * (win_rate - 0.5)
+    
+    return elo, win_rate
 
 
 # ============================================================================
@@ -324,13 +329,14 @@ def main():
             model, ploss, vloss = train_step(model, batch)
         
         # 评估
-        elo = eval_step(model, old_model, elo, k1)
+        elo, win_rate = eval_step(model, old_model, elo, k1)
         
         print(
             f"step={int(model.step)}, "
             f"ploss={float(ploss):.4f}, "
             f"vloss={float(vloss):.4f}, "
-            f"elo={float(elo):.1f}"
+            f"elo={float(elo):.1f}, "
+            f"win={float(win_rate)*100:.1f}%"
         )
         
         # 保存检查点

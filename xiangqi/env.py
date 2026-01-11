@@ -386,12 +386,12 @@ class XiangqiEnv:
             
             # 2. 终局奖励
             # 胜: +1, 负: -1
-            # 和棋: 极大惩罚 (-10)，强制模型学会进攻分出胜负
+            # 和棋: -1（和输一样，鼓励分出胜负）
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([-10.0, -10.0]),  # 和棋：双方都受极大惩罚
+                    jnp.array([-1.0, -1.0]),  # 和棋：双方都输
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
