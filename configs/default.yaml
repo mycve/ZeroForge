@@ -32,13 +32,12 @@ mcts:
   max_num_considered_actions: 32
   discount: 1.0
   
-  # 温度采样：增加探索多样性
-  # temperature > 1：更随机探索
-  # temperature = 1：标准采样
-  # temperature < 1：更确定（接近 argmax）
-  temperature: 2.0
-  # 前 N 步使用高温度（设为 999 = 全程高温度）
-  temp_threshold_steps: 999
+  # 温度采样：平衡探索与利用
+  # 前 N 步用高温度探索（开局多样性）
+  # 之后用 argmax 贪婪（中后期求胜）
+  temperature: 1.5
+  # 前 30 步随机探索，之后贪婪
+  temp_threshold_steps: 30
 
 # ============================================================================
 # 训练

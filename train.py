@@ -24,32 +24,6 @@ _config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/default.yaml"
 CONFIG = _load_config(_config_path)
 print(f"加载配置: {_config_path}", flush=True)
 
-# ============================================================================
-# JAX/XLA 优化设置（必须在 import jax 之前）
-# ============================================================================
-
-# 1. 持久化编译缓存 - 避免重复编译
-_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".jax_cache")
-os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _cache_dir)
-os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
-os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
-
-# 2. XLA 多线程编译加速
-# 获取 CPU 核心数，用于并行编译
-_num_cpus = os.cpu_count() or 16
-os.environ.setdefault("XLA_FLAGS", (
-    f"--xla_cpu_multi_thread_eigen=true "
-    f"--xla_backend_optimization_level=3 "
-    f"--xla_gpu_enable_fast_min_max=true "
-))
-# TensorFlow/XLA 线程设置
-os.environ.setdefault("TF_NUM_INTEROP_THREADS", str(_num_cpus))
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(_num_cpus))
-
-# 3. 禁用不必要的日志
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("JAX_PLATFORMS", "cuda")  # 优先使用 CUDA
-
 import jax
 import jax.numpy as jnp
 import optax
@@ -106,13 +80,6 @@ NETWORK = MuZeroNetwork(
     value_support_size=_net_cfg.get("value_support_size", 0),
     reward_support_size=_net_cfg.get("reward_support_size", 0),
 )
-
-# 检查 mctx 版本
-try:
-    _sig = inspect.signature(mctx.gumbel_muzero_policy)
-    SUPPORTS_MAX_ACTIONS = "max_num_considered_actions" in _sig.parameters
-except:
-    SUPPORTS_MAX_ACTIONS = False
 
 # 全局退出标志
 _SHOULD_EXIT = False
@@ -193,7 +160,7 @@ def _selfplay_core(params, key):
     """单设备自我对弈（带温度采样）"""
     
     def selfplay_step(carry, rng_data):
-        state, step_idx = carry
+        state, step_idx = carry  # step_idx: (B,) 每个游戏独立的步数计数器
         key = rng_data
         k_policy, k_sample, k_reset = jax.random.split(key, 3)
         
@@ -219,32 +186,31 @@ def _selfplay_core(params, key):
             gumbel_scale=1.0,
         )
         
-        # === 温度采样：前 N 步用高温度增加探索 ===
-        # action_weights 是 MCTS 输出的访问概率
-        weights = policy_output.action_weights  # (batch, num_actions)
+        # === 温度采样：前 N 步用高温度增加探索，之后真正贪婪 ===
+        weights = policy_output.action_weights  # (B, num_actions)
         
-        # 温度调整：前 TEMP_THRESHOLD_STEPS 步用高温度，之后用贪婪
-        use_temperature = step_idx < TEMP_THRESHOLD_STEPS
+        # 每个游戏独立判断是否还在探索阶段
+        use_temperature = step_idx < TEMP_THRESHOLD_STEPS  # (B,) bool
         
-        # 对 log-probs 应用温度
+        # 对 log-probs 应用温度（仅用于 stochastic 采样）
         log_weights = jnp.log(weights + 1e-8)
-        # 高温度时 (T>1)：分布更平坦，探索更多
-        # 低温度时 (T→0)：接近 argmax，利用最优
-        temp = jnp.where(use_temperature, TEMPERATURE, 0.1)
-        adjusted_logits = log_weights / temp
+        adjusted_logits = log_weights / TEMPERATURE  # 探索阶段用高温度
         
         # 确保非法动作不被选中
         adjusted_logits = jnp.where(state.legal_action_mask, adjusted_logits, -1e9)
+        weights_masked = jnp.where(state.legal_action_mask, weights, -1e9)
         
-        # 从调整后的分布中采样
-        sampled_action = jax.random.categorical(k_sample, adjusted_logits, axis=-1)
+        # 探索阶段：stochastic 采样；超过阈值：真正贪婪 (argmax)
+        stochastic_action = jax.random.categorical(k_sample, adjusted_logits, axis=-1)  # (B,)
+        greedy_action = jnp.argmax(weights_masked, axis=-1)  # (B,)
+        sampled_action = jnp.where(use_temperature, stochastic_action, greedy_action)
         
         # 执行动作
         next_state = _v_step(state, sampled_action)
         reward = jax.vmap(lambda s, p: s.rewards[p])(next_state, player)
 
         reset_state = _v_init(jax.random.split(k_reset, PER_DEVICE_PARALLEL))
-        term = next_state.terminated
+        term = next_state.terminated  # (B,)
 
         def _select(ns, rs):
             if ns.ndim == 0:
@@ -254,10 +220,8 @@ def _selfplay_core(params, key):
 
         state_after = jax.tree.map(_select, next_state, reset_state)
         
-        # 重置后 step_idx 归零
-        new_step_idx = jnp.where(term, 0, step_idx + 1)
-        # 对于每个并行游戏，需要单独的 step_idx
-        # 这里简化处理：用全局 step_idx（每个游戏共享，重置时清零）
+        # 每个游戏独立更新 step_idx：terminated 时重置为 0，否则 +1
+        new_step_idx = jnp.where(term, 0, step_idx + 1)  # (B,)
         
         traj = Trajectory(
             obs=obs,
@@ -267,11 +231,12 @@ def _selfplay_core(params, key):
             player=player,
             winner=next_state.winner,
         )
-        return (state_after, step_idx + 1), traj
+        return (state_after, new_step_idx), traj  # 返回 new_step_idx 而不是 step_idx+1
     
     k0, k1, k2 = jax.random.split(key, 3)
     state = _v_init(jax.random.split(k0, PER_DEVICE_PARALLEL))
-    init_step_idx = jnp.int32(0)
+    # step_idx 按游戏维度：每个并行游戏独立计数
+    init_step_idx = jnp.zeros(PER_DEVICE_PARALLEL, dtype=jnp.int32)  # (B,)
     (_, _), traj = jax.lax.scan(selfplay_step, (state, init_step_idx), jax.random.split(k1, MAX_STEPS))
     
     # === 统计自对弈结果 ===
@@ -302,10 +267,21 @@ def _selfplay_core(params, key):
         jnp.float32(MAX_STEPS)
     )
     
-    # 计算价值目标
+    # 计算价值目标（reverse scan，从后往前传播）
+    # 零和博弈：当前玩家价值 = reward - discount * 对手价值
     def compute_value(carry, t):
-        value = t.reward + DISCOUNT * carry * (1 - t.terminated.astype(jnp.float32))
-        return -value, value
+        term = t.terminated.astype(jnp.float32)  # (B,)
+        
+        # 1. 先 gate carry：episode 边界切断（terminated 时不传递后续 episode 的价值）
+        gated_carry = carry * (1.0 - term)
+        
+        # 2. 计算当前步价值
+        value = t.reward + DISCOUNT * gated_carry
+        
+        # 3. 翻转后传给前一步（对手视角的负价值）
+        next_carry = -value
+        
+        return next_carry, value
     
     _, target_value = jax.lax.scan(compute_value, jnp.zeros(PER_DEVICE_PARALLEL), traj, reverse=True)
     
