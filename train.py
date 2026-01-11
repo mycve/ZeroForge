@@ -28,10 +28,10 @@ from networks.alphazero import AlphaZeroNetwork
 class Config:
     seed: int = 42
     num_channels: int = 128
-    num_blocks: int = 10
+    num_blocks: int = 12  # 稍微增加深度
     selfplay_batch_size: int = 256
-    num_simulations: int = 32
-    max_num_steps: int = 200
+    num_simulations: int = 64  # 增加模拟次数
+    max_num_steps: int = 400  # 匹配环境最大步数
     training_batch_size: int = 256
     learning_rate: float = 2e-4
     ckpt_dir: str = "checkpoints"
@@ -120,10 +120,6 @@ def selfplay(model, rng_key):
     params, batch_stats = model
     batch_size = config.selfplay_batch_size // num_devices
     
-    def auto_reset(state, action, key):
-        state = env.step(state, action)
-        return jax.lax.cond(state.terminated, lambda: env.init(key), lambda: state)
-    
     def step_fn(state, key):
         key1, key2 = jax.random.split(key)
         obs = jax.vmap(env.observe)(state)
@@ -142,9 +138,12 @@ def selfplay(model, rng_key):
         
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
-        next_state = jax.vmap(auto_reset)(state, policy_output.action, keys)
         
-        return next_state, SelfplayOutput(
+        # 先执行一步动作，不立即 reset
+        next_state = jax.vmap(env.step)(state, policy_output.action)
+        
+        # 记录数据（此时 next_state 包含真实的 terminated 信息）
+        data = SelfplayOutput(
             obs=obs,
             action_weights=policy_output.action_weights,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
@@ -152,6 +151,14 @@ def selfplay(model, rng_key):
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner,
         )
+        
+        # 检查是否需要 reset 并更新 next_state 用于下一轮循环
+        def _reset_fn(s, k):
+            return jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s)
+        
+        next_state_reset = jax.vmap(_reset_fn)(next_state, keys)
+        
+        return next_state_reset, data
     
     rng_key, subkey = jax.random.split(rng_key)
     keys = jax.random.split(subkey, batch_size)
@@ -182,7 +189,8 @@ def compute_targets(data: SelfplayOutput):
 def loss_fn(params, batch_stats, samples: Sample):
     (logits, value), new_batch_stats = forward(params, batch_stats, samples.obs, is_training=True)
     policy_loss = jnp.mean(optax.softmax_cross_entropy(logits, samples.policy_tgt))
-    value_loss = jnp.mean(optax.l2_loss(value, samples.value_tgt) * ~samples.mask)
+    # 修复掩码：只在有效步数上计算损失 (mask 为 True 的地方)
+    value_loss = jnp.mean(optax.l2_loss(value, samples.value_tgt) * samples.mask)
     return policy_loss + value_loss, (new_batch_stats, policy_loss, value_loss)
 
 # ============================================================================

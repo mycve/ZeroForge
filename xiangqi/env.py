@@ -36,18 +36,17 @@ CHANNELS_PER_STEP = 14
 # 总观察通道数: (16历史 + 1当前) × 14棋子 + 1当前玩家 + 1步数 = 240
 NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP + 2
 
-# 最大步数限制 (用于判断和棋)
-MAX_STEPS = 200
+# 最大步数限制 (象棋通常在 40-100 回合结束，设为 400 步比较充裕)
+MAX_STEPS = 400
 
-# 无吃子步数限制 (用于判断和棋)
+# 无吃子步数限制 (通常 60 步无吃子判和，120 步稍微宽松一点)
 MAX_NO_CAPTURE_STEPS = 120
 
 # 重复局面检测: 保存最近 N 步的局面哈希
-POSITION_HISTORY_SIZE = 100
+POSITION_HISTORY_SIZE = 256
 
-# 重复次数阈值 (三次重复判和)
-# 训练时设高一点，避免模型学会"重复走棋"逃避胜负
-REPETITION_THRESHOLD = 999  # 暂时禁用，强制分出胜负
+# 重复次数阈值 (中国象棋通常是三次重复)
+REPETITION_THRESHOLD = 3
 
 # 长将检测: 连续将军次数阈值 (超过判负)
 PERPETUAL_CHECK_THRESHOLD = 6
@@ -55,18 +54,17 @@ PERPETUAL_CHECK_THRESHOLD = 6
 # ============================================================================
 # 辅助奖励：吃子得分
 # ============================================================================
-# 棋子价值（增大到 0.03-0.25 范围，提供更强的学习信号）
-# 车=0.25, 马=0.12, 炮=0.12, 士=0.06, 象=0.06, 兵=0.03
-# 注意：这些值相对于胜负的 ±1 仍然较小，不会主导策略
+# 降低吃子奖励，避免模型过于贪吃，主要以胜负为准
+# 象棋中胜负奖励是 ±1，吃子奖励之和不应超过胜负的影响
 PIECE_VALUES = jnp.array([
     0.0,    # 0: EMPTY
-    0.0,    # 1: R_KING (不能被吃)
-    0.06,   # 2: R_ADVISOR (士)
-    0.06,   # 3: R_BISHOP (象)
-    0.12,   # 4: R_KNIGHT (马)
-    0.25,   # 5: R_ROOK (车)
-    0.12,   # 6: R_CANNON (炮)
-    0.03,   # 7: R_PAWN (兵)
+    0.0,    # 1: R_KING
+    0.01,   # 2: R_ADVISOR
+    0.01,   # 3: R_BISHOP
+    0.02,   # 4: R_KNIGHT
+    0.04,   # 5: R_ROOK
+    0.02,   # 6: R_CANNON
+    0.005,  # 7: R_PAWN
 ], dtype=jnp.float32)
 
 def get_piece_value(piece: jnp.int32) -> jnp.float32:
@@ -386,12 +384,13 @@ class XiangqiEnv:
             
             # 2. 终局奖励
             # 胜: +1, 负: -1
-            # 和棋: -1（和输一样，鼓励分出胜负）
+            # 和棋: 给一个轻微的惩罚（例如 -0.5），而不是直接判定为输(-1.0)
+            # 这样模型在必败时会主动追求和棋，但在势均力敌时不会乱求和
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([-1.0, -1.0]),  # 和棋：双方都输
+                    jnp.array([-0.5, -0.5]),  # 和棋：轻微惩罚
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
