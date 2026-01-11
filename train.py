@@ -270,12 +270,13 @@ def selfplay(model, rng_key):
     batch_size = config.selfplay_batch_size // num_devices
     
     def step_fn(state, key):
-        key1, key2, key_noise = jax.random.split(key, 3)
-        obs = jax.vmap(env.observe)(state)
+        # 为 batch 里的每个环境分配独立的种子
+        batch_keys = jax.random.split(key, batch_size)
         
+        obs = jax.vmap(env.observe)(state)
         (logits, value), _ = forward(params, batch_stats, obs)
         
-        # --- 视角修正：将视角 logits 转回真实坐标 ---
+        # --- 视角修正 ---
         rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
         rotated_idx = rotate_action(rotate_idx)
         logits = jnp.where(
@@ -284,29 +285,28 @@ def selfplay(model, rng_key):
             logits[:, rotated_idx]
         )
         
-        # 添加 Dirichlet 噪声 (AlphaZero 标准探索)
-        noise = jax.random.dirichlet(key_noise, jnp.ones(ACTION_SPACE_SIZE) * 0.3, shape=(batch_size,))
-        probs = jax.nn.softmax(logits)
-        noise_probs = 0.75 * probs + 0.25 * noise
-        logits = jnp.log(noise_probs + 1e-10)
+        # 添加 Dirichlet 噪声
+        def _add_noise(l, k):
+            noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
+            p = jax.nn.softmax(l)
+            return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
+        
+        noise_keys = jax.random.split(key, batch_size)
+        logits = jax.vmap(_add_noise)(logits, noise_keys)
 
-        # 温度采样
-        temp = jnp.where(state.step_count < config.temperature_steps, 
-                         config.temperature_initial, 
-                         config.temperature_final)
-        logits = logits / jnp.maximum(temp[:, None], 1e-3)
-
+        # 准备 MCTS 根节点
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
-        # --- 非对称算力分流 ---
-        # 模式 1: 红强黑弱, 模式 2: 红弱黑强
+        # 非对称算力判定
         is_weak_step = ((state.power_mode == 1) & (state.current_player == 1)) | \
                        ((state.power_mode == 2) & (state.current_player == 0))
         
-        # 强搜索
+        # 强/弱搜索使用不同的 batch_keys
+        search_keys = jax.random.split(key, batch_size)
+        
         policy_output_strong = mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=key1,
+            rng_key=search_keys, # 关键：传入 batch 种子
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
@@ -314,33 +314,43 @@ def selfplay(model, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
-        # 弱搜索 (如果 weak_simulations > 1 则调用 mctx，如果是 1 则直接用网络输出)
-        # 这里为了简单，如果 weak_simulations=1，我们模拟一个 policy_output
-        def get_weak_search():
-            return mctx.gumbel_muzero_policy(
-                params=model,
-                rng_key=key1,
-                root=root,
-                recurrent_fn=recurrent_fn,
-                num_simulations=config.weak_simulations,
-                max_num_considered_actions=config.max_num_considered_actions,
-                invalid_actions=~state.legal_action_mask,
-            )
-        
-        policy_output_weak = get_weak_search()
+        policy_output_weak = mctx.gumbel_muzero_policy(
+            params=model,
+            rng_key=search_keys,
+            root=root,
+            recurrent_fn=recurrent_fn,
+            num_simulations=config.weak_simulations,
+            max_num_considered_actions=config.max_num_considered_actions,
+            invalid_actions=~state.legal_action_mask,
+        )
         
         # 合并结果
-        action = jnp.where(is_weak_step, policy_output_weak.action, policy_output_strong.action)
         action_weights = jnp.where(is_weak_step[:, None], policy_output_weak.action_weights, policy_output_strong.action_weights)
+        
+        # --- 温度采样选择最终 Action ---
+        # 这里的温度只影响动作选择，不干扰 MCTS 先验
+        temp = jnp.where(state.step_count < config.temperature_steps, 
+                         config.temperature_initial, 
+                         config.temperature_final)
+        
+        def _sample_action(w, t, k):
+            # 防止除零
+            t = jnp.maximum(t, 1e-3)
+            # 对 weights 进行温度缩放
+            w_temp = jnp.power(w, 1.0 / t)
+            w_temp = w_temp / jnp.sum(w_temp)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp)
+        
+        select_keys = jax.random.split(key, batch_size)
+        action = jax.vmap(_sample_action)(action_weights, temp, select_keys)
 
         actor = state.current_player
-        keys = jax.random.split(key2, batch_size)
+        keys = jax.random.split(key, batch_size)
         
         # 执行一步动作
         next_state = jax.vmap(env.step)(state, action)
         
         # 记录数据
-        # 关键修正：将 policy 目标转回视角坐标系，以匹配归一化的 obs
         normalized_action_weights = jnp.where(
             state.current_player[:, None] == 0,
             action_weights,
