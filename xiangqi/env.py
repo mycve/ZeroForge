@@ -328,14 +328,15 @@ class XiangqiEnv:
                     jnp.where(is_threefold_repetition, 3, 0)
                 )
             )
-            # 长将也算一种和棋形式的终结（虽然有胜负）
-            new_draw_reason = jnp.where(perpetual_check_loss, 4, new_draw_reason)
             
             # 检查长将判负
             # 红方长将 -> 红方负 (黑方胜)
             # 黑方长将 -> 黑方负 (红方胜)
             perpetual_check_loss = red_perpetual_check | black_perpetual_check
             perpetual_winner = jnp.where(red_perpetual_check, 1, jnp.where(black_perpetual_check, 0, -1))
+            
+            # 长将也算一种和棋形式的终结（虽然有胜负）
+            new_draw_reason = jnp.where(perpetual_check_loss, 4, new_draw_reason)
             
             # 综合判断
             game_over = game_over | is_draw | perpetual_check_loss
