@@ -347,17 +347,16 @@ class XiangqiEnv:
             game_over = game_over | is_draw | perpetual_check_loss
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 重复局面判负 > 其他和棋
-            # 注意：将重复局面设为判负，是强制模型在训练初期探索新局面的最强手段
+            # 优先级: 将死 > 长将判负 > 其他和棋
             winner = jnp.where(
                 winner != -1,
                 winner,  # 已有胜者 (将死)
                 jnp.where(
                     perpetual_check_loss,
-                    perpetual_winner,  # 长将判负
+                    perpetual_winner,  # 长将判负 (保留作为违规判负)
                     jnp.where(
                         is_threefold_repetition,
-                        1 - state.current_player,  # 谁造成的重复谁负 (即对方胜)
+                        -1,  # --- 修改：三次重复务必算和 ---
                         jnp.where(is_draw, -1, -1)  # 步数到限的和棋
                     )
                 )
