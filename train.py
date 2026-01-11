@@ -241,11 +241,15 @@ def main():
         data = selfplay(model, keys)
         samples = compute_targets(data)
         
-        # 统计
-        first_term = (jnp.cumsum(data.terminated, axis=1) == 1) & data.terminated
-        r = int((first_term & (data.winner == 0)).sum())
-        b = int((first_term & (data.winner == 1)).sum())
-        d = int((first_term & (data.winner == -1)).sum())
+        # 统计（data 形状: num_devices, max_num_steps, batch_size）
+        data_np = jax.device_get(data)
+        term = data_np.terminated  # (D, T, B)
+        winner = data_np.winner    # (D, T, B)
+        # 沿时间轴找第一次结束
+        first_term = (jnp.cumsum(term, axis=1) == 1) & term
+        r = int((first_term & (winner == 0)).sum())
+        b = int((first_term & (winner == 1)).sum())
+        d = int((first_term & (winner == -1)).sum())
         
         # 处理样本
         samples_np = jax.device_get(samples)
