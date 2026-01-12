@@ -336,13 +336,25 @@ def main():
         return (optax.apply_updates(params, updates), new_batch_stats), opt_state, ploss, vloss
 
     # --- 极简顶级优化：启动即并行编译所有核心算子 ---
-    print("正在并行预编译 JAX Splay / Train 算子...")
+    print("正在并行预编译 JAX Selfplay / Train 算子...")
     comp_st = time.time()
     dummy_key = jax.random.PRNGKey(0)
     dummy_keys = jax.random.split(dummy_key, num_devices)
+    
+    # 1. 编译 Selfplay
     dummy_data = selfplay(model, dummy_keys)
     dummy_samples = compute_targets(dummy_data)
-    _ = train_step(model, opt_state, dummy_samples, dummy_keys)
+    
+    # 2. 编译 Train Step (模拟展平后的训练批次形状)
+    # 取一个标准训练批次的大小进行预热
+    batch_per_device = config.training_batch_size // num_devices
+    # 抽取 dummy_samples 中的一小部分并变形为 [num_devices, batch_per_device, C, H, W]
+    dummy_batch = jax.tree.map(
+        lambda x: x[:, 0, :batch_per_device].reshape((num_devices, batch_per_device) + x.shape[3:]), 
+        dummy_samples
+    )
+    _ = train_step(model, opt_state, dummy_batch, dummy_keys)
+    
     print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
     os.makedirs(config.ckpt_dir, exist_ok=True)
