@@ -389,6 +389,7 @@ def main():
     dummy_state = jax.pmap(jax.vmap(env.init))(init_keys)
     dummy_is_strong = jnp.ones((num_devices, batch_size_per_device), dtype=jnp.bool_)
     
+    # 注意：这里传 dummy_key 而不是 dummy_keys
     _, dummy_step_data = selfplay_step(model, dummy_state, dummy_keys, dummy_is_strong)
     
     # 2. 编译 compute_targets (需要构造正确形状的 dummy 数据)
@@ -406,6 +407,9 @@ def main():
     )
     _ = train_step(model, opt_state, dummy_batch, dummy_keys)
     
+    # 4. 额外预编译 Evaluate Step (可选，但推荐)
+    _ = evaluate_step(model, model, dummy_state, dummy_keys)
+    
     print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -416,12 +420,21 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        data = selfplay(model, jax.random.split(sk1, num_devices))
+        data = selfplay(model, sk1)
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
-        first_term = (jnp.cumsum(data_np.terminated, axis=1) == 1) & data_np.terminated
-        r, b, d = int((first_term & (data_np.winner == 0)).sum()), int((first_term & (data_np.winner == 1)).sum()), int((first_term & (data_np.winner == -1)).sum())
+        # 注意：合并后的 data 形状是 [num_devices, max_steps, batch_per_device]
+        # 需要做一些处理来计算胜率统计
+        term = data_np.terminated # [num_devices, max_steps, batch_per_device]
+        winner = data_np.winner
+        
+        # 统计本轮对局结果
+        # 找到每个对局第一次 terminated 的位置
+        first_term = (jnp.cumsum(term, axis=1) == 1) & term
+        r = int((first_term & (winner == 0)).sum())
+        b = int((first_term & (winner == 1)).sum())
+        d = int((first_term & (winner == -1)).sum())
         
         samples_flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), jax.device_get(samples))
         frames += samples_flat.obs.shape[0]
@@ -451,10 +464,13 @@ def main():
         if iteration % config.eval_interval == 0:
             past_iter = max(0, iteration - config.past_model_offset)
             past_model = jax.device_put_replicated(history_models[past_iter], devices)
-            rng_key, sk5 = jax.random.split(rng_key)
-            wr = (evaluate(model, past_model, jax.random.split(sk5, num_devices)) == 0).sum()
-            wb = (evaluate(past_model, model, jax.random.split(sk5, num_devices)) == 1).sum()
-            score = (wr + wb + 0.5 * (config.eval_games - wr - wb)) / config.eval_games
+            rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
+            # 双边评估：红黑轮换以抵消先手优势
+            winners_r = evaluate(model, past_model, sk5)
+            winners_b = evaluate(past_model, model, sk6)
+            wr = (winners_r == 0).sum()
+            wb = (winners_b == 1).sum()
+            score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
             elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
             iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
             print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
