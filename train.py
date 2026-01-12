@@ -153,106 +153,82 @@ class Sample(NamedTuple):
 # 自玩
 # ============================================================================
 
-@partial(jax.pmap, axis_name='i')
-def selfplay_step(model, state, key, is_red_strong):
-    """单步自对弈算子 - 拆分编译边界的关键"""
-    params, batch_stats = model
-    batch_size = state.current_player.shape[0]
-    
-    key_noise, key_search, key_sample, key_next = jax.random.split(key, 4)
-    obs = jax.vmap(env.observe)(state)
-    (logits, value), _ = forward(params, batch_stats, obs)
-    
-    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-    rotated_idx = rotate_action(rotate_idx)
-    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
-    
-    def _add_noise(l, k):
-        noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
-        p = jax.nn.softmax(l)
-        return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
-    
-    noise_keys = jax.random.split(key_noise, batch_size)
-    logits = jax.vmap(_add_noise)(logits, noise_keys)
-    root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-    
-    is_strong_step = jnp.where(state.current_player == 0, is_red_strong, ~is_red_strong)
-    
-    # 使用 checkpoint 减少 recurrent_fn 的显存占用和编译图复杂度
-    checkpointed_recurrent_fn = jax.checkpoint(recurrent_fn)
-    
-    k1, k2 = jax.random.split(key_search)
-    policy_output_strong = mctx.gumbel_muzero_policy(
-        params=model, rng_key=k1, root=root, recurrent_fn=checkpointed_recurrent_fn,
-        num_simulations=config.strong_simulations,
-        max_num_considered_actions=config.max_num_considered_actions,
-        invalid_actions=~state.legal_action_mask,
-    )
-    policy_output_weak = mctx.gumbel_muzero_policy(
-        params=model, rng_key=k2, root=root, recurrent_fn=checkpointed_recurrent_fn,
-        num_simulations=config.weak_simulations,
-        max_num_considered_actions=config.max_num_considered_actions,
-        invalid_actions=~state.legal_action_mask,
-    )
-    
-    action_weights = jnp.where(is_strong_step[:, None], policy_output_strong.action_weights, policy_output_weak.action_weights)
-    
-    temp = jnp.where(state.step_count < config.temperature_steps, config.temperature_initial, config.temperature_final)
-    def _sample_action(w, t, k):
-        t = jnp.maximum(t, 1e-3)
-        w_temp = jnp.power(w + 1e-10, 1.0 / t)
-        return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
-    
-    sample_keys = jax.random.split(key_sample, batch_size)
-    action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
-    
-    actor = state.current_player
-    next_state = jax.vmap(env.step)(state, action)
-    
-    normalized_action_weights = jnp.where(state.current_player[:, None] == 0, action_weights, action_weights[:, rotated_idx])
-    
-    data = SelfplayOutput(
-        obs=obs, action_weights=normalized_action_weights,
-        reward=next_state.rewards[jnp.arange(batch_size), actor],
-        terminated=next_state.terminated,
-        discount=jnp.where(next_state.terminated, 0.0, -1.0),
-        winner=next_state.winner, draw_reason=next_state.draw_reason,
-        is_strong=is_strong_step
-    )
-    
-    next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s))(next_state, jax.random.split(key_next, batch_size))
-    return next_state_reset, data
-
+@jax.pmap
 def selfplay(model, rng_key):
     """
-    自玩主循环 - 通过 Python 循环调用 pmap 算子，
-    将“编译边界”限制在单步内，极大降低编译耗时。
+    高性能自玩算子：重新使用 lax.scan 消除 Python 循环开销
     """
-    batch_size_per_device = config.selfplay_batch_size // num_devices
+    params, batch_stats = model
+    batch_size = config.selfplay_batch_size // num_devices
     
     rng_key, subkey = jax.random.split(rng_key)
-    is_red_strong = jax.random.bernoulli(subkey, 0.5, shape=(num_devices, batch_size_per_device))
+    is_red_strong = jax.random.bernoulli(subkey, 0.5, shape=(batch_size,))
     
-    # 初始状态
-    init_keys = jax.random.split(rng_key, num_devices * batch_size_per_device).reshape(num_devices, batch_size_per_device, -1)
-    state = jax.pmap(jax.vmap(env.init))(init_keys)
-    
-    all_data = []
-    step_keys = jax.random.split(rng_key, config.max_steps * num_devices).reshape(config.max_steps, num_devices, -1)
-    
-    print(f"开始自对弈迭代 ({config.max_steps} 步)...")
-    for t in range(config.max_steps):
-        state, data = selfplay_step(model, state, step_keys[t], is_red_strong)
-        all_data.append(data)
-    
-    # 合并数据: 将 list of SelfplayOutput (each has shape [num_devices, batch_per_device, ...])
-    # 转换为单个 SelfplayOutput (shape [num_devices, config.max_steps, batch_per_device, ...])
-    # 注意：需要交换前两个维度，以便后续 pmap(compute_targets) 正常按设备分发
-    def stack_and_transpose(*leaves):
-        stacked = jnp.stack(leaves, axis=1) # [num_devices, max_steps, batch_per_device, ...]
-        return stacked
-    
-    return jax.tree.map(stack_and_transpose, *all_data)
+    def step_fn(state, key):
+        key_noise, key_search, key_sample, key_next = jax.random.split(key, 4)
+        obs = jax.vmap(env.observe)(state)
+        (logits, value), _ = forward(params, batch_stats, obs)
+        
+        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+        rotated_idx = rotate_action(rotate_idx)
+        logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
+        
+        def _add_noise(l, k):
+            noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
+            p = jax.nn.softmax(l)
+            return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
+        
+        noise_keys = jax.random.split(key_noise, batch_size)
+        logits = jax.vmap(_add_noise)(logits, noise_keys)
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        
+        is_strong_step = jnp.where(state.current_player == 0, is_red_strong, ~is_red_strong)
+        
+        k1, k2 = jax.random.split(key_search)
+        policy_output_strong = mctx.gumbel_muzero_policy(
+            params=model, rng_key=k1, root=root, recurrent_fn=recurrent_fn,
+            num_simulations=config.strong_simulations,
+            max_num_considered_actions=config.max_num_considered_actions,
+            invalid_actions=~state.legal_action_mask,
+        )
+        policy_output_weak = mctx.gumbel_muzero_policy(
+            params=model, rng_key=k2, root=root, recurrent_fn=recurrent_fn,
+            num_simulations=config.weak_simulations,
+            max_num_considered_actions=config.max_num_considered_actions,
+            invalid_actions=~state.legal_action_mask,
+        )
+        
+        action_weights = jnp.where(is_strong_step[:, None], policy_output_strong.action_weights, policy_output_weak.action_weights)
+        
+        temp = jnp.where(state.step_count < config.temperature_steps, config.temperature_initial, config.temperature_final)
+        def _sample_action(w, t, k):
+            t = jnp.maximum(t, 1e-3)
+            w_temp = jnp.power(w + 1e-10, 1.0 / t)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+        
+        sample_keys = jax.random.split(key_sample, batch_size)
+        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
+        
+        actor = state.current_player
+        next_state = jax.vmap(env.step)(state, action)
+        
+        normalized_action_weights = jnp.where(state.current_player[:, None] == 0, action_weights, action_weights[:, rotated_idx])
+        
+        data = SelfplayOutput(
+            obs=obs, action_weights=normalized_action_weights,
+            reward=next_state.rewards[jnp.arange(batch_size), actor],
+            terminated=next_state.terminated,
+            discount=jnp.where(next_state.terminated, 0.0, -1.0),
+            winner=next_state.winner, draw_reason=next_state.draw_reason,
+            is_strong=is_strong_step
+        )
+        
+        next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s))(next_state, jax.random.split(key_next, batch_size))
+        return next_state_reset, data
+
+    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
+    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
+    return data
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
@@ -296,77 +272,49 @@ def loss_fn(params, batch_stats, samples: Sample, rng_key):
     
     return total_loss, (new_batch_stats, policy_loss, value_loss)
 
-@partial(jax.pmap, axis_name='i')
-def evaluate_step(model_red, model_black, state, key):
-    """单步评估算子"""
-    # 标注当前 search 属于哪个玩家的视角
-    is_red = state.current_player == 0
-    state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
-    
+@jax.pmap
+def evaluate(model_red, model_black, rng_key):
+    """高性能评估算子：重新使用 while_loop 跑满 GPU"""
     params_r, stats_r = model_red
     params_b, stats_b = model_black
+    batch_size = config.eval_games // num_devices
     
-    obs = jax.vmap(env.observe)(state)
-    (logits_r, value_r), _ = forward(params_r, stats_r, obs)
-    (logits_b, value_b), _ = forward(params_b, stats_b, obs)
-    
-    logits = jnp.where(is_red[:, None], logits_r, logits_b)
-    value = jnp.where(is_red, value_r, value_b)
-    
-    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-    rotated_idx = rotate_action(rotate_idx)
-    logits = jnp.where(is_red[:, None], logits, logits[:, rotated_idx])
-    
-    root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-    
-    # 定义混合评估的 recurrent_fn
-    def evaluate_recurrent_fn(models, rng_key, action, state):
-        m_red, m_black = models
-        # 为了兼容 mctx 的 vmap，必须同时计算或使用 jax.lax.cond (但 vmap 里的 cond 会变成 select)
-        # 这里最稳健的做法是分别 forward 并根据 search_model_index 选择
-        res_red, next_state = recurrent_fn(m_red, rng_key, action, state)
-        res_black, _ = recurrent_fn(m_black, rng_key, action, state)
+    def step_fn(state, key):
+        obs = jax.vmap(env.observe)(state)
+        is_red = state.current_player == 0
+        (logits_r, value_r), _ = forward(params_r, stats_r, obs)
+        (logits_b, value_b), _ = forward(params_b, stats_b, obs)
         
-        # 根据 root 时的玩家身份选择对应的模型输出
-        use_red = state.search_model_index == 0
+        logits = jnp.where(is_red[:, None], logits_r, logits_b)
+        value = jnp.where(is_red, value_r, value_b)
         
-        # 混合输出
-        out = jax.tree.map(
-            lambda r, b: jnp.where(use_red[:, None] if r.ndim > 1 else use_red, r, b),
-            res_red, res_black
+        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+        rotated_idx = rotate_action(rotate_idx)
+        logits = jnp.where(is_red[:, None], logits, logits[:, rotated_idx])
+        
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        
+        policy_output = mctx.gumbel_muzero_policy(
+            params=(model_red, model_black), rng_key=key, root=root,
+            recurrent_fn=lambda ms, k, a, s: recurrent_fn(ms[0] if s.current_player[0]==0 else ms[1], k, a, s),
+            num_simulations=96, max_num_considered_actions=16, invalid_actions=~state.legal_action_mask,
         )
-        return out, next_state
+        next_state = jax.vmap(env.step)(state, policy_output.action)
+        return next_state, next_state.terminated
 
-    # 评估时也使用 checkpoint
-    checkpointed_recurrent_fn = jax.checkpoint(evaluate_recurrent_fn)
+    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
+    terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
     
-    policy_output = mctx.gumbel_muzero_policy(
-        params=(model_red, model_black), rng_key=key, root=root,
-        recurrent_fn=checkpointed_recurrent_fn,
-        num_simulations=96, max_num_considered_actions=16, invalid_actions=~state.legal_action_mask,
-    )
-    next_state = jax.vmap(env.step)(state, policy_output.action)
-    return next_state, next_state.terminated
-
-def evaluate(model_red, model_black, rng_key):
-    """
-    评估主循环 - 同样通过拆分边界降低编译时间
-    """
-    batch_size_per_device = config.eval_games // num_devices
-    init_keys = jax.random.split(rng_key, num_devices * batch_size_per_device).reshape(num_devices, batch_size_per_device, -1)
-    state = jax.pmap(jax.vmap(env.init))(init_keys)
-    
-    terminated = jnp.zeros((num_devices, batch_size_per_device), dtype=jnp.bool_)
-    
-    # 使用 Python 循环替代 lax.while_loop
-    step_count = 0
-    while not jnp.all(terminated) and step_count < config.max_steps:
-        rng_key, sk = jax.random.split(rng_key)
-        step_keys = jax.random.split(sk, num_devices)
-        state, step_terminated = evaluate_step(model_red, model_black, state, step_keys)
-        terminated = terminated | step_terminated
-        step_count += 1
+    def body_fn(args):
+        s, t, k = args
+        k, sk = jax.random.split(k)
+        ns, nt = step_fn(s, sk)
+        return ns, t | nt, k
         
+    state, _, _ = jax.lax.while_loop(
+        lambda args: (~jnp.all(args[1])) & (args[0].step_count[0] < config.max_steps), 
+        body_fn, (state, terminated, rng_key)
+    )
     return state.winner
 
 # ============================================================================
@@ -404,23 +352,11 @@ def main():
     dummy_key = jax.random.PRNGKey(0)
     dummy_keys = jax.random.split(dummy_key, num_devices)
     
-    # 1. 编译 Selfplay Step (只需编译单步)
-    batch_size_per_device = config.selfplay_batch_size // num_devices
-    init_keys = jax.random.split(dummy_key, num_devices * batch_size_per_device).reshape(num_devices, batch_size_per_device, -1)
-    dummy_state = jax.pmap(jax.vmap(env.init))(init_keys)
-    dummy_is_strong = jnp.ones((num_devices, batch_size_per_device), dtype=jnp.bool_)
+    # 1. 编译 Selfplay (现在是一个完整的并行算子)
+    dummy_data = selfplay(model, dummy_keys)
+    dummy_samples = compute_targets(dummy_data)
     
-    # 注意：这里传 dummy_key 而不是 dummy_keys
-    _, dummy_step_data = selfplay_step(model, dummy_state, dummy_keys, dummy_is_strong)
-    
-    # 2. 编译 compute_targets (需要构造正确形状的 dummy 数据)
-    # 构造一个 shape 为 [num_devices, max_steps, batch_size_per_device, ...] 的 dummy data
-    def make_dummy_full(x):
-        return jnp.broadcast_to(x[:, None], (num_devices, config.max_steps, batch_size_per_device) + x.shape[2:])
-    dummy_full_data = jax.tree.map(make_dummy_full, dummy_step_data)
-    dummy_samples = compute_targets(dummy_full_data)
-    
-    # 3. 编译 Train Step
+    # 2. 编译 Train Step
     batch_per_device = config.training_batch_size // num_devices
     dummy_batch = jax.tree.map(
         lambda x: x[:, 0, :batch_per_device].reshape((num_devices, batch_per_device) + x.shape[3:]), 
@@ -428,8 +364,8 @@ def main():
     )
     _ = train_step(model, opt_state, dummy_batch, dummy_keys)
     
-    # 4. 额外预编译 Evaluate Step (可选，但推荐)
-    _ = evaluate_step(model, model, dummy_state, dummy_keys)
+    # 3. 编译 Evaluate
+    _ = evaluate(model, model, dummy_keys)
     
     print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
@@ -441,17 +377,15 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        data = selfplay(model, sk1)
+        data = selfplay(model, jax.random.split(sk1, num_devices))
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
-        # 注意：合并后的 data 形状是 [num_devices, max_steps, batch_per_device]
-        # 需要做一些处理来计算胜率统计
-        term = data_np.terminated # [num_devices, max_steps, batch_per_device]
+        # 现在 data 形状恢复为 [num_devices, max_steps, batch_per_device]
+        term = data_np.terminated
         winner = data_np.winner
         
-        # 统计本轮对局结果
-        # 找到每个对局第一次 terminated 的位置
+        # 统计结果
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         r = int((first_term & (winner == 0)).sum())
         b = int((first_term & (winner == 1)).sum())
@@ -486,9 +420,9 @@ def main():
             past_iter = max(0, iteration - config.past_model_offset)
             past_model = jax.device_put_replicated(history_models[past_iter], devices)
             rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-            # 双边评估：红黑轮换以抵消先手优势
-            winners_r = evaluate(model, past_model, sk5)
-            winners_b = evaluate(past_model, model, sk6)
+            # 恢复双边并行评估
+            winners_r = evaluate(model, past_model, jax.random.split(sk5, num_devices))
+            winners_b = evaluate(past_model, model, jax.random.split(sk6, num_devices))
             wr = (winners_r == 0).sum()
             wb = (winners_b == 1).sum()
             score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
