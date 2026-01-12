@@ -328,22 +328,6 @@ def main():
     model = jax.device_put_replicated(model, devices)
     opt_state = jax.device_put_replicated(opt_state, devices)
     
-    # --- 极简顶级优化：启动即并行编译所有核心算子 ---
-    print("正在并行预编译 JAX 算子 (Selfplay / Train / Eval)...")
-    comp_st = time.time()
-    # 模拟数据
-    dummy_key = jax.random.PRNGKey(0)
-    dummy_keys = jax.random.split(dummy_key, num_devices)
-    dummy_data = selfplay(model, dummy_keys)
-    dummy_samples = compute_targets(dummy_data)
-    # 预编译损失函数与评估函数
-    _ = train_step(model, opt_state, dummy_samples, dummy_keys)
-    # 评估函数可以异步编译，不阻塞主流程
-    print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
-
-    os.makedirs(config.ckpt_dir, exist_ok=True)
-    writer = SummaryWriter(config.log_dir)
-    
     @partial(jax.pmap, axis_name='i')
     def train_step(model, opt_state, samples, rng_key):
         params, batch_stats = model
@@ -351,6 +335,19 @@ def main():
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state)
         return (optax.apply_updates(params, updates), new_batch_stats), opt_state, ploss, vloss
 
+    # --- 极简顶级优化：启动即并行编译所有核心算子 ---
+    print("正在并行预编译 JAX Splay / Train 算子...")
+    comp_st = time.time()
+    dummy_key = jax.random.PRNGKey(0)
+    dummy_keys = jax.random.split(dummy_key, num_devices)
+    dummy_data = selfplay(model, dummy_keys)
+    dummy_samples = compute_targets(dummy_data)
+    _ = train_step(model, opt_state, dummy_samples, dummy_keys)
+    print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
+
+    os.makedirs(config.ckpt_dir, exist_ok=True)
+    writer = SummaryWriter(config.log_dir)
+    
     iteration, frames = 0, 0
     while True:
         iteration += 1
