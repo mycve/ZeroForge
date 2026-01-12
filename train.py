@@ -299,11 +299,14 @@ def loss_fn(params, batch_stats, samples: Sample, rng_key):
 @partial(jax.pmap, axis_name='i')
 def evaluate_step(model_red, model_black, state, key):
     """单步评估算子"""
+    # 标注当前 search 属于哪个玩家的视角
+    is_red = state.current_player == 0
+    state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
+    
     params_r, stats_r = model_red
     params_b, stats_b = model_black
     
     obs = jax.vmap(env.observe)(state)
-    is_red = state.current_player == 0
     (logits_r, value_r), _ = forward(params_r, stats_r, obs)
     (logits_b, value_b), _ = forward(params_b, stats_b, obs)
     
@@ -316,12 +319,30 @@ def evaluate_step(model_red, model_black, state, key):
     
     root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
     
+    # 定义混合评估的 recurrent_fn
+    def evaluate_recurrent_fn(models, rng_key, action, state):
+        m_red, m_black = models
+        # 为了兼容 mctx 的 vmap，必须同时计算或使用 jax.lax.cond (但 vmap 里的 cond 会变成 select)
+        # 这里最稳健的做法是分别 forward 并根据 search_model_index 选择
+        res_red, next_state = recurrent_fn(m_red, rng_key, action, state)
+        res_black, _ = recurrent_fn(m_black, rng_key, action, state)
+        
+        # 根据 root 时的玩家身份选择对应的模型输出
+        use_red = state.search_model_index == 0
+        
+        # 混合输出
+        out = jax.tree.map(
+            lambda r, b: jnp.where(use_red[:, None] if r.ndim > 1 else use_red, r, b),
+            res_red, res_black
+        )
+        return out, next_state
+
     # 评估时也使用 checkpoint
-    checkpointed_recurrent_fn = jax.checkpoint(recurrent_fn)
+    checkpointed_recurrent_fn = jax.checkpoint(evaluate_recurrent_fn)
     
     policy_output = mctx.gumbel_muzero_policy(
         params=(model_red, model_black), rng_key=key, root=root,
-        recurrent_fn=lambda ms, k, a, s: checkpointed_recurrent_fn(ms[0] if s.current_player[0]==0 else ms[1], k, a, s),
+        recurrent_fn=checkpointed_recurrent_fn,
         num_simulations=96, max_num_considered_actions=16, invalid_actions=~state.legal_action_mask,
     )
     next_state = jax.vmap(env.step)(state, policy_output.action)

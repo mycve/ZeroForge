@@ -90,6 +90,11 @@ class XiangqiState:
     
     # 黑方连续将军次数
     black_consecutive_checks: jnp.int32
+    
+    # === 搜索辅助 (不影响环境逻辑) ===
+    # 标记当前搜索归属于哪个模型 (0=model_red/当前模型, 1=model_black/历史模型)
+    # 仅在 evaluate 时使用，避免 TracerBoolConversionError
+    search_model_index: jnp.int32 = 0
 
 
 # ============================================================================
@@ -230,6 +235,7 @@ class XiangqiEnv:
             hash_count=jnp.int32(1),
             red_consecutive_checks=jnp.int32(0),
             black_consecutive_checks=jnp.int32(0),
+            search_model_index=jnp.int32(0),
         )
     
     @partial(jax.jit, static_argnums=(0,))
@@ -404,6 +410,7 @@ class XiangqiEnv:
                 hash_count=new_hash_count,
                 red_consecutive_checks=new_red_checks,
                 black_consecutive_checks=new_black_checks,
+                search_model_index=state.search_model_index,
             )
         
         return jax.lax.cond(state.terminated, lambda: state, _do_step)
