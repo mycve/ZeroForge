@@ -17,6 +17,14 @@ import numpy as np
 import optax
 import mctx
 
+# --- JAX 极速优化配置 ---
+# 1. 开启编译缓存，第二次运行秒开
+cache_dir = "jax_cache"
+os.makedirs(cache_dir, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", os.path.abspath(cache_dir))
+# 2. 允许 JAX 充分利用算力并行编译
+jax.config.update("jax_parallel_functions_output", True)
+
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
 from xiangqi.mirror import mirror_observation, mirror_policy
@@ -322,6 +330,19 @@ def main():
     model = jax.device_put_replicated(model, devices)
     opt_state = jax.device_put_replicated(opt_state, devices)
     
+    # --- 极简顶级优化：启动即并行编译所有核心算子 ---
+    print("正在并行预编译 JAX 算子 (Selfplay / Train / Eval)...")
+    comp_st = time.time()
+    # 模拟数据
+    dummy_key = jax.random.PRNGKey(0)
+    dummy_keys = jax.random.split(dummy_key, num_devices)
+    dummy_data = selfplay(model, dummy_keys)
+    dummy_samples = compute_targets(dummy_data)
+    # 预编译损失函数与评估函数
+    _ = train_step(model, opt_state, dummy_samples, dummy_keys)
+    # 评估函数可以异步编译，不阻塞主流程
+    print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
+
     os.makedirs(config.ckpt_dir, exist_ok=True)
     writer = SummaryWriter(config.log_dir)
     

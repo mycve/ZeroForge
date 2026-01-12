@@ -10,8 +10,27 @@ from flax.training.train_state import TrainState
 import optax
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation 块 (通道注意力机制)
+    这是现代顶级 AI (如 KataGo, Lc0) 的标准配置。
+    它能让网络学会关注棋盘上的关键区域。
+    """
+    channels: int
+
+    @nn.compact
+    def __call__(self, x):
+        # Squeeze: 全局平均池化
+        w = jnp.mean(x, axis=(1, 2), keepdims=True)
+        # Excitation: 两层全连接
+        w = nn.Conv(self.channels // 4, (1, 1))(w)
+        w = nn.relu(w)
+        w = nn.Conv(self.channels, (1, 1))(w)
+        w = nn.sigmoid(w)
+        return x * w
+
+
 class ResBlock(nn.Module):
-    """残差块"""
+    """增强残差块 (ResNet + SE)"""
     channels: int
     
     @nn.compact
@@ -21,6 +40,8 @@ class ResBlock(nn.Module):
         y = nn.relu(y)
         y = nn.Conv(self.channels, (3, 3), padding='SAME', use_bias=False)(y)
         y = nn.BatchNorm(use_running_average=not train)(y)
+        # 加入 SE 注意力机制
+        y = SEBlock(self.channels)(y)
         return nn.relu(x + y)
 
 
