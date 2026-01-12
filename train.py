@@ -50,8 +50,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构
-    num_channels: int = 256
-    num_blocks: int = 12
+    num_channels: int = 128
+    num_blocks: int = 8
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -59,8 +59,8 @@ class Config:
     
     # 自对弈与搜索 (现代化顶级配置)
     selfplay_batch_size: int = 512
-    strong_simulations: int = 256    # 导师算力
-    weak_simulations: int = 32       # 学生算力
+    strong_simulations: int = 128    # 导师算力
+    weak_simulations: int = 16       # 学生算力
     max_num_considered_actions: int = 16
     
     # 探索策略
@@ -108,20 +108,56 @@ def forward(params, batch_stats, obs, is_training=False):
     )
     return (logits, value), new_batch_stats['batch_stats']
 
+# --- 预计算常量，避免 MCTS 内部重复编译 ---
+_ROTATE_IDX = jnp.arange(ACTION_SPACE_SIZE)
+_ROTATED_IDX = rotate_action(_ROTATE_IDX)
+
+# --- 独立 JIT 单元: 环境步进 (MCTS 内部高频调用) ---
+@jax.jit
+def _env_step_batch(state, action):
+    """批量环境步进（独立编译，MCTS 内部复用）"""
+    return jax.vmap(env.step)(state, action)
+
+# --- 独立 JIT 单元: 观察生成 ---
+@jax.jit  
+def _env_observe_batch(state):
+    """批量观察生成（独立编译）"""
+    return jax.vmap(env.observe)(state)
+
+# --- 独立 JIT 单元: 神经网络推理 (MCTS 核心瓶颈) ---
+@jax.jit
+def _forward_inference(params, batch_stats, obs):
+    """神经网络推理（独立编译，MCTS 内部复用）"""
+    (logits, value), _ = forward(params, batch_stats, obs)
+    return logits, value
+
+# --- 独立 JIT 单元: 后处理 logits ---
+@jax.jit
+def _process_logits(logits, current_player, legal_action_mask):
+    """处理 logits（旋转 + 掩码）"""
+    logits = jnp.where(current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    logits = jnp.where(legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    return logits
+
 def recurrent_fn(model, rng_key, action, state):
+    """MCTS 递归函数（调用预编译的子单元）"""
     params, batch_stats = model
     prev_player = state.current_player
-    state = jax.vmap(env.step)(state, action)
-    obs = jax.vmap(env.observe)(state)
-    (logits, value), _ = forward(params, batch_stats, obs)
     
-    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-    rotated_idx = rotate_action(rotate_idx)
-    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
+    # 调用预编译的环境步进
+    state = _env_step_batch(state, action)
     
-    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    # 调用预编译的观察生成
+    obs = _env_observe_batch(state)
     
+    # 调用预编译的神经网络推理
+    logits, value = _forward_inference(params, batch_stats, obs)
+    
+    # 调用预编译的 logits 处理
+    logits = _process_logits(logits, state.current_player, state.legal_action_mask)
+    
+    # 简单的标量计算，编译开销小
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
     value = jnp.where(state.terminated, 0.0, value)
     discount = jnp.where(state.terminated, 0.0, -1.0)
@@ -401,32 +437,47 @@ def main():
     
     # 取第一个设备的模型用于预编译
     model_single = jax.tree.map(lambda x: x[0], model)
+    params, batch_stats = model_single
+    
+    # 0. 预编译 recurrent_fn 内部子单元（关键优化！）
+    print("  [0/6] 编译 MCTS 内部子单元...")
+    t0 = time.time()
+    dummy_state = jax.vmap(env.init)(jax.random.split(dummy_key, batch_size))
+    dummy_action = jnp.zeros(batch_size, dtype=jnp.int32)
+    
+    # 编译环境步进
+    _ = _env_step_batch(dummy_state, dummy_action)
+    # 编译观察生成
+    dummy_obs = _env_observe_batch(dummy_state)
+    # 编译神经网络推理
+    dummy_logits, dummy_value = _forward_inference(params, batch_stats, dummy_obs)
+    # 编译 logits 处理
+    _ = _process_logits(dummy_logits, dummy_state.current_player, dummy_state.legal_action_mask)
+    print(f"      完成，耗时: {time.time()-t0:.1f}s")
     
     # 1. 预编译 _prepare_root (神经网络推理)
-    print("  [1/5] 编译神经网络推理...")
+    print("  [1/6] 编译神经网络推理...")
     t1 = time.time()
-    dummy_state = jax.vmap(env.init)(jax.random.split(dummy_key, batch_size))
     dummy_noise_keys = jax.random.split(dummy_key, batch_size)
-    params, batch_stats = model_single
     _ = _prepare_root(params, batch_stats, dummy_state, dummy_noise_keys, batch_size)
     print(f"      完成，耗时: {time.time()-t1:.1f}s")
     
     # 2. 预编译 _mcts_search (MCTS 搜索 - 这是主要耗时的部分)
-    print("  [2/5] 编译 MCTS 搜索 (强)...")
+    print("  [2/6] 编译 MCTS 搜索 (强)...")
     t2 = time.time()
     _, dummy_root = _prepare_root(params, batch_stats, dummy_state, dummy_noise_keys, batch_size)
     _ = _mcts_search(model_single, dummy_key, dummy_root, ~dummy_state.legal_action_mask,
                      config.strong_simulations, config.max_num_considered_actions)
     print(f"      完成，耗时: {time.time()-t2:.1f}s")
     
-    print("  [3/5] 编译 MCTS 搜索 (弱)...")
+    print("  [3/6] 编译 MCTS 搜索 (弱)...")
     t3 = time.time()
     _ = _mcts_search(model_single, dummy_key, dummy_root, ~dummy_state.legal_action_mask,
                      config.weak_simulations, config.max_num_considered_actions)
     print(f"      完成，耗时: {time.time()-t3:.1f}s")
     
-    # 3. 预编译 _select_and_step
-    print("  [4/5] 编译动作选择与状态更新...")
+    # 4. 预编译 _select_and_step
+    print("  [4/6] 编译动作选择与状态更新...")
     t4 = time.time()
     dummy_weights = jnp.ones((batch_size, ACTION_SPACE_SIZE)) / ACTION_SPACE_SIZE
     dummy_is_strong = jnp.ones(batch_size, dtype=bool)
@@ -437,19 +488,23 @@ def main():
                          dummy_temp, dummy_sample_keys, dummy_next_keys, batch_size)
     print(f"      完成，耗时: {time.time()-t4:.1f}s")
     
-    # 4. 预编译 train_step
-    print("  [5/5] 编译训练步骤...")
+    # 5. 预编译完整自玩流程（验证）
+    print("  [5/6] 编译完整自玩流程...")
     t5 = time.time()
-    # 运行一次完整自玩来获取正确形状的数据
     dummy_data = selfplay_pmap(model, dummy_keys)
     dummy_samples = compute_targets(dummy_data)
+    print(f"      完成，耗时: {time.time()-t5:.1f}s")
+    
+    # 6. 预编译 train_step
+    print("  [6/6] 编译训练步骤...")
+    t6 = time.time()
     batch_per_device = config.training_batch_size // num_devices
     dummy_batch = jax.tree.map(
         lambda x: x[:, 0, :batch_per_device].reshape((num_devices, batch_per_device) + x.shape[3:]), 
         dummy_samples
     )
     _ = train_step(model, opt_state, dummy_batch, dummy_keys)
-    print(f"      完成，耗时: {time.time()-t5:.1f}s")
+    print(f"      完成，耗时: {time.time()-t6:.1f}s")
     
     print(f"预编译完成，总耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
