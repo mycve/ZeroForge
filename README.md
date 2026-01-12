@@ -1,109 +1,78 @@
-# ZeroForge - 中国象棋 Gumbel MuZero AI
+# ZeroForge - 中国象棋 Gumbel AlphaZero
 
-基于 JAX + mctx 的中国象棋 AI，使用 Gumbel MuZero 算法自我对弈进化。
+ZeroForge 是一个基于 **JAX** + **mctx** 实现的现代化、极简主义中国象棋 AI。它采用 Gumbel AlphaZero 算法，通过自我对弈（Self-play）实现从零开始的自我进化。
 
-## 特性
+## 核心特性
 
-- **Gumbel MuZero**: 高效的 MCTS 搜索，100 次模拟即可达到好效果
-- **全 JAX JIT**: 自我对弈和训练完全 JIT 编译，GPU 高利用率
-- **批量并行**: 512 局游戏同时进行，充分利用 GPU
-- **完整象棋规则**: 将军、将死、长将、三次重复等
-- **ELO 评估**: 自动评估模型强度
-- **TensorBoard**: 实时监控训练进度
-- **断点继续**: 自动保存和恢复检查点
+- **Gumbel AlphaZero**: 采用 DeepMind 的 Gumbel-Top-k 策略改善算法，在极低模拟次数（如 64-96 次）下即可产生强力的训练信号。
+- **现代化架构**:
+    - **算力随机化 (Compute Randomization)**: 自对象中采用“导师（强算力）- 学生（弱算力）”博弈模式，学生对局以低权重参与训练，增强模型鲁棒性。
+    - **视角归一化 (Perspective Normalization)**: 始终以当前玩家为中心进行观察，简化网络学习难度。
+    - **镜像增强 (Mirror Augmentation)**: 训练时自动进行左右镜像变换，数据利用率翻倍。
+- **极速 JAX 优化**:
+    - **全向量化规则**: 象棋规则（将军、将死、重复局面等）完全使用 JAX 算子重写，消除 Python 循环，极大减小计算图规模。
+    - **并行预编译**: 启动时并行预热 Selfplay 和 Train 算子，解决 JAX 编译耗时问题。
+    - **高 GPU 利用率**: 通过 `jax.pmap` 多设备分发和 `jax.lax.scan` 循环优化，确保 GPU 持续满载运行。
+- **顶级网络架构**: 
+    - **ResNet + SE**: 经典的残差网络结构，集成 **Squeeze-and-Excitation (SE)** 通道注意力机制（KataGo/Lc0 同款配置）。
+- **全方位监控**: 
+    - 实时统计胜负、四种细分和棋原因（步数超限、无吃子、三次重复、长将）。
+    - 监控平均对局长度、FPS（采样吞吐量）及标准 ELO 等级分演变。
 
 ## 快速开始
 
+### 1. 安装依赖
+确保已安装 JAX（建议配合 CUDA 使用）：
 ```bash
-# 安装依赖
-pip install -e .
+pip install -U jax jaxlib flax mctx optax chex
+```
 
-# 开始训练
+### 2. 开始训练
+直接运行主脚本即可启动：
+```bash
 python train.py
+```
 
-# 查看训练日志
+### 3. 可视化监控
+启动 TensorBoard 查看详细训练指标：
+```bash
 tensorboard --logdir logs
 ```
 
+## 技术规格
+
+- **观察空间**: `(240, 10, 9)`。包含 16 步历史轨迹，视角归一化后的棋子位置及步数信息。
+- **动作空间**: `2086`。经过压缩编码的中国象棋所有几何合法动作空间。
+- **默认配置**:
+    - **网络**: 256 通道 x 12 个 SE 残差块。
+    - **搜索**: 导师 96 次模拟 / 学生 32 次模拟。
+    - **批大小**: 512 (Selfplay) / 512 (Training)。
+
 ## 项目结构
 
-```
+```text
 ZeroForge/
-├── train.py           # 训练入口
-├── configs/
-│   └── default.yaml   # 配置文件
+├── train.py           # 训练入口：包含 Selfplay、Train、Evaluate 核心循环
 ├── networks/          # 神经网络
-│   ├── muzero.py      # MuZero 网络
-│   ├── convnext.py    # ConvNeXt 骨干
-│   └── heads.py       # 输出头
-├── xiangqi/           # 象棋环境
-│   ├── env.py         # JAX 环境
-│   ├── rules.py       # 规则
-│   ├── actions.py     # 动作编码
-│   └── mirror.py      # 数据增强
+│   └── alphazero.py   # AlphaZero 网络 (ResNet + SE)
+├── xiangqi/           # 象棋环境 (高性能 JAX 实现)
+│   ├── env.py         # 状态管理与视角归一化
+│   ├── rules.py       # 纯向量化规则校验
+│   ├── actions.py     # 动作压缩编码与解码
+│   └── mirror.py      # 左右镜像数据增强
 └── gui/
-    └── web_gui.py     # Gradio 人机对弈
+    └── web_gui.py     # 基于 Web 的人机对弈界面
 ```
 
-## 配置
+## 训练指标说明
 
-编辑 `configs/default.yaml`:
-
-```yaml
-# 并行游戏数 (根据显存调整)
-self_play:
-  num_parallel_games: 512
-
-# MCTS 模拟次数
-mcts:
-  num_simulations: 100
-
-# 训练
-training:
-  batch_size: 512
-  learning_rate: 0.0003
-```
-
-## 训练输出
-
-```
-[2026-01-11] ZeroForge - 中国象棋 Gumbel MuZero
-[2026-01-11] 设备: [CudaDevice(id=0), ...]
-[2026-01-11] TensorBoard: tensorboard --logdir logs
-[2026-01-11] 开始训练...
-[2026-01-11] step=512, loss=2.34, samples=51200, elo=1500.0
-[2026-01-11] 评估: elo=1523.5, win_rate=54.00%
-[2026-01-11] 检查点已保存: step=1000, elo=1523.5
-```
-
-## 技术细节
-
-### 算法
-- **Gumbel MuZero**: 使用 Gumbel-Top-k 技巧高效采样动作
-- **mctx**: Google DeepMind 的 MCTS 库
-
-### 网络架构
-- **Representation**: ConvNeXt 编码器
-- **Dynamics**: 预测下一状态
-- **Prediction**: 策略和价值头
-
-### 观察空间
-- 形状: `(240, 10, 9)`
-- 16 步历史 + 当前局面
-- 每步 14 个平面 (7 种棋子 × 2 方)
-
-### 动作空间
-- 大小: 2550
-- 编码: 起点 (90) × 终点 (90) 的子集
-
-## 依赖
-
-- JAX + CUDA
-- Flax
-- mctx
-- Optax
-- TensorBoard
+在控制台输出或 TensorBoard 中，您可以监控：
+- **ploss / vloss**: 策略和价值损失。
+- **len**: 平均对局步数。
+- **fps**: 每秒生成的采样帧数。
+- **和棋统计**: 区分“步数上限(步)”、“无吃子(抓)”、“三次重复(复)”和“长将(将)”。
+- **ELO**: 与过去模型对局评估出的强度等级。
 
 ## License
 
-MIT
+[MIT License](LICENSE)
