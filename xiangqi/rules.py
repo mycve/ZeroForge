@@ -218,23 +218,19 @@ def _is_valid_rook_move(
         step_r = jnp.where(steps > 0, jnp.sign(dr), 0)
         step_c = jnp.where(steps > 0, jnp.sign(dc), 0)
         
-        # 检查中间位置
-        def check_step(i, _):
-            check_row = from_row + step_r * i
-            check_col = from_col + step_c * i
-            return board[check_row, check_col] == EMPTY
-        
         # 检查从1到steps-1的所有位置
-        path_clear = True
-        for i in range(1, 10):  # 最多9格
-            pos_in_path = i < steps
-            check_row = from_row + step_r * i
-            check_col = from_col + step_c * i
-            # 边界检查
-            valid_pos = (check_row >= 0) & (check_row < BOARD_HEIGHT) & \
-                       (check_col >= 0) & (check_col < BOARD_WIDTH)
-            piece_at_pos = jnp.where(valid_pos, board[check_row, check_col], EMPTY)
-            path_clear = path_clear & (~pos_in_path | (piece_at_pos == EMPTY))
+        # 使用 vmap 替代 Python for 循环以减少编译图大小
+        i = jnp.arange(1, 10)
+        pos_in_path = i < steps
+        check_row = from_row + step_r * i
+        check_col = from_col + step_c * i
+        
+        # 安全索引：确保不会越界 (虽然 jnp.arange 1..10 且棋盘 10x9 很难越界，但习惯上应保持严谨)
+        check_row = jnp.clip(check_row, 0, BOARD_HEIGHT - 1)
+        check_col = jnp.clip(check_col, 0, BOARD_WIDTH - 1)
+        
+        pieces_at_pos = board[check_row, check_col]
+        path_clear = jnp.all(~pos_in_path | (pieces_at_pos == EMPTY))
         
         return path_clear
     
@@ -267,15 +263,14 @@ def _is_valid_cannon_move(
     step_r = jnp.where(steps > 0, jnp.sign(dr), 0)
     step_c = jnp.where(steps > 0, jnp.sign(dc), 0)
     
-    pieces_in_path = 0
-    for i in range(1, 10):
-        pos_in_path = i < steps
-        check_row = from_row + step_r * i
-        check_col = from_col + step_c * i
-        valid_pos = (check_row >= 0) & (check_row < BOARD_HEIGHT) & \
-                   (check_col >= 0) & (check_col < BOARD_WIDTH)
-        piece_at_pos = jnp.where(valid_pos, board[check_row, check_col], EMPTY)
-        pieces_in_path = pieces_in_path + jnp.where(pos_in_path & (piece_at_pos != EMPTY), 1, 0)
+    # 使用 vmap 替代 Python for 循环
+    i = jnp.arange(1, 10)
+    pos_in_path = i < steps
+    check_row = jnp.clip(from_row + step_r * i, 0, BOARD_HEIGHT - 1)
+    check_col = jnp.clip(from_col + step_c * i, 0, BOARD_WIDTH - 1)
+    
+    pieces_at_pos = board[check_row, check_col]
+    pieces_in_path = jnp.sum(jnp.where(pos_in_path & (pieces_at_pos != EMPTY), 1, 0))
     
     # 移动：路径上没有棋子，目标为空
     # 吃子：路径上恰好一个棋子（炮架）
@@ -439,28 +434,21 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     enemy = 1 - player
     
     # 检查所有敌方棋子是否能攻击到将/帅
-    in_check = jnp.bool_(False)
-    
-    for sq in range(NUM_SQUARES):
+    # 使用 vmap 替代 Python for 循环，大幅减少编译时的图节点数量
+    sqs = jnp.arange(NUM_SQUARES)
+    def check_sq_attack(sq):
         row = sq // BOARD_WIDTH
         col = sq % BOARD_WIDTH
         piece = board[row, col]
-        
-        # 是否为敌方棋子
         is_enemy = is_enemy_piece(piece, player)
-        
-        # 检查是否能攻击将/帅
         can_attack = is_valid_move_for_piece(
-            board, 
-            jnp.int32(row), jnp.int32(col),
-            king_row, king_col,
-            get_piece_type(piece),
-            enemy
+            board, row, col, king_row, king_col, get_piece_type(piece), enemy
         )
-        
-        in_check = in_check | (is_enemy & can_attack)
+        return is_enemy & can_attack
     
-    # 检查将帅对面（王见王）- 使用纯 JAX 操作，避免 Python if
+    in_check = jnp.any(jax.vmap(check_sq_attack)(sqs))
+    
+    # 检查将帅对面（王见王）
     enemy_king_row, enemy_king_col = find_king(board, enemy)
     same_col = (king_col == enemy_king_col)
     
@@ -468,12 +456,11 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     min_row = jnp.minimum(king_row, enemy_king_row)
     max_row = jnp.maximum(king_row, enemy_king_row)
     
-    # 统计两王之间的棋子数量
-    pieces_between = jnp.int32(0)
-    for r in range(10):
-        is_between = (r > min_row) & (r < max_row)
-        has_piece = board[r, king_col] != EMPTY
-        pieces_between = pieces_between + jnp.where(is_between & has_piece, 1, 0)
+    # 统计两王之间的棋子数量 (使用 vmap 替代 for)
+    rows = jnp.arange(10)
+    is_between = (rows > min_row) & (rows < max_row)
+    pieces_at_col = board[rows, king_col]
+    pieces_between = jnp.sum(jnp.where(is_between & (pieces_at_col != EMPTY), 1, 0))
     
     # 同列且中间无子则对面
     face_to_face = same_col & (pieces_between == 0)
