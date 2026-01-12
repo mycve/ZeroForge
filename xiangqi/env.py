@@ -194,13 +194,12 @@ class XiangqiEnv:
         self.perpetual_check_threshold = perpetual_check_threshold
     
     @partial(jax.jit, static_argnums=(0,))
-    def init(self, key: jax.random.PRNGKey, power_mode: jnp.int32 = 0) -> XiangqiState:
+    def init(self, key: jax.random.PRNGKey) -> XiangqiState:
         """
         初始化游戏状态
         
         Args:
             key: JAX 随机数密钥
-            power_mode: 算力模式
             
         Returns:
             初始游戏状态
@@ -226,7 +225,6 @@ class XiangqiEnv:
             no_capture_count=jnp.int32(0),
             winner=jnp.int32(-1),
             draw_reason=jnp.int32(0),
-            power_mode=power_mode,
             # 违规检测
             position_hashes=position_hashes,
             hash_count=jnp.int32(1),
@@ -401,7 +399,6 @@ class XiangqiEnv:
                 no_capture_count=new_no_capture,
                 winner=winner,
                 draw_reason=jnp.where(game_over, new_draw_reason, jnp.int32(0)),
-                power_mode=state.power_mode,
                 # 违规检测状态
                 position_hashes=new_position_hashes,
                 hash_count=new_hash_count,
@@ -549,12 +546,10 @@ class VectorizedXiangqiEnv:
         self.v_observe = jax.vmap(self.env.observe)
     
     @partial(jax.jit, static_argnums=(0,))
-    def init(self, key: jax.random.PRNGKey, power_modes: Optional[jnp.ndarray] = None) -> XiangqiState:
+    def init(self, key: jax.random.PRNGKey) -> XiangqiState:
         """批量初始化"""
         keys = jax.random.split(key, self.batch_size)
-        if power_modes is None:
-            power_modes = jnp.zeros(self.batch_size, dtype=jnp.int32)
-        return self.v_init(keys, power_modes)
+        return self.v_init(keys)
     
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: XiangqiState, actions: jnp.ndarray) -> XiangqiState:

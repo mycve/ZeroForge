@@ -441,8 +441,8 @@ def main():
     opt_state = optimizer.init(model[0])
     
     # 复制到所有设备
-    model = jax.device_put_replicated(model, devices)
-    opt_state = jax.device_put_replicated(opt_state, devices)
+    model = jax.device_put(model, jax.sharding.PositionalSharding(devices).replicate())
+    opt_state = jax.device_put(opt_state, jax.sharding.PositionalSharding(devices).replicate())
     
     os.makedirs(config.ckpt_dir, exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
