@@ -49,18 +49,18 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构 (轻量化：推理更快，初期收敛更高效)
-    num_channels: int = 128
-    num_blocks: int = 8
+    # 网络架构
+    num_channels: int = 256
+    num_blocks: int = 12
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 512  # 配合轻量化模型，减小 batch size 增加更新频率
+    training_batch_size: int = 512
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    strong_simulations: int = 96     # 导师算力从 256 降至 64
-    weak_simulations: int = 16       # 学生算力从 32 降至 16
+    strong_simulations: int = 96
+    weak_simulations: int = 32       # 提升学生算力，提供更有质量的辅助信号
     max_num_considered_actions: int = 16
     
     # 探索策略
@@ -68,8 +68,8 @@ class Config:
     temperature_initial: float = 1.0
     temperature_final: float = 0.01
     
-    # 环境规则 (对局步数合理化)
-    max_steps: int = 200             # 从 400 降至 200
+    # 环境规则
+    max_steps: int = 400
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     perpetual_check_threshold: int = 6
@@ -255,10 +255,10 @@ def loss_fn(params, batch_stats, samples: Sample, rng_key):
     
     (logits, value), new_batch_stats = forward(params, batch_stats, obs, is_training=True)
     
-    # 策略损失 (只学导师)
+    # 策略损失 (导师 1.0 权重，学生 0.1 权重辅助训练)
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
-    num_strong = jnp.maximum(jnp.sum(is_strong), 1.0)
-    policy_loss = jnp.sum(policy_ce * is_strong) / num_strong
+    weights = jnp.where(is_strong, 1.0, 0.1)
+    policy_loss = jnp.sum(policy_ce * weights) / jnp.maximum(jnp.sum(weights), 1.0)
     
     # 价值损失 (全学)
     value_loss = jnp.sum(optax.l2_loss(value, samples.value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
@@ -389,6 +389,8 @@ def main():
     writer = SummaryWriter(config.log_dir)
     
     iteration, frames = 0, 0
+    start_time_total = time.time()
+    
     while True:
         iteration += 1
         st = time.time()
@@ -397,15 +399,30 @@ def main():
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
-        # 现在 data 形状恢复为 [num_devices, max_steps, batch_per_device]
         term = data_np.terminated
         winner = data_np.winner
+        reasons = data_np.draw_reason
         
-        # 统计结果
+        # --- 增强版数据统计 ---
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
-        r = int((first_term & (winner == 0)).sum())
-        b = int((first_term & (winner == 1)).sum())
-        d = int((first_term & (winner == -1)).sum())
+        num_games = int(first_term.sum())
+        
+        # 1. 胜负平基础统计
+        r_wins = int((first_term & (winner == 0)).sum())
+        b_wins = int((first_term & (winner == 1)).sum())
+        draws = int((first_term & (winner == -1)).sum())
+        
+        # 2. 和棋原因细分 (1=步数, 2=无吃子, 3=重复, 4=长将)
+        d_max_steps = int((first_term & (reasons == 1)).sum())
+        d_no_capture = int((first_term & (reasons == 2)).sum())
+        d_repetition = int((first_term & (reasons == 3)).sum())
+        d_perpetual = int((first_term & (reasons == 4)).sum())
+        
+        # 3. 对局长度
+        # 找到每个对局结束时的步数
+        game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
+        final_lengths = jnp.min(game_lengths, axis=1)
+        avg_length = float(jnp.mean(final_lengths))
         
         samples_flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), jax.device_get(samples))
         frames += samples_flat.obs.shape[0]
@@ -422,9 +439,27 @@ def main():
             model, opt_state, ploss, vloss = train_step(model, opt_state, batch, jax.random.split(sk4, num_devices))
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
-        print(f"iter={iteration}, ploss={np.mean(policy_losses):.4f}, vloss={np.mean(value_losses):.4f}, frames={frames}, time={time.time()-st:.1f}s | 自玩: {r+b+d}局 红{r} 黑{b} 和{d}")
+        # --- 打印与日志 ---
+        iter_time = time.time() - st
+        fps = samples_flat.obs.shape[0] / iter_time
+        
+        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
+              f"len={avg_length:4.1f} fps={fps:4.0f} | "
+              f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d} (步{d_max_steps}/抓{d_no_capture}/复{d_repetition}/将{d_perpetual})")
+        
+        # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
         writer.add_scalar("train/value_loss", np.mean(value_losses), iteration)
+        writer.add_scalar("stats/avg_game_length", avg_length, iteration)
+        writer.add_scalar("stats/fps", fps, iteration)
+        writer.add_scalar("stats/win_rate_red", r_wins / max(1, num_games), iteration)
+        writer.add_scalar("stats/draw_rate", draws / max(1, num_games), iteration)
+        
+        if draws > 0:
+            writer.add_scalar("draw_reasons/max_steps", d_max_steps / draws, iteration)
+            writer.add_scalar("draw_reasons/no_capture", d_no_capture / draws, iteration)
+            writer.add_scalar("draw_reasons/repetition", d_repetition / draws, iteration)
+            writer.add_scalar("draw_reasons/perpetual_check", d_perpetual / draws, iteration)
         
         if iteration % 10 == 0:
             model_np = jax.device_get(jax.tree.map(lambda x: x[0], model))
