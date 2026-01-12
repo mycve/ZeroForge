@@ -279,9 +279,25 @@ def evaluate(model_red, model_black, rng_key):
     params_b, stats_b = model_black
     batch_size = config.eval_games // num_devices
     
+    def evaluate_recurrent_fn(models, rng_key, action, state):
+        m_red, m_black = models
+        # 分别计算两个模型的输出
+        out_red, next_state = recurrent_fn(m_red, rng_key, action, state)
+        out_black, _ = recurrent_fn(m_black, rng_key, action, state)
+        # 根据搜索模型索引进行合并
+        use_red = state.search_model_index == 0
+        out = jax.tree.map(
+            lambda r, b: jnp.where(use_red[:, None] if r.ndim > 1 else use_red, r, b),
+            out_red, out_black
+        )
+        return out, next_state
+    
     def step_fn(state, key):
-        obs = jax.vmap(env.observe)(state)
+        # 在根节点确定当前搜索归属于哪个模型
         is_red = state.current_player == 0
+        state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
+        
+        obs = jax.vmap(env.observe)(state)
         (logits_r, value_r), _ = forward(params_r, stats_r, obs)
         (logits_b, value_b), _ = forward(params_b, stats_b, obs)
         
@@ -296,7 +312,7 @@ def evaluate(model_red, model_black, rng_key):
         
         policy_output = mctx.gumbel_muzero_policy(
             params=(model_red, model_black), rng_key=key, root=root,
-            recurrent_fn=lambda ms, k, a, s: recurrent_fn(ms[0] if s.current_player[0]==0 else ms[1], k, a, s),
+            recurrent_fn=evaluate_recurrent_fn,
             num_simulations=96, max_num_considered_actions=16, invalid_actions=~state.legal_action_mask,
         )
         next_state = jax.vmap(env.step)(state, policy_output.action)

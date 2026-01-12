@@ -9,20 +9,14 @@ from typing import Optional, Callable, Tuple, List
 from dataclasses import dataclass
 import json
 
-# JAX 导入
-try:
-    import jax
-    import jax.numpy as jnp
-    from xiangqi.env import XiangqiEnv, XiangqiState
-    from xiangqi.rules import (
-        get_legal_moves_mask, is_in_check, find_king,
-        BOARD_WIDTH, BOARD_HEIGHT
-    )
-    from xiangqi.actions import move_to_action, action_to_move
-    JAX_AVAILABLE = True
-except ImportError as e:
-    print(f"[Web GUI] JAX 导入失败: {e}")
-    JAX_AVAILABLE = False
+import jax
+import jax.numpy as jnp
+from xiangqi.env import XiangqiEnv, XiangqiState
+from xiangqi.rules import (
+    get_legal_moves_mask, is_in_check, find_king,
+    BOARD_WIDTH, BOARD_HEIGHT
+)
+from xiangqi.actions import move_to_action, action_to_move
 
 # ============================================================================
 # 常量定义
@@ -342,8 +336,8 @@ class ChessGame:
     """象棋游戏逻辑"""
     
     def __init__(self):
-        self.env = XiangqiEnv() if JAX_AVAILABLE else None
-        self._rng_key = jax.random.PRNGKey(42) if JAX_AVAILABLE else None
+        self.env = XiangqiEnv()
+        self._rng_key = jax.random.PRNGKey(42)
         self.state: Optional[GameState] = None
         self.ai_callback: Optional[Callable] = None
         self.ai_player: int = 1  # AI 默认执黑
@@ -351,10 +345,8 @@ class ChessGame:
     def new_game(self, fen: str = STARTING_FEN) -> GameState:
         """开始新游戏"""
         board, player = parse_fen(fen)
-        
-        jax_state = None
-        if JAX_AVAILABLE:
-            jax_state = self._create_jax_state(board, player)
+
+        jax_state = self._create_jax_state(board, player)
         
         self.state = GameState(
             board=board,
@@ -380,7 +372,7 @@ class ChessGame:
     
     def _update_check_status(self):
         """更新将军状态"""
-        if not JAX_AVAILABLE or self.state is None:
+        if self.state is None:
             return
         
         jax_board = jnp.array(self.state.board, dtype=jnp.int8)
@@ -395,7 +387,7 @@ class ChessGame:
     
     def get_legal_moves(self, row: int, col: int) -> List[Tuple[int, int]]:
         """获取指定位置棋子的合法走法"""
-        if not JAX_AVAILABLE or self.state is None:
+        if self.state is None:
             return []
         
         piece = self.state.board[row, col]
@@ -453,9 +445,7 @@ class ChessGame:
     
     def _make_move(self, from_row: int, from_col: int, to_row: int, to_col: int):
         """执行走棋"""
-        if not JAX_AVAILABLE:
-            return
-        
+
         # 保存历史
         self.state.history.append({
             'board': self.state.board.copy(),
