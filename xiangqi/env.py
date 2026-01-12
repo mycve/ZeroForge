@@ -372,7 +372,7 @@ class XiangqiEnv:
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([-0.05, -0.05]),  # 和棋：微小惩罚
+                    jnp.zeros(2),  # 平局必须为严格 0，否则会破坏 V = -V' 的零和逻辑
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜

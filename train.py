@@ -50,8 +50,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构
-    num_channels: int = 256
-    num_blocks: int = 12
+    num_channels: int = 128
+    num_blocks: int = 8
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -69,7 +69,7 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则
-    max_steps: int = 400
+    max_steps: int = 200
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     perpetual_check_threshold: int = 6
@@ -263,12 +263,12 @@ def loss_fn(params, batch_stats, samples: Sample, rng_key):
     # 价值损失 (全学)
     value_loss = jnp.sum(optax.l2_loss(value, samples.value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 熵损失 (防止模型变僵硬，保持顶级 AI 的灵活性)
+    # 熵损失 (保持一定的灵活性，但不宜过高)
     probs = jax.nn.softmax(logits)
     entropy = -jnp.sum(probs * jax.nn.log_softmax(logits), axis=-1)
-    entropy_loss = -0.01 * jnp.mean(entropy)
+    entropy_loss = -0.001 * jnp.mean(entropy)
     
-    total_loss = policy_loss + 0.5 * value_loss + entropy_loss
+    total_loss = policy_loss + 1.5 * value_loss + entropy_loss
     
     return total_loss, (new_batch_stats, policy_loss, value_loss)
 
