@@ -150,94 +150,151 @@ class Sample(NamedTuple):
     is_strong: jnp.ndarray
 
 # ============================================================================
-# 自玩
+# 自玩 (编译边界拆分优化版)
 # ============================================================================
 
-@jax.pmap
-def selfplay(model, rng_key):
+# --- 独立 JIT 单元 1: 神经网络推理 + 根节点准备 ---
+@partial(jax.jit, static_argnames=['batch_size'])
+def _prepare_root(params, batch_stats, state, noise_keys, batch_size):
+    """准备 MCTS 根节点（独立编译单元）"""
+    obs = jax.vmap(env.observe)(state)
+    (logits, value), _ = forward(params, batch_stats, obs)
+    
+    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+    rotated_idx = rotate_action(rotate_idx)
+    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
+    
+    def _add_noise(l, k):
+        noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
+        p = jax.nn.softmax(l)
+        return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
+    
+    logits = jax.vmap(_add_noise)(logits, noise_keys)
+    root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+    return obs, root
+
+# --- 独立 JIT 单元 2: MCTS 搜索 (导师/强) ---
+@partial(jax.jit, static_argnames=['num_simulations', 'max_considered'])
+def _mcts_search(model, rng_key, root, invalid_actions, num_simulations, max_considered):
+    """执行 MCTS 搜索（独立编译单元）"""
+    return mctx.gumbel_muzero_policy(
+        params=model, rng_key=rng_key, root=root, recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_considered,
+        invalid_actions=invalid_actions,
+    )
+
+# --- 独立 JIT 单元 3: 动作选择 + 状态更新 ---
+@partial(jax.jit, static_argnames=['batch_size'])
+def _select_and_step(state, action_weights_strong, action_weights_weak, is_strong_step, 
+                     temp, sample_keys, next_keys, batch_size):
+    """选择动作并更新状态（独立编译单元）"""
+    action_weights = jnp.where(is_strong_step[:, None], action_weights_strong, action_weights_weak)
+    
+    def _sample_action(w, t, k):
+        t = jnp.maximum(t, 1e-3)
+        w_temp = jnp.power(w + 1e-10, 1.0 / t)
+        return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+    
+    action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
+    
+    actor = state.current_player
+    next_state = jax.vmap(env.step)(state, action)
+    
+    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
+    rotated_idx = rotate_action(rotate_idx)
+    normalized_action_weights = jnp.where(state.current_player[:, None] == 0, action_weights, action_weights[:, rotated_idx])
+    
+    # 重置已终止的游戏
+    next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s))(next_state, next_keys)
+    
+    return next_state, next_state_reset, action, actor, normalized_action_weights
+
+# --- 主自玩函数 (使用 Python 循环 + 小 JIT 单元) ---
+def selfplay_step(model, state, is_red_strong, rng_key, batch_size):
+    """单步自玩（不使用 scan，便于调试和快速编译）"""
+    key_noise, key_search, key_sample, key_next = jax.random.split(rng_key, 4)
     params, batch_stats = model
+    
+    # 1. 准备根节点
+    noise_keys = jax.random.split(key_noise, batch_size)
+    obs, root = _prepare_root(params, batch_stats, state, noise_keys, batch_size)
+    
+    # 2. MCTS 搜索 (强/弱分开，便于编译缓存)
+    k1, k2 = jax.random.split(key_search)
+    policy_strong = _mcts_search(model, k1, root, ~state.legal_action_mask, 
+                                  config.strong_simulations, config.max_num_considered_actions)
+    policy_weak = _mcts_search(model, k2, root, ~state.legal_action_mask,
+                                config.weak_simulations, config.max_num_considered_actions)
+    
+    # 3. 选择动作并更新
+    is_strong_step = jnp.where(state.current_player == 0, is_red_strong, ~is_red_strong)
+    temp = jnp.where(state.step_count < config.temperature_steps, config.temperature_initial, config.temperature_final)
+    
+    sample_keys = jax.random.split(key_sample, batch_size)
+    next_keys = jax.random.split(key_next, batch_size)
+    
+    next_state, next_state_reset, action, actor, normalized_action_weights = _select_and_step(
+        state, policy_strong.action_weights, policy_weak.action_weights,
+        is_strong_step, temp, sample_keys, next_keys, batch_size
+    )
+    
+    # 构造输出数据
+    data = SelfplayOutput(
+        obs=obs, action_weights=normalized_action_weights,
+        reward=next_state.rewards[jnp.arange(batch_size), actor],
+        terminated=next_state.terminated,
+        discount=jnp.where(next_state.terminated, 0.0, -1.0),
+        winner=next_state.winner, draw_reason=next_state.draw_reason,
+        is_strong=is_strong_step
+    )
+    
+    return next_state_reset, data
+
+def selfplay(model, rng_key, device_id=0):
+    """完整自玩（Python 循环，每步独立 JIT，大幅减少编译时间）"""
     batch_size = config.selfplay_batch_size // num_devices
     
     rng_key, subkey = jax.random.split(rng_key)
-    # 导师分配：每局固定
     is_red_strong = jax.random.bernoulli(subkey, 0.5, shape=(batch_size,))
     
-    def step_fn(state, key):
-        key_noise, key_search, key_sample, key_next = jax.random.split(key, 4)
-        obs = jax.vmap(env.observe)(state)
-        (logits, value), _ = forward(params, batch_stats, obs)
-        
-        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-        rotated_idx = rotate_action(rotate_idx)
-        logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
-        
-        def _add_noise(l, k):
-            noise = jax.random.dirichlet(k, jnp.ones(ACTION_SPACE_SIZE) * 0.3)
-            p = jax.nn.softmax(l)
-            return jnp.log(0.75 * p + 0.25 * noise + 1e-10)
-        
-        noise_keys = jax.random.split(key_noise, batch_size)
-        logits = jax.vmap(_add_noise)(logits, noise_keys)
-        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-        
-        is_strong_step = jnp.where(state.current_player == 0, is_red_strong, ~is_red_strong)
-        
-        k1, k2 = jax.random.split(key_search)
-        policy_output_strong = mctx.gumbel_muzero_policy(
-            params=model, rng_key=k1, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=config.strong_simulations,
-            max_num_considered_actions=config.max_num_considered_actions,
-            invalid_actions=~state.legal_action_mask,
-        )
-        policy_output_weak = mctx.gumbel_muzero_policy(
-            params=model, rng_key=k2, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=config.weak_simulations,
-            max_num_considered_actions=config.max_num_considered_actions,
-            invalid_actions=~state.legal_action_mask,
-        )
-        
-        action_weights = jnp.where(is_strong_step[:, None], policy_output_strong.action_weights, policy_output_weak.action_weights)
-        
-        temp = jnp.where(state.step_count < config.temperature_steps, config.temperature_initial, config.temperature_final)
-        def _sample_action(w, t, k):
-            t = jnp.maximum(t, 1e-3)
-            w_temp = jnp.power(w + 1e-10, 1.0 / t)
-            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
-        
-        sample_keys = jax.random.split(key_sample, batch_size)
-        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
-        
-        actor = state.current_player
-        next_state = jax.vmap(env.step)(state, action)
-        
-        normalized_action_weights = jnp.where(state.current_player[:, None] == 0, action_weights, action_weights[:, rotated_idx])
-        
-        data = SelfplayOutput(
-            obs=obs, action_weights=normalized_action_weights,
-            reward=next_state.rewards[jnp.arange(batch_size), actor],
-            terminated=next_state.terminated,
-            discount=jnp.where(next_state.terminated, 0.0, -1.0),
-            winner=next_state.winner, draw_reason=next_state.draw_reason,
-            is_strong=is_strong_step
-        )
-        
-        next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(s.terminated, lambda: env.init(k), lambda: s))(next_state, jax.random.split(key_next, batch_size))
-        return next_state_reset, data
-
+    # 初始化状态
     state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
-    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
-    return data
+    
+    # Python 循环收集数据（避免 scan 的巨大编译图）
+    all_data = []
+    step_keys = jax.random.split(rng_key, config.max_steps)
+    
+    for step_idx in range(config.max_steps):
+        state, data = selfplay_step(model, state, is_red_strong, step_keys[step_idx], batch_size)
+        all_data.append(data)
+    
+    # 堆叠所有步骤的数据
+    stacked_data = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *all_data)
+    return stacked_data
+
+# --- pmap 包装器 (用于多设备并行) ---
+@jax.pmap
+def selfplay_pmap(model, rng_key):
+    """多设备并行自玩包装器"""
+    return selfplay(model, rng_key)
+
+# --- 独立 JIT 单元: 计算价值目标 ---
+@partial(jax.jit, static_argnames=['batch_size', 'max_steps'])
+def _compute_targets_impl(data: SelfplayOutput, batch_size: int, max_steps: int):
+    """计算价值目标（独立编译单元）"""
+    value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
+    def body_fn(carry, i):
+        ix = max_steps - i - 1
+        v = data.reward[ix] + data.discount[ix] * carry
+        return v, v
+    _, value_tgt = jax.lax.scan(body_fn, jnp.zeros(batch_size), jnp.arange(max_steps))
+    return Sample(obs=data.obs, policy_tgt=data.action_weights, value_tgt=value_tgt[::-1, :], mask=value_mask, is_strong=data.is_strong)
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
     batch_size = config.selfplay_batch_size // num_devices
-    value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
-    def body_fn(carry, i):
-        ix = config.max_steps - i - 1
-        v = data.reward[ix] + data.discount[ix] * carry
-        return v, v
-    _, value_tgt = jax.lax.scan(body_fn, jnp.zeros(batch_size), jnp.arange(config.max_steps))
-    return Sample(obs=data.obs, policy_tgt=data.action_weights, value_tgt=value_tgt[::-1, :], mask=value_mask, is_strong=data.is_strong)
+    return _compute_targets_impl(data, batch_size, config.max_steps)
 
 # ============================================================================
 # 训练与评估
@@ -335,27 +392,66 @@ def main():
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state)
         return (optax.apply_updates(params, updates), new_batch_stats), opt_state, ploss, vloss
 
-    # --- 极简顶级优化：启动即并行编译所有核心算子 ---
-    print("正在并行预编译 JAX Selfplay / Train 算子...")
+    # --- 拆分编译边界：分步预编译，大幅减少编译时间 ---
+    print("正在分步预编译 JAX 算子（拆分边界优化）...")
     comp_st = time.time()
     dummy_key = jax.random.PRNGKey(0)
     dummy_keys = jax.random.split(dummy_key, num_devices)
+    batch_size = config.selfplay_batch_size // num_devices
     
-    # 1. 编译 Selfplay
-    dummy_data = selfplay(model, dummy_keys)
+    # 取第一个设备的模型用于预编译
+    model_single = jax.tree.map(lambda x: x[0], model)
+    
+    # 1. 预编译 _prepare_root (神经网络推理)
+    print("  [1/5] 编译神经网络推理...")
+    t1 = time.time()
+    dummy_state = jax.vmap(env.init)(jax.random.split(dummy_key, batch_size))
+    dummy_noise_keys = jax.random.split(dummy_key, batch_size)
+    params, batch_stats = model_single
+    _ = _prepare_root(params, batch_stats, dummy_state, dummy_noise_keys, batch_size)
+    print(f"      完成，耗时: {time.time()-t1:.1f}s")
+    
+    # 2. 预编译 _mcts_search (MCTS 搜索 - 这是主要耗时的部分)
+    print("  [2/5] 编译 MCTS 搜索 (强)...")
+    t2 = time.time()
+    _, dummy_root = _prepare_root(params, batch_stats, dummy_state, dummy_noise_keys, batch_size)
+    _ = _mcts_search(model_single, dummy_key, dummy_root, ~dummy_state.legal_action_mask,
+                     config.strong_simulations, config.max_num_considered_actions)
+    print(f"      完成，耗时: {time.time()-t2:.1f}s")
+    
+    print("  [3/5] 编译 MCTS 搜索 (弱)...")
+    t3 = time.time()
+    _ = _mcts_search(model_single, dummy_key, dummy_root, ~dummy_state.legal_action_mask,
+                     config.weak_simulations, config.max_num_considered_actions)
+    print(f"      完成，耗时: {time.time()-t3:.1f}s")
+    
+    # 3. 预编译 _select_and_step
+    print("  [4/5] 编译动作选择与状态更新...")
+    t4 = time.time()
+    dummy_weights = jnp.ones((batch_size, ACTION_SPACE_SIZE)) / ACTION_SPACE_SIZE
+    dummy_is_strong = jnp.ones(batch_size, dtype=bool)
+    dummy_temp = jnp.ones(batch_size)
+    dummy_sample_keys = jax.random.split(dummy_key, batch_size)
+    dummy_next_keys = jax.random.split(dummy_key, batch_size)
+    _ = _select_and_step(dummy_state, dummy_weights, dummy_weights, dummy_is_strong,
+                         dummy_temp, dummy_sample_keys, dummy_next_keys, batch_size)
+    print(f"      完成，耗时: {time.time()-t4:.1f}s")
+    
+    # 4. 预编译 train_step
+    print("  [5/5] 编译训练步骤...")
+    t5 = time.time()
+    # 运行一次完整自玩来获取正确形状的数据
+    dummy_data = selfplay_pmap(model, dummy_keys)
     dummy_samples = compute_targets(dummy_data)
-    
-    # 2. 编译 Train Step (模拟展平后的训练批次形状)
-    # 取一个标准训练批次的大小进行预热
     batch_per_device = config.training_batch_size // num_devices
-    # 抽取 dummy_samples 中的一小部分并变形为 [num_devices, batch_per_device, C, H, W]
     dummy_batch = jax.tree.map(
         lambda x: x[:, 0, :batch_per_device].reshape((num_devices, batch_per_device) + x.shape[3:]), 
         dummy_samples
     )
     _ = train_step(model, opt_state, dummy_batch, dummy_keys)
+    print(f"      完成，耗时: {time.time()-t5:.1f}s")
     
-    print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
+    print(f"预编译完成，总耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
     os.makedirs(config.ckpt_dir, exist_ok=True)
     writer = SummaryWriter(config.log_dir)
@@ -365,7 +461,7 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        data = selfplay(model, jax.random.split(sk1, num_devices))
+        data = selfplay_pmap(model, jax.random.split(sk1, num_devices))
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
