@@ -360,13 +360,13 @@ class XiangqiEnv:
             # ========== 计算奖励 ==========
             
             # 2. 终局奖励
-            # 胜: +1, 负: -1
-            # 和棋: 0.0
+            # 现代化价值映射：胜: +1, 负: -1, 和棋: -0.05
+            # 微小的平局惩罚强迫模型在僵局中寻求突破
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([0.0, 0.0]),  # 和棋：零奖励
+                    jnp.array([-0.05, -0.05]),  # 和棋：微小惩罚
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
