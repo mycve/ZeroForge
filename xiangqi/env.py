@@ -77,9 +77,6 @@ class XiangqiState:
     # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=三次重复, 4=长将
     draw_reason: jnp.int32
     
-    # 算力模式 (用于非对称自对弈): 0=双方正常, 1=强红弱黑, 2=弱红强黑
-    power_mode: jnp.int32
-    
     # === 违规检测相关 ===
     
     # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32 - 用于重复局面检测
@@ -381,23 +378,10 @@ class XiangqiEnv:
                 jnp.zeros(2)
             )
             
-            # 3. 总奖励 = 终局奖励 + 极其微小的子力奖励 (引导模型学会吃子)
-            # 价值: 帅/将=0, 士/象=2, 马=4, 车=9, 炮=4.5, 兵=1
-            # 这里的奖励必须极小 (0.01级别)，不能干扰终局判胜
-            piece_values = jnp.array([0, 0, 2, 2, 4, 9, 4.5, 1], dtype=jnp.float32)
-            piece_type = get_piece_type(captured_piece)
-            capture_reward_val = piece_values[piece_type] * 0.01
-            
-            # 给当前出手方加分
-            material_reward = jnp.where(
-                is_capture,
-                jnp.where(state.current_player == 0, 
-                          jnp.array([capture_reward_val, -capture_reward_val]), 
-                          jnp.array([-capture_reward_val, capture_reward_val])),
-                jnp.zeros(2)
-            )
-            
-            rewards = terminal_reward + material_reward
+            # 3. 总奖励 = 终局奖励
+            # 3. 总奖励 = 终局奖励
+            # 纯血 AlphaZero 逻辑：奖励只在对局结束时产生 (1, -1, 0)
+            rewards = terminal_reward
             
             # 获取新的合法动作
             new_legal_mask = jnp.where(

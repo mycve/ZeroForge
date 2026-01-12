@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import pickle
+import numpy as np
 from functools import partial
 from typing import NamedTuple
 
@@ -31,6 +32,7 @@ except ImportError:
 
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
+from xiangqi.mirror import mirror_observation, mirror_policy
 from networks.alphazero import AlphaZeroNetwork
 
 # ============================================================================
@@ -60,10 +62,6 @@ class Config:
     temperature_initial: float = 1.0
     temperature_final: float = 0.01
     
-    # 非对称自对弈 (破局核心)
-    asymmetric_ratio: float = 0.5   # 50% 的对局使用非对称算力
-    weak_simulations: int = 1       # 弱方模拟次数
-    
     # 环境规则 (统一管理)
     max_steps: int = 400            # 总步数限制
     max_no_capture_steps: int = 60  # 无吃子步数限制 (强制进攻)
@@ -76,6 +74,9 @@ class Config:
     # ELO 评估
     eval_interval: int = 20          # 每隔多少 iteration 评估一次
     eval_games: int = 64            # 评估对局数
+    
+    # 历史评估
+    past_model_offset: int = 40      # 与 40 代前的自己对战
 
 config = Config()
 
@@ -252,7 +253,6 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    power_mode: jnp.ndarray
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -297,16 +297,12 @@ def selfplay(model, rng_key):
         # 准备 MCTS 根节点
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
-        # 非对称算力判定
-        is_weak_step = ((state.power_mode == 1) & (state.current_player == 1)) | \
-                       ((state.power_mode == 2) & (state.current_player == 0))
+        # 搜索
+        key_search, _ = jax.random.split(key_search)
         
-        # 搜索 (mctx 内部会自动处理 root 的 batch_size)
-        key_s1, key_s2 = jax.random.split(key_search)
-        
-        policy_output_strong = mctx.gumbel_muzero_policy(
+        policy_output = mctx.gumbel_muzero_policy(
             params=model,
-            rng_key=key_s1, # 传入单一种子
+            rng_key=key_search,
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
@@ -314,18 +310,8 @@ def selfplay(model, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
-        policy_output_weak = mctx.gumbel_muzero_policy(
-            params=model,
-            rng_key=key_s2, # 传入单一种子
-            root=root,
-            recurrent_fn=recurrent_fn,
-            num_simulations=config.weak_simulations,
-            max_num_considered_actions=config.max_num_considered_actions,
-            invalid_actions=~state.legal_action_mask,
-        )
-        
-        # 合并结果
-        action_weights = jnp.where(is_weak_step[:, None], policy_output_weak.action_weights, policy_output_strong.action_weights)
+        # 记录结果
+        action_weights = policy_output.action_weights
         
         # 温度采样选择最终 Action
         temp = jnp.where(state.step_count < config.temperature_steps, 
@@ -361,16 +347,12 @@ def selfplay(model, rng_key):
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner,
             draw_reason=next_state.draw_reason,
-            power_mode=state.power_mode,
         )
         
         # 检查是否需要 reset
         def _reset_fn(s, k):
-            k1, k2 = jax.random.split(k)
-            r = jax.random.uniform(k1)
-            new_mode = jnp.where(r < config.asymmetric_ratio / 2, 1, 
-                                jnp.where(r < config.asymmetric_ratio, 2, 0))
-            return jax.lax.cond(s.terminated, lambda: env.init(k2, new_mode), lambda: s)
+            _, k2 = jax.random.split(k)
+            return jax.lax.cond(s.terminated, lambda: env.init(k2), lambda: s)
         
         reset_keys = jax.random.split(key_next, batch_size)
         next_state_reset = jax.vmap(_reset_fn)(next_state, reset_keys)
@@ -380,13 +362,7 @@ def selfplay(model, rng_key):
     rng_key, subkey = jax.random.split(rng_key)
     keys = jax.random.split(subkey, batch_size)
     
-    # 初始算力模式分配
-    mode_key, _ = jax.random.split(rng_key)
-    r = jax.random.uniform(mode_key, (batch_size,))
-    init_modes = jnp.where(r < config.asymmetric_ratio / 2, 1, 
-                          jnp.where(r < config.asymmetric_ratio, 2, 0))
-    
-    state = jax.vmap(env.init)(keys, init_modes)
+    state = jax.vmap(env.init)(keys)
     
     _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
     return data
@@ -410,8 +386,17 @@ def compute_targets(data: SelfplayOutput):
 # 训练
 # ============================================================================
 
-def loss_fn(params, batch_stats, samples: Sample):
-    (logits, value), new_batch_stats = forward(params, batch_stats, samples.obs, is_training=True)
+def loss_fn(params, batch_stats, samples: Sample, rng_key):
+    obs, policy_tgt = samples.obs, samples.policy_tgt
+    
+    # --- 镜像增强 (Data Augmentation) ---
+    # 以 50% 概率对整个 batch 进行左右镜像翻转
+    do_mirror = jax.random.bernoulli(rng_key, 0.5)
+    
+    obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
+    policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
+    
+    (logits, value), new_batch_stats = forward(params, batch_stats, obs, is_training=True)
     
     # 策略损失
     policy_loss = jnp.mean(optax.softmax_cross_entropy(logits, samples.policy_tgt))
@@ -446,8 +431,10 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     model = (variables['params'], variables['batch_stats'])
     
-    # 保存初始模型作为评估基准
-    initial_model = jax.device_put_replicated(model, devices)
+    # ELO 评估历史记录
+    history_models = {0: jax.device_get(model)}
+    # 设置所有 Iteration 的初始 ELO 为 1500
+    iteration_elos = {0: 1500.0}
     
     # 优化器
     optimizer = optax.adam(config.learning_rate)
@@ -466,9 +453,9 @@ def main():
     
     # pmap 训练函数
     @partial(jax.pmap, axis_name='i')
-    def train_step(model, opt_state, samples):
+    def train_step(model, opt_state, samples, rng_key):
         params, batch_stats = model
-        grads, (new_batch_stats, ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, batch_stats, samples)
+        grads, (new_batch_stats, ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, batch_stats, samples, rng_key)
         grads = jax.lax.pmean(grads, axis_name='i')
         updates, opt_state = optimizer.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
@@ -490,21 +477,12 @@ def main():
         data_np = jax.device_get(data)
         term = data_np.terminated  # (D, T, B)
         winner = data_np.winner    # (D, T, B)
-        p_mode = data_np.power_mode # (D, T, B)
         
         # 沿时间轴找第一次结束
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         r = int((first_term & (winner == 0)).sum())
         b = int((first_term & (winner == 1)).sum())
         d = int((first_term & (winner == -1)).sum())
-        
-        # 统计非对称局的胜率
-        # 模式 1 (强红弱黑) 下红胜
-        mode1_r_wins = int((first_term & (p_mode == 1) & (winner == 0)).sum())
-        mode1_total = int((first_term & (p_mode == 1)).sum())
-        # 模式 2 (弱红强黑) 下黑胜
-        mode2_b_wins = int((first_term & (p_mode == 2) & (winner == 1)).sum())
-        mode2_total = int((first_term & (p_mode == 2)).sum())
         
         # 细分和棋原因
         reason = data_np.draw_reason
@@ -538,7 +516,9 @@ def main():
         policy_losses, value_losses = [], []
         for i in range(num_updates):
             batch = jax.tree.map(lambda x: x[i], minibatches)
-            model, opt_state, ploss, vloss = train_step(model, opt_state, batch)
+            rng_key, subkey = jax.random.split(rng_key)
+            train_keys = jax.random.split(subkey, num_devices)
+            model, opt_state, ploss, vloss = train_step(model, opt_state, batch, train_keys)
             policy_losses.append(float(ploss.mean()))
             value_losses.append(float(vloss.mean()))
         
@@ -567,48 +547,70 @@ def main():
         writer.add_scalar("selfplay/draw_threefold", d_three, iteration)
         writer.add_scalar("selfplay/draw_perpetual", d_perp, iteration)
         writer.add_scalar("selfplay/avg_steps", avg_steps, iteration)
-        
-        # 记录非对称局表现
-        if mode1_total > 0:
-            writer.add_scalar("asymmetric/strong_red_win_rate", mode1_r_wins / mode1_total, iteration)
-        if mode2_total > 0:
-            writer.add_scalar("asymmetric/strong_black_win_rate", mode2_b_wins / mode2_total, iteration)
-        
         writer.add_scalar("stats/frames", frames, iteration)
         
         # 保存
         if iteration % 10 == 0:
             model_save = jax.tree.map(lambda x: x[0], model)
-            ckpt = {'model': jax.device_get(model_save), 'iteration': iteration, 'frames': frames}
+            model_np = jax.device_get(model_save)
+            ckpt = {'model': model_np, 'iteration': iteration, 'frames': frames}
             path = os.path.join(config.ckpt_dir, f"ckpt_{iteration:06d}.pkl")
             with open(path, 'wb') as f:
                 pickle.dump(ckpt, f)
             print(f"已保存: {path}")
             writer.flush()
+            # 存入评估历史
+            history_models[iteration] = model_np
             
-        # 评估
+        # 评估 (与过去模型对战计算 ELO)
         if iteration % config.eval_interval == 0:
-            print(f"正在评估 (vs 随机基准)...", end="", flush=True)
+            past_iter = max(0, iteration - config.past_model_offset)
+            print(f"正在评估 (Iter {iteration} vs Iter {past_iter})...", end="", flush=True)
+            
+            past_model_params = history_models[past_iter]
+            past_model = jax.device_put_replicated(past_model_params, devices)
+            
             rng_key, subkey = jax.random.split(rng_key)
             eval_keys = jax.random.split(subkey, num_devices)
             
             # 1. 当前模型执红
-            winners_r = evaluate(model, initial_model, eval_keys)
+            winners_r = evaluate(model, past_model, eval_keys)
             # 2. 当前模型执黑
-            winners_b = evaluate(initial_model, model, eval_keys)
+            winners_b = evaluate(past_model, model, eval_keys)
             
             wr = int((winners_r == 0).sum())
             wb = int((winners_b == 1).sum())
             dr = int((winners_r == -1).sum())
             db = int((winners_b == -1).sum())
+            
             total_wins = wr + wb
             total_draws = dr + db
             total_games = config.eval_games
             
-            win_rate = total_wins / total_games
-            print(f" 胜率: {win_rate:.2%}")
-            writer.add_scalar("eval/win_rate_vs_random", win_rate, iteration)
-            writer.add_scalar("eval/draw_rate_vs_random", total_draws / total_games, iteration)
+            # 计算胜率 (胜=1, 平=0.5, 负=0)
+            score = (total_wins + 0.5 * total_draws) / total_games
+            
+            # 标准 ELO 更新逻辑
+            k_factor = 32
+            past_elo = iteration_elos.get(past_iter, 1500.0)
+            expected_score = 1 / (1 + 10 ** ((past_elo - iteration_elos.get(iteration-config.eval_interval, 1500.0)) / 400))
+            
+            # 简单起见，我们直接根据胜率计算当前的相对 ELO 增量
+            # 如果胜率是 score，那么 ELO 差值约为 400 * log10(score / (1-score))
+            if score >= 1.0:
+                elo_diff = 400.0
+            elif score <= 0.0:
+                elo_diff = -400.0
+            else:
+                elo_diff = 400.0 * np.log10(score / (1.0 - score))
+            
+            current_elo = past_elo + elo_diff
+            iteration_elos[iteration] = current_elo
+            
+            print(f" 胜率: {score:.2%}, ELO: {current_elo:.0f} (增量: {elo_diff:+.0f})")
+            writer.add_scalar("eval/win_rate_vs_past", score, iteration)
+            writer.add_scalar("eval/elo", current_elo, iteration)
+            writer.add_scalar("eval/draw_rate", total_draws / total_games, iteration)
 
 
 if __name__ == "__main__":
