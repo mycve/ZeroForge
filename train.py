@@ -22,8 +22,6 @@ import mctx
 cache_dir = "jax_cache"
 os.makedirs(cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", os.path.abspath(cache_dir))
-# 2. 允许 JAX 充分利用算力并行编译
-jax.config.update("jax_parallel_functions_output", True)
 
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
