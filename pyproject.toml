@@ -30,7 +30,7 @@ requires-python = ">=3.12"
 dependencies = [
     # 核心 JAX 依赖
     "numpy>=2.0.0",
-    "jax[cuda12]>=0.4.30",
+    "jax[cuda12]>=0.4.30; platform_system == \"Linux\"",
     "flax>=0.8.0",
     "optax>=0.2.0",
     "mctx>=0.0.5",

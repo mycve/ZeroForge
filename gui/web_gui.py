@@ -344,6 +344,7 @@ class ChessGame:
         self.ai_callback: Optional[Callable] = None
         self.ai_player: int = 1  # AI 执黑 (0=红, 1=黑, 2=双AI, -1=双人)
         self.ai_mode: str = "人机对战 (AI执黑)"
+        self._ai_running: bool = False  # 防止 AI 并发执行
         
     def new_game(self, fen: str = STARTING_FEN) -> GameState:
         """开始新游戏"""
@@ -510,6 +511,45 @@ class ChessGame:
         if self.ai_callback is None:
             return self.state
         
+        # 防止并发执行
+        if self._ai_running:
+            print("[GUI警告] AI 正在执行中，跳过本次调用")
+            return self.state
+        
+        self._ai_running = True
+        try:
+            return self._ai_move_impl()
+        finally:
+            self._ai_running = False
+    
+    def _ai_move_impl(self) -> GameState:
+        """AI 走棋的实际实现"""
+        # 在 AI 计算前，确保 GUI 状态和 JAX 状态同步
+        jax_board = np.array(self.state.jax_state.board)
+        jax_player = int(self.state.jax_state.current_player)
+        
+        # 始终打印状态对比
+        boards_equal = np.array_equal(self.state.board, jax_board)
+        players_equal = self.state.current_player == jax_player
+        print(f"\n[AI计算前状态] 玩家: GUI={self.state.current_player}, JAX={jax_player}, 一致={players_equal}")
+        print(f"[AI计算前状态] 棋盘一致={boards_equal}")
+        if not boards_equal:
+            print(f"[AI计算前状态] GUI board:")
+            print(self.state.board)
+            print(f"[AI计算前状态] JAX board:")
+            print(jax_board)
+            # 找出差异
+            diff = self.state.board != jax_board
+            diff_positions = np.argwhere(diff)
+            for pos in diff_positions:
+                r, c = pos
+                print(f"  差异: ({r},{c}) GUI={self.state.board[r,c]} JAX={jax_board[r,c]}")
+        
+        if not boards_equal or not players_equal:
+            print(f"[GUI严重警告] ⚠️ 状态不同步！强制同步...")
+            self.state.board = jax_board.copy()
+            self.state.current_player = jax_player
+        
         # 调用 AI
         result = self.ai_callback(self.state.jax_state)
         if isinstance(result, tuple):
@@ -520,8 +560,46 @@ class ChessGame:
         if action is not None:
             self.state.ai_value = value
             from_sq, to_sq = action_to_move(action)
-            from_row, from_col = from_sq // BOARD_WIDTH, from_sq % BOARD_WIDTH
-            to_row, to_col = to_sq // BOARD_WIDTH, to_sq % BOARD_WIDTH
+            from_row, from_col = int(from_sq) // BOARD_WIDTH, int(from_sq) % BOARD_WIDTH
+            to_row, to_col = int(to_sq) // BOARD_WIDTH, int(to_sq) % BOARD_WIDTH
+            
+            # 调试验证：检查状态一致性和动作合法性
+            jax_board = np.array(self.state.jax_state.board)
+            jax_player = int(self.state.jax_state.current_player)
+            
+            # 首先检查 GUI board 和 jax_state.board 是否一致
+            if not np.array_equal(self.state.board, jax_board):
+                print(f"[GUI严重警告] ⚠️ 状态不一致！GUI board 和 jax_state.board 不同！")
+                print(f"[GUI警告] GUI board:")
+                print(self.state.board)
+                print(f"[GUI警告] jax_state.board:")
+                print(jax_board)
+                # 同步状态
+                self.state.board = jax_board.copy()
+                self.state.current_player = jax_player
+                print(f"[GUI警告] 已强制同步状态")
+            
+            if self.state.current_player != jax_player:
+                print(f"[GUI严重警告] ⚠️ 玩家不一致！GUI={self.state.current_player}, JAX={jax_player}")
+                self.state.current_player = jax_player
+            
+            piece_at_from = self.state.board[from_row, from_col]
+            current_player = self.state.current_player
+            is_own_piece = (current_player == 0 and piece_at_from > 0) or \
+                          (current_player == 1 and piece_at_from < 0)
+            
+            if piece_at_from == 0:
+                print(f"[GUI警告] AI选择的动作起点没有棋子！")
+                print(f"[GUI警告] 动作: {action}, 起点: ({from_row},{from_col})")
+                print(f"[GUI警告] 棋盘状态:")
+                print(self.state.board)
+            elif not is_own_piece:
+                print(f"[GUI警告] AI选择的动作起点不是己方棋子！")
+                print(f"[GUI警告] 玩家: {current_player}, 起点棋子: {piece_at_from}")
+                print(f"[GUI警告] 动作: {action}, 起点: ({from_row},{from_col})")
+                print(f"[GUI警告] 棋盘状态:")
+                print(self.state.board)
+            
             self._make_move(from_row, from_col, to_row, to_col)
         
         return self.state
@@ -580,13 +658,8 @@ def create_gui(ai_callback: Optional[Callable] = None):
             status += " | ⚠️ 将军！"
         
         # 胜率评估
-        # value 是当前玩家视角的评价 (-1 to 1)
-        # 转换为红方胜率: (value_if_red + 1) / 2
-        val = game.state.ai_value
-        if game.state.current_player == 1: # 如果是黑方，反转 value 得到红方评价
-            red_val = -val
-        else:
-            red_val = val
+        # ai_value 已经是红方视角的评价 (-1 to 1)，直接转换为百分比
+        red_val = game.state.ai_value
         win_rate_red = (red_val + 1) / 2 * 100
         
         eval_text = f"红方胜率评估: {win_rate_red:.1f}%"

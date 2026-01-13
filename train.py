@@ -201,13 +201,28 @@ def selfplay(model, rng_key):
         action_weights = jnp.where(is_strong_step[:, None], policy_output_strong.action_weights, policy_output_weak.action_weights)
         
         temp = jnp.where(state.step_count < config.temperature_steps, config.temperature_initial, config.temperature_final)
-        def _sample_action(w, t, k):
+        
+        def _sample_action(w, t, k, legal_mask):
+            """
+            温度采样，使用 log 空间避免数值下溢
+            """
             t = jnp.maximum(t, 1e-3)
-            w_temp = jnp.power(w + 1e-10, 1.0 / t)
-            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+            # 用 legal_mask 清零非法动作的权重
+            w_masked = jnp.where(legal_mask, w, 0.0)
+            # log 空间计算避免下溢
+            log_w = jnp.log(w_masked + 1e-10)
+            log_w_temp = log_w / t
+            # log-sum-exp trick
+            log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
+            log_w_temp = log_w_temp - jnp.max(log_w_temp)
+            w_temp = jnp.exp(log_w_temp)
+            w_temp = jnp.where(legal_mask, w_temp, 0.0)
+            w_sum = jnp.sum(w_temp)
+            w_prob = w_temp / jnp.maximum(w_sum, 1e-10)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
         
         sample_keys = jax.random.split(key_sample, batch_size)
-        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys)
+        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys, state.legal_action_mask)
         
         actor = state.current_player
         next_state = jax.vmap(env.step)(state, action)
@@ -321,14 +336,27 @@ def evaluate(model_red, model_black, rng_key):
         # 30 步对应 15 手棋，涵盖了绝大多数主流开局变招
         temp = jnp.where(state.step_count < 30, 1.0, 0.01) 
         
-        def _sample_action(w, t, k):
+        def _sample_action(w, t, k, legal_mask):
+            """
+            温度采样，使用 log 空间避免数值下溢
+            """
             t = jnp.maximum(t, 1e-3)
-            # 对搜索后的权重进行带温度的重采样
-            w_temp = jnp.power(w + 1e-10, 1.0 / t)
-            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+            # 用 legal_mask 清零非法动作的权重
+            w_masked = jnp.where(legal_mask, w, 0.0)
+            # log 空间计算避免下溢
+            log_w = jnp.log(w_masked + 1e-10)
+            log_w_temp = log_w / t
+            # log-sum-exp trick
+            log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
+            log_w_temp = log_w_temp - jnp.max(log_w_temp)
+            w_temp = jnp.exp(log_w_temp)
+            w_temp = jnp.where(legal_mask, w_temp, 0.0)
+            w_sum = jnp.sum(w_temp)
+            w_prob = w_temp / jnp.maximum(w_sum, 1e-10)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
         
         sample_keys = jax.random.split(k_sample, batch_size)
-        action = jax.vmap(_sample_action)(policy_output.action_weights, temp, sample_keys)
+        action = jax.vmap(_sample_action)(policy_output.action_weights, temp, sample_keys, state.legal_action_mask)
         
         next_state = jax.vmap(env.step)(state, action)
         return next_state, next_state.terminated
