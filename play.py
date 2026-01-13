@@ -43,7 +43,7 @@ def main():
         # 准备观察
         obs = env.observe(state)[None, ...] # 添加 batch 维度
         
-        # 前向计算
+        # 前向计算 (获取初始胜率评估)
         (logits, value), _ = net.apply(
             {'params': params, 'batch_stats': batch_stats},
             obs, train=False, mutable=['batch_stats']
@@ -97,7 +97,24 @@ def main():
             invalid_actions=(~state.legal_action_mask)[None, ...],
         )
         
-        return int(policy_output.action[0])
+        # --- 对弈多样性优化：前 10 步使用适中温度采样 ---
+        # 10 步 = 5 手棋，足以产生不同的开局分支
+        temp = jnp.where(state.step_count < 10, 0.5, 0.01)
+        
+        def _sample_action(w, t, k):
+            t = jnp.maximum(t, 1e-3)
+            w_temp = jnp.power(w + 1e-10, 1.0 / t)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+        
+        # 使用 rng_key 进行采样 (注意：play.py 里 key 之前被固定为 42)
+        # 为了让每局开局不同，建议使用随机 key
+        sample_key = jax.random.PRNGKey(np.random.randint(0, 10000))
+        action = _sample_action(policy_output.action_weights[0], temp, sample_key)
+        
+        # 最终搜索后的 Value 往往比初始 Value 更准
+        search_value = float(value[0])
+        
+        return int(action), search_value
 
     print("启动 Web GUI...")
     run_web_gui(ai_callback=ai_callback)

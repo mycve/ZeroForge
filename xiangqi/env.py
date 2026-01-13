@@ -185,7 +185,7 @@ class XiangqiEnv:
         self, 
         max_steps: int = 400,
         max_no_capture_steps: int = 60,
-        repetition_threshold: int = 3,
+        repetition_threshold: int = 4,
         perpetual_check_threshold: int = 6
     ):
         self.num_players = 2

@@ -324,6 +324,8 @@ class GameState:
     step_count: int = 0
     history: List = None
     jax_state: Optional[XiangqiState] = None
+    ai_value: float = 0.0  # AI 胜率评估
+    last_move_uci: str = "" # 上一步 UCI 坐标
     
     def __post_init__(self):
         if self.legal_moves is None:
@@ -340,7 +342,8 @@ class ChessGame:
         self._rng_key = jax.random.PRNGKey(42)
         self.state: Optional[GameState] = None
         self.ai_callback: Optional[Callable] = None
-        self.ai_player: int = 1  # AI 默认执黑
+        self.ai_player: int = 1  # AI 执黑 (0=红, 1=黑, 2=双AI, -1=双人)
+        self.ai_mode: str = "人机对战 (AI执黑)"
         
     def new_game(self, fen: str = STARTING_FEN) -> GameState:
         """开始新游戏"""
@@ -451,6 +454,8 @@ class ChessGame:
             'board': self.state.board.copy(),
             'player': self.state.current_player,
             'jax_state': self.state.jax_state,
+            'ai_value': self.state.ai_value,
+            'last_move_uci': self.state.last_move_uci,
         })
         
         # 执行走棋
@@ -459,6 +464,10 @@ class ChessGame:
         action = move_to_action(from_sq, to_sq)
         
         new_jax_state = self.env.step(self.state.jax_state, action)
+        
+        # 生成 UCI 坐标
+        cols = 'abcdefghi'
+        self.state.last_move_uci = f"{cols[from_col]}{from_row}{cols[to_col]}{to_row}"
         
         # 更新状态
         self.state.board = np.array(new_jax_state.board)
@@ -482,6 +491,8 @@ class ChessGame:
         self.state.board = prev['board']
         self.state.current_player = prev['player']
         self.state.jax_state = prev['jax_state']
+        self.state.ai_value = prev.get('ai_value', 0.0)
+        self.state.last_move_uci = prev.get('last_move_uci', "")
         self.state.selected = None
         self.state.legal_moves = []
         self.state.last_move = None
@@ -500,8 +511,14 @@ class ChessGame:
             return self.state
         
         # 调用 AI
-        action = self.ai_callback(self.state.jax_state)
+        result = self.ai_callback(self.state.jax_state)
+        if isinstance(result, tuple):
+            action, value = result
+        else:
+            action, value = result, 0.0
+            
         if action is not None:
+            self.state.ai_value = value
             from_sq, to_sq = action_to_move(action)
             from_row, from_col = from_sq // BOARD_WIDTH, from_sq % BOARD_WIDTH
             to_row, to_col = to_sq // BOARD_WIDTH, to_sq % BOARD_WIDTH
@@ -562,35 +579,78 @@ def create_gui(ai_callback: Optional[Callable] = None):
         elif game.state.is_check:
             status += " | ⚠️ 将军！"
         
+        # 胜率评估
+        # value 是当前玩家视角的评价 (-1 to 1)
+        # 转换为红方胜率: (value_if_red + 1) / 2
+        val = game.state.ai_value
+        if game.state.current_player == 1: # 如果是黑方，反转 value 得到红方评价
+            red_val = -val
+        else:
+            red_val = val
+        win_rate_red = (red_val + 1) / 2 * 100
+        
+        eval_text = f"红方胜率评估: {win_rate_red:.1f}%"
+        if game.state.last_move_uci:
+            eval_text += f" | 上一着: {game.state.last_move_uci}"
+            
         fen = board_to_fen(game.state.board, game.state.current_player)
         
-        return svg, status, fen
+        return svg, status, eval_text, fen
     
     def on_click(row: int, col: int):
         """处理点击"""
         game.click(row, col)
+        # 如果当前是 AI 回合，且不是双人模式，则触发 AI 走棋
+        if not game.state.game_over:
+            if (game.ai_player == game.state.current_player) or (game.ai_player == 2):
+                game.ai_move()
         return render()
     
     def new_game_click():
         """新游戏"""
         game.new_game()
+        # 如果 AI 执红，则立即走第一步
+        if game.ai_player == 0 or game.ai_player == 2:
+            game.ai_move()
         return render()
     
     def undo_click():
         """悔棋"""
         game.undo()
+        # 人机模式下，悔棋通常要悔两步
+        if game.ai_player != -1 and game.ai_player != 2:
+            game.undo()
         return render()
     
     def ai_move_click():
-        """AI 走棋"""
+        """手动触发 AI 走棋"""
         game.ai_move()
         return render()
     
-    def switch_side_click():
-        """换边"""
-        game.ai_player = 1 - game.ai_player
-        side = "红方" if game.ai_player == 0 else "黑方"
-        return f"AI 执{side}"
+    def switch_mode_click(mode):
+        """切换模式"""
+        if mode == "人机 (AI执黑)":
+            game.ai_player = 1
+        elif mode == "人机 (AI执红)":
+            game.ai_player = 0
+        elif mode == "双AI对弈":
+            game.ai_player = 2
+        else: # 双人对弈
+            game.ai_player = -1
+        
+        game.ai_mode = mode
+        # 如果切换到 AI 回合，自动走棋
+        if not game.state.game_over:
+            if (game.ai_player == game.state.current_player) or (game.ai_player == 2):
+                game.ai_move()
+        return render()
+    
+    def auto_play_loop():
+        """自动对弈循环"""
+        if not game.state.game_over and game.ai_player == 2:
+            game.ai_move()
+            return render()
+        return render()
     
     def import_fen_click(fen: str):
         """导入 FEN"""
@@ -658,40 +718,43 @@ def create_gui(ai_callback: Optional[Callable] = None):
         with gr.Row():
             with gr.Column(scale=2):
                 board_html = gr.HTML(label="棋盘")
-                status_text = gr.Textbox(label="状态", interactive=False)
+                with gr.Row():
+                    status_text = gr.Textbox(label="状态", interactive=False, scale=1)
+                    eval_text = gr.Textbox(label="AI 评估", interactive=False, scale=1)
             
             with gr.Column(scale=1):
-                gr.Markdown("### 操作")
+                gr.Markdown("### 模式选择")
+                mode_radio = gr.Radio(
+                    choices=["人机 (AI执黑)", "人机 (AI执红)", "双AI对弈", "双人对弈"],
+                    value="人机 (AI执黑)",
+                    label="对弈模式"
+                )
                 
+                gr.Markdown("### 操作")
                 with gr.Row():
                     new_game_btn = gr.Button("🆕 新游戏", variant="primary")
                     undo_btn = gr.Button("↩️ 悔棋")
                 
                 with gr.Row():
                     ai_move_btn = gr.Button("🤖 AI走棋", variant="secondary")
-                    switch_btn = gr.Button("🔄 换边")
-                
-                switch_status = gr.Textbox(value="AI 执黑方", label="AI 设置", interactive=False)
                 
                 gr.Markdown("### FEN")
                 fen_input = gr.Textbox(label="FEN 字符串", placeholder="输入 FEN...")
                 
                 with gr.Row():
                     import_btn = gr.Button("📥 导入")
-                    # export 由 fen_output 自动显示
                 
                 fen_output = gr.Textbox(label="当前 FEN", interactive=False)
                 import_status = gr.Textbox(label="", interactive=False, visible=False)
                 
                 gr.Markdown("### 说明")
                 gr.Markdown("""
-                - 点击棋子选择，再点击目标位置走棋
-                - 绿色圆点表示合法走法
-                - 黄色圈表示选中的棋子
-                - 红色圈表示将军
+                - **人机模式**: 点击棋子选择，点击目标位置走棋。AI 会在您的回合结束后自动落子。
+                - **双AI对弈**: AI 将自动循环走棋，点击“AI走棋”或切换模式可启动。
+                - **胜率评估**: 显示 AI 对红方胜算的百分比判断。
                 """)
         
-        # 隐藏的输入用于接收点击 (用 CSS 隐藏，保证 DOM 存在)
+        # 隐藏的输入用于接收点击
         with gr.Row(elem_id="hidden-controls"):
             row_input = gr.Textbox(elem_id="row-input", value="", visible=True, 
                                    container=False, show_label=False)
@@ -711,24 +774,31 @@ def create_gui(ai_callback: Optional[Callable] = None):
             except:
                 return render()
         
+        outputs = [board_html, status_text, eval_text, fen_output]
+        
         click_btn.click(
             handle_board_click,
             inputs=[row_input, col_input],
-            outputs=[board_html, status_text, fen_output]
+            outputs=outputs
         )
         
-        new_game_btn.click(new_game_click, outputs=[board_html, status_text, fen_output])
-        undo_btn.click(undo_click, outputs=[board_html, status_text, fen_output])
-        ai_move_btn.click(ai_move_click, outputs=[board_html, status_text, fen_output])
-        switch_btn.click(switch_side_click, outputs=[switch_status])
+        new_game_btn.click(new_game_click, outputs=outputs)
+        undo_btn.click(undo_click, outputs=outputs)
+        ai_move_btn.click(ai_move_click, outputs=outputs)
+        mode_radio.change(switch_mode_click, inputs=[mode_radio], outputs=outputs)
+        
         import_btn.click(
             import_fen_click, 
             inputs=[fen_input],
-            outputs=[board_html, status_text, fen_output, import_status]
+            outputs=[board_html, status_text, eval_text, fen_output, import_status]
         )
         
+        # 自动对弈计时器：如果是双AI模式，每隔 1.5 秒尝试走一步
+        auto_timer = gr.Timer(value=1.5, active=True)
+        auto_timer.tick(auto_play_loop, outputs=outputs)
+        
         # 初始化
-        demo.load(render, outputs=[board_html, status_text, fen_output])
+        demo.load(render, outputs=outputs)
     
     return demo
 

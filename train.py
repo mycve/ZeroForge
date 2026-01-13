@@ -66,7 +66,7 @@ class Config:
     # 探索策略
     temperature_steps: int = 30
     temperature_initial: float = 1.0
-    temperature_final: float = 0.01
+    temperature_final: float = 0.1
     
     # 环境规则
     max_steps: int = 200
@@ -310,12 +310,27 @@ def evaluate(model_red, model_black, rng_key):
         
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
+        k_search, k_sample = jax.random.split(key)
         policy_output = mctx.gumbel_muzero_policy(
-            params=(model_red, model_black), rng_key=key, root=root,
+            params=(model_red, model_black), rng_key=k_search, root=root,
             recurrent_fn=evaluate_recurrent_fn,
             num_simulations=96, max_num_considered_actions=16, invalid_actions=~state.legal_action_mask,
         )
-        next_state = jax.vmap(env.step)(state, policy_output.action)
+        
+        # --- 评估多样性优化：前 30 步使用高温度采样，彻底打开局面 ---
+        # 30 步对应 15 手棋，涵盖了绝大多数主流开局变招
+        temp = jnp.where(state.step_count < 30, 1.0, 0.01) 
+        
+        def _sample_action(w, t, k):
+            t = jnp.maximum(t, 1e-3)
+            # 对搜索后的权重进行带温度的重采样
+            w_temp = jnp.power(w + 1e-10, 1.0 / t)
+            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_temp / jnp.sum(w_temp))
+        
+        sample_keys = jax.random.split(k_sample, batch_size)
+        action = jax.vmap(_sample_action)(policy_output.action_weights, temp, sample_keys)
+        
+        next_state = jax.vmap(env.step)(state, action)
         return next_state, next_state.terminated
 
     state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
