@@ -218,7 +218,7 @@ __marimo__/
 pikafish
 pikafish.nnue
 .venv
-node_modules/
+jax_cache/
 checkpoints/
-config.json
+ckpt_*.pkl
 uv.lock

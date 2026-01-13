@@ -74,10 +74,10 @@ class Config:
     repetition_threshold: int = 4
     perpetual_check_threshold: int = 6
     
-    # ELO 评估
+    # ELO 评估 (优化：单链滑动窗口评估，确保 ELO 连续)
     eval_interval: int = 20
     eval_games: int = 64
-    past_model_offset: int = 40
+    past_model_offset: int = 20      # 设置为与间隔相同，形成连续进化链
 
 config = Config()
 

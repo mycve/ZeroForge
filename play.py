@@ -8,6 +8,7 @@ import sys
 import pickle
 import jax
 import jax.numpy as jnp
+from train import config  # 直接从主训练文件导入配置
 from gui.web_gui import run_web_gui
 from networks.alphazero import AlphaZeroNetwork
 from xiangqi.env import XiangqiEnv
@@ -23,12 +24,12 @@ def main():
     ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/ckpt_000100.pkl"
     print(f"正在加载模型: {ckpt_path}")
     
-    # 初始化环境和网络
+    # 初始化环境和网络 (自动使用 train.py 中的配置)
     env = XiangqiEnv()
     net = AlphaZeroNetwork(
         action_space_size=ACTION_SPACE_SIZE,
-        channels=128,
-        num_blocks=12,
+        channels=config.num_channels,
+        num_blocks=config.num_blocks,
     )
     
     # 加载参数
@@ -83,7 +84,7 @@ def main():
         # 运行 Gumbel MCTS
         key = jax.random.PRNGKey(42)
         # 为 chex dataclass 添加 batch 维度
-        batched_state = jax.tree_map(lambda x: jnp.expand_dims(x, 0), state)
+        batched_state = jax.tree.map(lambda x: jnp.expand_dims(x, 0), state)
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=batched_state)
         
         policy_output = mctx.gumbel_muzero_policy(
