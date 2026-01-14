@@ -28,7 +28,7 @@ from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
 from xiangqi.mirror import mirror_observation, mirror_policy
 from networks.alphazero import AlphaZeroNetwork
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 
 # ============================================================================
 # 配置
