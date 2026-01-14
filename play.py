@@ -4,27 +4,46 @@
 用法: python play.py [checkpoint_path]
 """
 
+import os
 import sys
-import pickle
 import jax
 import jax.numpy as jnp
-from train import config  # 直接从主训练文件导入配置
+from train import config
 from gui.web_gui import run_web_gui
 from networks.alphazero import AlphaZeroNetwork
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import ACTION_SPACE_SIZE, rotate_action, action_to_move, move_to_uci
 import mctx
 import numpy as np
+import orbax.checkpoint as ocp
 
 
-def load_model(path):
-    """加载模型参数"""
-    with open(path, 'rb') as f:
-        ckpt = pickle.load(f)
-    return ckpt['params']
+def load_model(path: str):
+    """加载模型参数 (orbax 格式)
+    
+    Args:
+        path: checkpoint 路径
+            - "checkpoints" → 自动选最新
+            - "checkpoints/100" → 指定步数
+    """
+    # 如果是 checkpoints 目录，自动找最新的
+    if os.path.isdir(path):
+        subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)) and d.isdigit()]
+        if subdirs:
+            latest_step = max(int(d) for d in subdirs)
+            path = os.path.join(path, str(latest_step))
+            print(f"[自动选择] 最新 checkpoint: step={latest_step}")
+    
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Checkpoint 不存在: {path}")
+    
+    checkpointer = ocp.StandardCheckpointer()
+    restored = checkpointer.restore(path)
+    return restored["params"]
 
 def main():
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/ckpt_000100.pkl"
+    # 默认使用 checkpoints 目录（自动选最新）
+    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints"
     print(f"正在加载模型: {ckpt_path}")
     
     # 初始化环境和网络 (自动使用 train.py 中的配置)

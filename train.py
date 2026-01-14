@@ -7,15 +7,16 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 import os
 import sys
 import time
-import pickle
+import json
 from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import mctx
+import orbax.checkpoint as ocp
 
 # --- JAX 极速优化配置 ---
 # 1. 开启编译缓存，第二次运行秒开
@@ -60,9 +61,12 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 1024
-    strong_simulations: int = 128
-    weak_simulations: int = 32
-    max_num_considered_actions: int = 32
+    num_simulations: int = 128       # 统一模拟次数 (移除强弱差异)
+    top_k: int = 32                 # top-k ≈ simulations / 4
+    
+    # 经验回放配置
+    replay_buffer_size: int = 200000  # 回放缓冲区大小
+    sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
     temperature_steps: int = 40
@@ -79,6 +83,11 @@ class Config:
     eval_interval: int = 20
     eval_games: int = 64
     past_model_offset: int = 20
+    
+    # Checkpoint 配置
+    ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
+    max_to_keep: int = 20            # 最多保留 N 个 checkpoint
+    keep_period: int = 50           # 每 N 次迭代永久保留一个 checkpoint
 
 config = Config()
 
@@ -139,7 +148,6 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    is_strong: jnp.ndarray
     root_value: jnp.ndarray  # MCTS 搜索后的根节点价值 (用于 TD bootstrap)
 
 class Sample(NamedTuple):
@@ -147,7 +155,6 @@ class Sample(NamedTuple):
     policy_tgt: jnp.ndarray
     value_tgt: jnp.ndarray  # n-step TD 目标
     mask: jnp.ndarray
-    is_strong: jnp.ndarray
 
 # ============================================================================
 # 自玩
@@ -159,12 +166,9 @@ def selfplay(params, rng_key):
     高性能自玩算子：
     - 使用 lax.scan 消除 Python 循环开销
     - Gumbel 算法无需 Dirichlet 噪声 (Gumbel 噪声已提供足够探索)
-    - 记录 MCTS 搜索价值用于训练
+    - 统一策略（移除强弱差异，节省计算资源）
     """
     batch_size = config.selfplay_batch_size // num_devices
-    
-    rng_key, subkey = jax.random.split(rng_key)
-    is_red_strong = jax.random.bernoulli(subkey, 0.5, shape=(batch_size,))
     
     def step_fn(state, key):
         key_search, key_sample, key_next = jax.random.split(key, 3)
@@ -178,30 +182,16 @@ def selfplay(params, rng_key):
         # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
-        is_strong_step = jnp.where(state.current_player == 0, is_red_strong, ~is_red_strong)
-        
-        k1, k2 = jax.random.split(key_search)
-        policy_output_strong = mctx.gumbel_muzero_policy(
-            params=params, rng_key=k1, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=config.strong_simulations,
-            max_num_considered_actions=config.max_num_considered_actions,
-            invalid_actions=~state.legal_action_mask,
-        )
-        policy_output_weak = mctx.gumbel_muzero_policy(
-            params=params, rng_key=k2, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=config.weak_simulations,
-            max_num_considered_actions=config.max_num_considered_actions,
+        # 统一策略：只执行一次 MCTS 搜索
+        policy_output = mctx.gumbel_muzero_policy(
+            params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+            num_simulations=config.num_simulations,
+            max_num_considered_actions=config.top_k,
             invalid_actions=~state.legal_action_mask,
         )
         
-        # 选择强/弱模拟的策略和搜索价值
-        action_weights = jnp.where(is_strong_step[:, None], 
-                                   policy_output_strong.action_weights, 
-                                   policy_output_weak.action_weights)
-        # MCTS 搜索后的根节点价值 (用于 n-step TD bootstrap)
-        root_value = jnp.where(is_strong_step,
-                               policy_output_strong.search_tree.node_values[:, 0],
-                               policy_output_weak.search_tree.node_values[:, 0])
+        action_weights = policy_output.action_weights
+        root_value = policy_output.search_tree.node_values[:, 0]
         
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, config.temperature_final)
@@ -234,7 +224,6 @@ def selfplay(params, rng_key):
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
-            is_strong=is_strong_step,
             root_value=root_value,
         )
         
@@ -300,8 +289,7 @@ def compute_targets(data: SelfplayOutput):
         obs=data.obs, 
         policy_tgt=data.action_weights, 
         value_tgt=value_tgt,
-        mask=value_mask, 
-        is_strong=data.is_strong,
+        mask=value_mask,
     )
 
 # ============================================================================
@@ -311,10 +299,10 @@ def compute_targets(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：只用强模拟数据训练 (弱模拟不参与)
-    - 价值损失：拟合游戏最终结果 (蒙特卡洛回报)
+    - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
+    - 价值损失：拟合 n-step TD 目标
     """
-    obs, policy_tgt, is_strong = samples.obs, samples.policy_tgt, samples.is_strong
+    obs, policy_tgt = samples.obs, samples.policy_tgt
     
     # 随机镜像增强
     do_mirror = jax.random.bernoulli(rng_key, 0.5)
@@ -323,11 +311,11 @@ def loss_fn(params, samples: Sample, rng_key):
     
     logits, value = forward(params, obs, is_training=True)
     
-    # 策略损失 (只用强模拟数据)
+    # 策略损失（所有样本）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
-    policy_loss = jnp.sum(policy_ce * is_strong) / jnp.maximum(jnp.sum(is_strong), 1.0)
+    policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失 (游戏最终结果)
+    # 价值损失 (n-step TD 目标)
     value_loss = jnp.sum(optax.l2_loss(value, samples.value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     # 熵正则化
@@ -421,26 +409,335 @@ def evaluate(params_red, params_black, rng_key):
     return state.winner
 
 # ============================================================================
+# 经验回放缓冲区
+# ============================================================================
+
+class ReplayBuffer:
+    """经验回放缓冲区，支持样本复用训练多次后丢弃"""
+    
+    def __init__(self, max_size: int, reuse_times: int):
+        self.max_size = max_size
+        self.reuse_times = reuse_times
+        
+        # 存储样本数据
+        self.obs = None
+        self.policy_tgt = None
+        self.value_tgt = None
+        self.mask = None
+        self.train_count = None  # 每个样本被训练的次数
+        
+        self.size = 0
+        self.total_added = 0
+        self.total_removed = 0
+    
+    def add(self, samples: Sample):
+        """添加新样本到缓冲区"""
+        # 展平样本 [max_steps, batch, ...] -> [N, ...]
+        flat_samples = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), jax.device_get(samples))
+        n_new = flat_samples.obs.shape[0]
+        
+        # 首次初始化
+        if self.obs is None:
+            self.obs = flat_samples.obs
+            self.policy_tgt = flat_samples.policy_tgt
+            self.value_tgt = flat_samples.value_tgt
+            self.mask = flat_samples.mask
+            self.train_count = np.zeros(n_new, dtype=np.int32)
+            self.size = n_new
+            self.total_added = n_new
+            return
+        
+        # 追加新样本
+        self.obs = np.concatenate([self.obs, flat_samples.obs], axis=0)
+        self.policy_tgt = np.concatenate([self.policy_tgt, flat_samples.policy_tgt], axis=0)
+        self.value_tgt = np.concatenate([self.value_tgt, flat_samples.value_tgt], axis=0)
+        self.mask = np.concatenate([self.mask, flat_samples.mask], axis=0)
+        self.train_count = np.concatenate([self.train_count, np.zeros(n_new, dtype=np.int32)], axis=0)
+        
+        self.size = len(self.obs)
+        self.total_added += n_new
+        
+        # 如果超过最大容量，移除最旧的样本
+        if self.size > self.max_size:
+            excess = self.size - self.max_size
+            self._remove_oldest(excess)
+    
+    def _remove_oldest(self, n: int):
+        """移除最旧的 n 个样本"""
+        self.obs = self.obs[n:]
+        self.policy_tgt = self.policy_tgt[n:]
+        self.value_tgt = self.value_tgt[n:]
+        self.mask = self.mask[n:]
+        self.train_count = self.train_count[n:]
+        self.size = len(self.obs)
+        self.total_removed += n
+    
+    def _remove_trained(self):
+        """移除已训练足够次数的样本"""
+        keep_mask = self.train_count < self.reuse_times
+        n_remove = np.sum(~keep_mask)
+        if n_remove > 0:
+            self.obs = self.obs[keep_mask]
+            self.policy_tgt = self.policy_tgt[keep_mask]
+            self.value_tgt = self.value_tgt[keep_mask]
+            self.mask = self.mask[keep_mask]
+            self.train_count = self.train_count[keep_mask]
+            self.size = len(self.obs)
+            self.total_removed += n_remove
+    
+    def sample(self, batch_size: int, rng_key) -> Sample:
+        """从缓冲区采样一个批次并增加训练计数"""
+        if self.size < batch_size:
+            raise ValueError(f"缓冲区样本不足: {self.size} < {batch_size}")
+        
+        # 随机采样索引
+        indices = jax.random.choice(rng_key, self.size, shape=(batch_size,), replace=False)
+        indices = np.array(indices)
+        
+        # 增加被采样样本的训练计数
+        self.train_count[indices] += 1
+        
+        # 返回采样结果
+        return Sample(
+            obs=self.obs[indices],
+            policy_tgt=self.policy_tgt[indices],
+            value_tgt=self.value_tgt[indices],
+            mask=self.mask[indices],
+        )
+    
+    def cleanup(self):
+        """清理已训练足够次数的样本"""
+        self._remove_trained()
+    
+    def stats(self):
+        """返回缓冲区统计信息"""
+        if self.size == 0:
+            return {"size": 0, "avg_train_count": 0.0}
+        return {
+            "size": self.size,
+            "avg_train_count": float(np.mean(self.train_count)),
+            "total_added": self.total_added,
+            "total_removed": self.total_removed,
+        }
+    
+    def state_dict(self) -> dict:
+        """导出状态用于 checkpoint 保存"""
+        return {
+            "obs": self.obs,
+            "policy_tgt": self.policy_tgt,
+            "value_tgt": self.value_tgt,
+            "mask": self.mask,
+            "train_count": self.train_count,
+            "size": self.size,
+            "total_added": self.total_added,
+            "total_removed": self.total_removed,
+        }
+    
+    def load_state_dict(self, state: dict):
+        """从 checkpoint 恢复状态"""
+        self.obs = state["obs"]
+        self.policy_tgt = state["policy_tgt"]
+        self.value_tgt = state["value_tgt"]
+        self.mask = state["mask"]
+        self.train_count = state["train_count"]
+        self.size = state["size"]
+        self.total_added = state["total_added"]
+        self.total_removed = state["total_removed"]
+
+# ============================================================================
+# Checkpoint 管理 (使用 orbax 官方方案)
+# ============================================================================
+
+class TrainState(NamedTuple):
+    """完整训练状态，用于断点续训"""
+    params: dict                    # 模型参数
+    opt_state: dict                 # 优化器状态
+    iteration: int                  # 当前迭代次数
+    frames: int                     # 总帧数
+    rng_key: jnp.ndarray           # 随机数状态
+    history_models: dict            # 历史模型 (用于 ELO 评估)
+    iteration_elos: dict            # ELO 记录
+
+
+def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
+    """创建 orbax checkpoint manager
+    
+    使用官方推荐的 PyTreeCheckpointer，支持：
+    - 自动版本管理
+    - 异步保存
+    - 最多保留 N 个 checkpoint
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=config.max_to_keep,
+        keep_period=config.keep_period,
+        save_interval_steps=1,  # 由外部控制保存间隔
+    )
+    return ocp.CheckpointManager(
+        directory=ckpt_dir,
+        options=options,
+    )
+
+
+def save_checkpoint(
+    ckpt_manager: ocp.CheckpointManager,
+    train_state: TrainState,
+    replay_buffer: ReplayBuffer,
+    step: int,
+):
+    """保存完整训练状态
+    
+    包含：模型参数、优化器状态、迭代计数、随机数状态、历史模型、ELO、回放缓冲区
+    """
+    # 从设备获取参数（只取第一个设备的副本）
+    params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.params))
+    opt_state_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.opt_state))
+    rng_key_np = jax.device_get(train_state.rng_key)
+    
+    # 构建完整状态字典
+    state_dict = {
+        "params": params_np,
+        "opt_state": opt_state_np,
+        "iteration": np.array(train_state.iteration),
+        "frames": np.array(train_state.frames),
+        "rng_key": rng_key_np,
+        # history_models 和 iteration_elos 单独保存为 JSON (因为 key 是 int)
+    }
+    
+    # 保存主状态
+    ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
+    
+    # 单独保存 metadata (history_models keys, elos) 和 replay buffer
+    meta_dir = os.path.join(config.ckpt_dir, f"meta_{step}")
+    os.makedirs(meta_dir, exist_ok=True)
+    
+    # 保存 ELO 和历史模型索引
+    with open(os.path.join(meta_dir, "metadata.json"), "w") as f:
+        json.dump({
+            "iteration_elos": {str(k): v for k, v in train_state.iteration_elos.items()},
+            "history_model_keys": [int(k) for k in train_state.history_models.keys()],
+        }, f)
+    
+    # 保存历史模型参数
+    for k, v in train_state.history_models.items():
+        np.savez_compressed(os.path.join(meta_dir, f"history_{k}.npz"), 
+                           **{f"arr_{i}": arr for i, arr in enumerate(jax.tree.leaves(v))})
+    
+    # 保存回放缓冲区
+    if replay_buffer.size > 0:
+        buf_state = replay_buffer.state_dict()
+        np.savez_compressed(os.path.join(meta_dir, "replay_buffer.npz"), **buf_state)
+    
+    print(f"[Checkpoint] 已保存 step={step}")
+
+
+def restore_checkpoint(
+    ckpt_manager: ocp.CheckpointManager,
+    params_template: dict,
+    opt_state_template: dict,
+    replay_buffer: ReplayBuffer,
+) -> Optional[tuple]:
+    """恢复训练状态
+    
+    Returns:
+        None 如果没有 checkpoint
+        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
+    """
+    latest_step = ckpt_manager.latest_step()
+    if latest_step is None:
+        print("[Checkpoint] 未找到已有 checkpoint，从头开始训练")
+        return None
+    
+    print(f"[Checkpoint] 正在恢复 step={latest_step}...")
+    
+    # 恢复主状态
+    restored = ckpt_manager.restore(latest_step)
+    
+    params = restored["params"]
+    opt_state = restored["opt_state"]
+    iteration = int(restored["iteration"])
+    frames = int(restored["frames"])
+    rng_key = restored["rng_key"]
+    
+    # 恢复 metadata
+    meta_dir = os.path.join(config.ckpt_dir, f"meta_{latest_step}")
+    
+    history_models = {}
+    iteration_elos = {}
+    
+    if os.path.exists(meta_dir):
+        # 读取元数据
+        with open(os.path.join(meta_dir, "metadata.json"), "r") as f:
+            meta = json.load(f)
+            iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
+            history_model_keys = meta["history_model_keys"]
+        
+        # 恢复历史模型
+        tree_struct = jax.tree.structure(params_template)
+        for k in history_model_keys:
+            npz_path = os.path.join(meta_dir, f"history_{k}.npz")
+            if os.path.exists(npz_path):
+                data = np.load(npz_path)
+                leaves = [data[f"arr_{i}"] for i in range(len(data.files))]
+                history_models[k] = jax.tree.unflatten(tree_struct, leaves)
+        
+        # 恢复回放缓冲区
+        buf_path = os.path.join(meta_dir, "replay_buffer.npz")
+        if os.path.exists(buf_path):
+            buf_data = dict(np.load(buf_path))
+            replay_buffer.load_state_dict(buf_data)
+            print(f"[Checkpoint] 回放缓冲区恢复: {replay_buffer.size} 样本")
+    
+    print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={iteration_elos.get(iteration, 'N/A')}")
+    
+    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
+
+
+# ============================================================================
 # 主循环
 # ============================================================================
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: Pre-LN ResNet + SE + Global Pooling + 双价值头 + Gumbel (无噪声)")
+    print("特性: Pre-LN ResNet + SE + Global Pooling + Gumbel + 经验回放 + 断点续训")
+    
+    # 创建必要目录
+    os.makedirs(config.ckpt_dir, exist_ok=True)
+    
+    # 初始化经验回放缓冲区
+    replay_buffer = ReplayBuffer(
+        max_size=config.replay_buffer_size,
+        reuse_times=config.sample_reuse_times
+    )
+    
+    # 初始化模型模板 (用于恢复时的结构参考)
     rng_key = jax.random.PRNGKey(config.seed)
     rng_key, subkey = jax.random.split(rng_key)
-    
-    # 初始化模型 (LayerNorm 架构，无需 batch_stats)
     dummy_obs = jnp.zeros((config.selfplay_batch_size // num_devices, 240, 10, 9))
     variables = net.init(subkey, dummy_obs, train=True)
-    params = variables['params']
-    
-    history_models = {0: jax.device_get(params)}
-    iteration_elos = {0: 1500.0}
+    params_template = variables['params']
     
     optimizer = optax.adam(config.learning_rate)
-    opt_state = optimizer.init(params)
+    opt_state_template = optimizer.init(params_template)
     
+    # === 创建 Checkpoint Manager 并尝试恢复 ===
+    ckpt_manager = create_checkpoint_manager(config.ckpt_dir)
+    restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template, replay_buffer)
+    
+    if restored is not None:
+        # 从 checkpoint 恢复
+        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        print(f"[断点续训] 从 iteration={iteration} 继续训练")
+    else:
+        # 全新训练
+        params = params_template
+        opt_state = opt_state_template
+        iteration = 0
+        frames = 0
+        history_models = {0: jax.device_get(params)}
+        iteration_elos = {0: 1500.0}
+    
+    # 分发到所有设备
     params = jax.device_put_replicated(params, devices)
     opt_state = jax.device_put_replicated(opt_state, devices)
     
@@ -473,10 +770,7 @@ def main():
     
     print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
 
-    os.makedirs(config.ckpt_dir, exist_ok=True)
     writer = SummaryWriter(config.log_dir)
-    
-    iteration, frames = 0, 0
     start_time_total = time.time()
     
     while True:
@@ -511,28 +805,36 @@ def main():
         final_lengths = jnp.min(game_lengths, axis=1)
         avg_length = float(jnp.mean(final_lengths))
         
-        samples_flat = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), jax.device_get(samples))
-        frames += samples_flat.obs.shape[0]
+        # --- 将新样本添加到经验回放缓冲区 ---
+        replay_buffer.add(samples)
+        new_frames = samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
+        frames += new_frames
         
-        rng_key, sk3 = jax.random.split(rng_key)
-        ixs = jax.random.permutation(sk3, jnp.arange(samples_flat.obs.shape[0]))
-        samples_flat = jax.tree.map(lambda x: x[ixs], samples_flat)
+        # --- 从缓冲区采样训练 ---
+        # 计算训练次数：确保每个样本平均被训练 reuse_times 次
+        num_updates = max(1, (replay_buffer.size * config.sample_reuse_times) // (config.training_batch_size * config.sample_reuse_times))
+        num_updates = min(num_updates, new_frames // config.training_batch_size * config.sample_reuse_times)  # 限制训练量
+        num_updates = max(1, num_updates)
         
-        num_updates = max(1, samples_flat.obs.shape[0] // config.training_batch_size)
         policy_losses, value_losses = [], []
         for i in range(num_updates):
-            batch = jax.tree.map(lambda x: x[i*config.training_batch_size:(i+1)*config.training_batch_size].reshape((num_devices, -1) + x.shape[1:]), samples_flat)
-            rng_key, sk4 = jax.random.split(rng_key)
-            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, jax.random.split(sk4, num_devices))
+            rng_key, sk_sample, sk_train = jax.random.split(rng_key, 3)
+            batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
+            batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
+            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, jax.random.split(sk_train, num_devices))
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
+        
+        # --- 清理已训练足够次数的样本 ---
+        replay_buffer.cleanup()
         
         # --- 打印与日志 ---
         iter_time = time.time() - st
-        fps = samples_flat.obs.shape[0] / iter_time
+        fps = new_frames / iter_time
+        buf_stats = replay_buffer.stats()
         
         print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
-              f"len={avg_length:4.1f} fps={fps:4.0f} | "
-              f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d} (步{d_max_steps}/抓{d_no_capture}/复{d_repetition}/将{d_perpetual})")
+              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k avg_use={buf_stats['avg_train_count']:.1f} | "
+              f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
@@ -541,6 +843,8 @@ def main():
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("stats/win_rate_red", r_wins / max(1, num_games), iteration)
         writer.add_scalar("stats/draw_rate", draws / max(1, num_games), iteration)
+        writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
+        writer.add_scalar("replay/avg_train_count", buf_stats['avg_train_count'], iteration)
         
         if draws > 0:
             writer.add_scalar("draw_reasons/max_steps", d_max_steps / draws, iteration)
@@ -548,26 +852,45 @@ def main():
             writer.add_scalar("draw_reasons/repetition", d_repetition / draws, iteration)
             writer.add_scalar("draw_reasons/perpetual_check", d_perpetual / draws, iteration)
         
-        if iteration % 10 == 0:
+        # === Checkpoint 保存 (使用 orbax 官方方案) ===
+        if iteration % config.ckpt_interval == 0:
+            # 更新历史模型
             params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
             history_models[iteration] = params_np
-            with open(os.path.join(config.ckpt_dir, f"ckpt_{iteration:06d}.pkl"), 'wb') as f:
-                pickle.dump({'params': params_np, 'iteration': iteration, 'frames': frames}, f)
+            
+            # 保存完整训练状态
+            train_state = TrainState(
+                params=params,
+                opt_state=opt_state,
+                iteration=iteration,
+                frames=frames,
+                rng_key=rng_key,
+                history_models=history_models,
+                iteration_elos=iteration_elos,
+            )
+            save_checkpoint(ckpt_manager, train_state, replay_buffer, iteration)
         
         if iteration % config.eval_interval == 0:
+            # 找到最近的可用历史模型
             past_iter = max(0, iteration - config.past_model_offset)
-            past_params = jax.device_put_replicated(history_models[past_iter], devices)
-            rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-            # 双边评估
-            winners_r = evaluate(params, past_params, jax.random.split(sk5, num_devices))
-            winners_b = evaluate(past_params, params, jax.random.split(sk6, num_devices))
-            wr = (winners_r == 0).sum()
-            wb = (winners_b == 1).sum()
-            score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
-            elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
-            iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
-            print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
-            writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
+            available_iters = sorted(history_models.keys())
+            past_iter = max([k for k in available_iters if k <= past_iter], default=0)
+            
+            if past_iter in history_models:
+                past_params = jax.device_put_replicated(history_models[past_iter], devices)
+                rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
+                # 双边评估
+                winners_r = evaluate(params, past_params, jax.random.split(sk5, num_devices))
+                winners_b = evaluate(past_params, params, jax.random.split(sk6, num_devices))
+                wr = (winners_r == 0).sum()
+                wb = (winners_b == 1).sum()
+                score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
+                elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
+                iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
+                print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
+                writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
+            else:
+                print(f"[警告] 无可用历史模型，跳过本次评估")
 
 if __name__ == "__main__":
     main()
