@@ -18,27 +18,54 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 
-def load_model(path: str):
+def load_model(path: str, params_template: dict):
     """加载模型参数 (orbax 格式)
     
     Args:
         path: checkpoint 路径
             - "checkpoints" → 自动选最新
             - "checkpoints/100" → 指定步数
+        params_template: 参数结构模板
     """
-    # 如果是 checkpoints 目录，自动找最新的
+    # 转换为绝对路径（orbax 要求）
+    path = os.path.abspath(path)
+    
+    # 判断是 checkpoint 根目录还是具体的 step 目录
+    ckpt_dir = path
+    step = None
+    
     if os.path.isdir(path):
         subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d)) and d.isdigit()]
         if subdirs:
-            latest_step = max(int(d) for d in subdirs)
-            path = os.path.join(path, str(latest_step))
-            print(f"[自动选择] 最新 checkpoint: step={latest_step}")
+            # 这是 checkpoints 根目录
+            ckpt_dir = path
+            step = max(int(d) for d in subdirs)
+            print(f"[自动选择] 最新 checkpoint: step={step}")
+        else:
+            # 可能是具体的 step 目录
+            parent_dir = os.path.dirname(path)
+            step_name = os.path.basename(path)
+            if step_name.isdigit():
+                ckpt_dir = parent_dir
+                step = int(step_name)
     
-    if not os.path.isdir(path):
+    if step is None:
         raise FileNotFoundError(f"Checkpoint 不存在: {path}")
     
-    checkpointer = ocp.StandardCheckpointer()
-    restored = checkpointer.restore(path)
+    print(f"[加载] {ckpt_dir}/step={step}")
+    
+    # 只恢复 params（不恢复 opt_state，避免损坏文件问题）
+    ckpt_manager = ocp.CheckpointManager(
+        ckpt_dir,
+        item_names=("params",),  # 只恢复 params
+    )
+    
+    # 使用模板恢复
+    restore_args = ocp.args.Composite(
+        params=ocp.args.StandardRestore(params_template),
+    )
+    
+    restored = ckpt_manager.restore(step, args=restore_args)
     return restored["params"]
 
 def main():
@@ -54,11 +81,19 @@ def main():
         num_blocks=config.num_blocks,
     )
     
+    # 初始化参数模板（用于 orbax 恢复）
+    dummy_obs = jnp.zeros((1, 240, 10, 9))
+    params_template = net.init(jax.random.PRNGKey(0), dummy_obs, train=False)['params']
+    
     # 加载参数
     try:
-        params = load_model(ckpt_path)
-    except FileNotFoundError:
-        print(f"错误: 找不到模型文件 {ckpt_path}")
+        params = load_model(ckpt_path, params_template)
+    except FileNotFoundError as e:
+        print(f"错误: {e}")
+        return
+    except Exception as e:
+        print(f"加载失败: {e}")
+        print("提示: checkpoint 可能损坏，请重新从训练机器复制完整的 checkpoints 目录")
         return
 
     def ai_callback(state):

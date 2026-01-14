@@ -91,11 +91,12 @@ devices = jax.local_devices()
 num_devices = len(devices)
 
 def replicate_to_devices(pytree):
-    """将 pytree 复制到所有设备 (替代已废弃的 device_put_replicated)"""
-    return jax.device_put(
-        jax.tree.map(lambda x: jnp.stack([x] * num_devices), pytree),
-        devices
-    )
+    """将 pytree 复制到所有设备"""
+    # 使用 device_put_replicated（虽然废弃但仍可用且最可靠）
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return jax.device_put_replicated(pytree, devices)
 
 env = XiangqiEnv(
     max_steps=config.max_steps,
