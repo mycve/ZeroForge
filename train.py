@@ -649,8 +649,17 @@ def restore_checkpoint(
     
     print(f"[Checkpoint] 正在恢复 step={latest_step}...")
     
+    # 构建恢复目标结构 (提供给 orbax 以正确恢复)
+    restore_target = {
+        "params": params_template,
+        "opt_state": opt_state_template,
+        "iteration": np.array(0),
+        "frames": np.array(0),
+        "rng_key": jax.random.PRNGKey(0),
+    }
+    
     # 恢复主状态
-    restored = ckpt_manager.restore(latest_step)
+    restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
     
     params = restored["params"]
     opt_state = restored["opt_state"]
