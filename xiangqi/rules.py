@@ -421,52 +421,96 @@ def find_king(board: jnp.ndarray, player: jnp.ndarray) -> tuple[jnp.ndarray, jnp
 @jax.jit
 def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     """
-    检查指定玩家是否被将军
-    
-    Args:
-        board: 棋盘状态
-        player: 被检查的玩家 (0=红, 1=黑)
-        
-    Returns:
-        是否被将军
+    以将/帅为中心的快速将军检测 (King-centric)
+    由原来的 O(90) 降低为 O(1) 的固定检测，极大减少 XLA 图节点数量
     """
     king_row, king_col = find_king(board, player)
-    enemy = 1 - player
     
-    # 检查所有敌方棋子是否能攻击到将/帅
-    # 使用 vmap 替代 Python for 循环，大幅减少编译时的图节点数量
-    sqs = jnp.arange(NUM_SQUARES)
-    def check_sq_attack(sq):
-        row = sq // BOARD_WIDTH
-        col = sq % BOARD_WIDTH
-        piece = board[row, col]
-        is_enemy = is_enemy_piece(piece, player)
-        can_attack = is_valid_move_for_piece(
-            board, row, col, king_row, king_col, get_piece_type(piece), enemy
-        )
-        return is_enemy & can_attack
+    # 敌方棋子类型
+    is_red = player == 0
+    E_KING = jnp.where(is_red, B_KING, R_KING)
+    E_ROOK = jnp.where(is_red, B_ROOK, R_ROOK)
+    E_CANNON = jnp.where(is_red, B_CANNON, R_CANNON)
+    E_KNIGHT = jnp.where(is_red, B_KNIGHT, R_KNIGHT)
+    E_PAWN = jnp.where(is_red, B_PAWN, R_PAWN)
     
-    in_check = jnp.any(jax.vmap(check_sq_attack)(sqs))
+    # 1. 探测四个方向的直线攻击 (车、炮、王见王)
+    def scan_line(dr, dc):
+        # 使用 arange 探测
+        idx = jnp.arange(1, 10)
+        rows = jnp.clip(king_row + dr * idx, 0, BOARD_HEIGHT - 1)
+        cols = jnp.clip(king_col + dc * idx, 0, BOARD_WIDTH - 1)
+        
+        # 边界掩码
+        in_bounds = (king_row + dr * idx >= 0) & (king_row + dr * idx < BOARD_HEIGHT) & \
+                    (king_col + dc * idx >= 0) & (king_col + dc * idx < BOARD_WIDTH)
+        
+        pieces = jnp.where(in_bounds, board[rows, cols], EMPTY)
+        
+        # 找到第一个和第二个非空棋子
+        is_piece = pieces != EMPTY
+        first_idx = jnp.argmax(is_piece)
+        first_exists = jnp.any(is_piece)
+        first_piece = jnp.where(first_exists, pieces[first_idx], EMPTY)
+        
+        # 找第二个棋子
+        mask_after_first = jnp.arange(9) > first_idx
+        second_exists = jnp.any(is_piece & mask_after_first)
+        second_idx = jnp.argmax(is_piece & mask_after_first)
+        second_piece = jnp.where(second_exists, pieces[second_idx], EMPTY)
+        
+        # 将见将/车将军：第一个棋子是敌方王或车
+        # 注意：王见王仅在同列(dc=0)有效
+        is_king_face_to_face = (dc == 0) & (first_piece == E_KING)
+        is_rook_check = first_piece == E_ROOK
+        # 炮将军：第二个棋子是敌方炮
+        is_cannon_check = second_piece == E_CANNON
+        
+        return is_king_face_to_face | is_rook_check | is_cannon_check
+
+    check_h = scan_line(0, 1) | scan_line(0, -1)
+    check_v = scan_line(1, 0) | scan_line(-1, 0)
     
-    # 检查将帅对面（王见王）
-    enemy_king_row, enemy_king_col = find_king(board, enemy)
-    same_col = (king_col == enemy_king_col)
+    # 2. 探测马的攻击
+    knight_deltas = jnp.array([
+        [-2, -1], [-2, 1], [-1, -2], [-1, 2],
+        [1, -2], [1, 2], [2, -1], [2, 1]
+    ])
+    # 马腿位置
+    leg_deltas = jnp.array([
+        [-1, 0], [-1, 0], [0, -1], [0, 1],
+        [0, -1], [0, 1], [1, 0], [1, 0]
+    ])
     
-    # 检查中间是否有棋子
-    min_row = jnp.minimum(king_row, enemy_king_row)
-    max_row = jnp.maximum(king_row, enemy_king_row)
+    def check_knight(i):
+        dr, dc = knight_deltas[i]
+        lr, lc = leg_deltas[i]
+        tr, tc = king_row + dr, king_col + dc
+        lr, lc = king_row + lr, king_col + lc
+        
+        in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
+        leg_in_bounds = (lr >= 0) & (lr < BOARD_HEIGHT) & (lc >= 0) & (lc < BOARD_WIDTH)
+        
+        # 无蹩马腿且目标是敌方马
+        return in_bounds & leg_in_bounds & (board[lr, lc] == EMPTY) & (board[tr, tc] == E_KNIGHT)
+
+    check_knight_all = jnp.any(jax.vmap(check_knight)(jnp.arange(8)))
     
-    # 统计两王之间的棋子数量 (使用 vmap 替代 for)
-    rows = jnp.arange(10)
-    is_between = (rows > min_row) & (rows < max_row)
-    pieces_at_col = board[rows, king_col]
-    pieces_between = jnp.sum(jnp.where(is_between & (pieces_at_col != EMPTY), 1, 0))
+    # 3. 探测兵的攻击
+    # 红方将(帅)在下方，会被黑方卒(向下走)攻击：dr = +1
+    # 黑方将(将)在上方，会被红方兵(向上走)攻击：dr = -1
+    pawn_dr = jnp.where(is_red, 1, -1)
+    pawn_deltas = jnp.array([[pawn_dr, 0], [0, -1], [0, 1]])
     
-    # 同列且中间无子则对面
-    face_to_face = same_col & (pieces_between == 0)
-    in_check = in_check | face_to_face
+    def check_pawn(i):
+        dr, dc = pawn_deltas[i]
+        tr, tc = king_row + dr, king_col + dc
+        in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
+        return in_bounds & (board[tr, tc] == E_PAWN)
+        
+    check_pawn_all = jnp.any(jax.vmap(check_pawn)(jnp.arange(3)))
     
-    return in_check
+    return check_h | check_v | check_knight_all | check_pawn_all
 
 
 @jax.jit

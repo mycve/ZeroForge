@@ -26,6 +26,15 @@ jax.config.update("jax_compilation_cache_dir", cache_dir)
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)  # 缓存所有编译结果
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # 不管编译时间都缓存
 
+# --- XLA 编译加速建议 (无损方案) ---
+# 1. 允许 XLA 融合更多算子
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_enable_highest_priority_async_stream=true "
+)
+# 2. 强制使用 32 位哈希 (已在 env.py 实现)
+# 3. 避免不需要的 64 位运算
+jax.config.update("jax_enable_x64", False)
+
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
 from xiangqi.mirror import mirror_observation, mirror_policy
@@ -48,11 +57,11 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 1024
+    training_batch_size: int = 512
     td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 1024
+    selfplay_batch_size: int = 512
     num_simulations: int = 128       # 统一模拟次数 (移除强弱差异)
     top_k: int = 32                 # top-k ≈ simulations / 4
     
@@ -66,7 +75,7 @@ class Config:
     temperature_final: float = 0.2
     
     # 环境规则
-    max_steps: int = 200
+    max_steps: int = 150
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     perpetual_check_threshold: int = 6
@@ -89,6 +98,9 @@ config = Config()
 
 devices = jax.local_devices()
 num_devices = len(devices)
+
+# 预计算旋转索引，避免在 JIT 循环内重复计算
+_ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def replicate_to_devices(pytree):
     """将 pytree 复制到所有设备"""
@@ -123,9 +135,7 @@ def recurrent_fn(params, rng_key, action, state):
     obs = jax.vmap(env.observe)(state)
     logits, value = forward(params, obs)
     
-    rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-    rotated_idx = rotate_action(rotate_idx)
-    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
+    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
@@ -175,9 +185,7 @@ def selfplay(params, rng_key):
         obs = jax.vmap(env.observe)(state)
         logits, value = forward(params, obs)
         
-        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-        rotated_idx = rotate_action(rotate_idx)
-        logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, rotated_idx])
+        logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
         # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
@@ -216,7 +224,7 @@ def selfplay(params, rng_key):
         next_state = jax.vmap(env.step)(state, action)
         
         normalized_action_weights = jnp.where(state.current_player[:, None] == 0, 
-                                              action_weights, action_weights[:, rotated_idx])
+                                              action_weights, action_weights[:, _ROTATED_IDX])
         
         data = SelfplayOutput(
             obs=obs, action_weights=normalized_action_weights,
@@ -238,58 +246,31 @@ def selfplay(params, rng_key):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """计算 n-step TD 目标 (MuZero 风格)
-    
-    公式: V_target(t) = r(t) + γ*r(t+1) + ... + γ^(n-1)*r(t+n-1) + γ^n * V(t+n)
-    
-    优点：
-    - 比纯蒙特卡洛方差更小
-    - 比 TD(0) 偏差更小
-    - 平衡方差与偏差的最优折中
-    """
-    # data shape: [max_steps, batch_size, ...]
+    """优化后的 n-step TD 目标计算 (移除 nested vmap/scan)"""
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     n = config.td_steps
     
-    # 有效步骤掩码
+    # 1. 严格对齐原始掩码逻辑：只保留已完成对局的步骤，丢弃最后一段未完成的对局
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # 计算 n-step TD 目标
-    # 预计算：每个位置之前是否已经终止（用于过滤无效步骤）
-    # terminated[i] = True 表示第 i 步执行后游戏结束
-    # 我们需要 cumsum 来标记"游戏已经在之前结束"的步骤
-    terminated_cumsum = jnp.cumsum(data.terminated.astype(jnp.int32), axis=0)
-    already_done = terminated_cumsum > 1  # >1 表示之前某步已经终止，当前是无效数据
+    # 2. 准备数据：填充 0 避免越界
+    padded_reward = jnp.concatenate([data.reward, jnp.zeros((n, batch_size))], axis=0)
+    padded_discount = jnp.concatenate([data.discount, jnp.zeros((n, batch_size))], axis=0)
+    padded_root_v = jnp.concatenate([data.root_value, jnp.zeros((n, batch_size))], axis=0)
     
-    def compute_td_target(t):
-        """计算时刻 t 的 n-step TD 目标"""
-        # 累积 n 步奖励
-        def accum_reward(carry, i):
-            accum, gamma_power = carry
-            step_idx = jnp.minimum(t + i, max_steps - 1)
-            # 只在有效步骤累积奖励（包括终局那一步，但排除之后的无效步骤）
-            is_valid = (t + i < max_steps) & ~already_done[step_idx]
-            r = jnp.where(is_valid, data.reward[step_idx], 0.0)
-            new_accum = accum + gamma_power * r
-            # discount: -1 (交替) 或 0 (终止)
-            new_gamma = gamma_power * data.discount[step_idx]
-            return (new_accum, new_gamma), None
+    def get_td_for_step(t):
+        # 初始为 n 步后的 bootstrap 价值
+        res_val = padded_root_v[t + n]
         
-        (n_step_return, final_gamma), _ = jax.lax.scan(
-            accum_reward, (jnp.zeros(batch_size), jnp.ones(batch_size)), jnp.arange(n)
-        )
-        
-        # Bootstrap: 加上 n 步后的价值估计
-        bootstrap_idx = jnp.minimum(t + n, max_steps - 1)
-        # 如果 n 步后游戏未结束，用 MCTS 价值 bootstrap
-        game_not_ended = ~data.terminated[bootstrap_idx]
-        bootstrap_value = jnp.where(game_not_ended, data.root_value[bootstrap_idx], 0.0)
-        
-        td_target = n_step_return + final_gamma * bootstrap_value
-        return td_target
-    
-    # 对所有时刻计算 TD 目标
-    value_tgt = jax.vmap(compute_td_target)(jnp.arange(max_steps))
+        # 逆向迭代累加奖励：G_t = r_t + gamma_t * G_{t+1}
+        # 当 gamma_i 为 0 时（即 terminated），会自动切断后续奖励和 bootstrap 的贡献
+        for i in reversed(range(n)):
+            curr_idx = t + i
+            res_val = padded_reward[curr_idx] + padded_discount[curr_idx] * res_val
+        return res_val
+
+    # 对所有 t 向量化
+    value_tgt = jax.vmap(get_td_for_step)(jnp.arange(max_steps))
     
     return Sample(
         obs=data.obs, 
@@ -363,9 +344,7 @@ def evaluate(params_red, params_black, rng_key):
         logits = jnp.where(is_red[:, None], logits_r, logits_b)
         value = jnp.where(is_red, value_r, value_b)
         
-        rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
-        rotated_idx = rotate_action(rotate_idx)
-        logits = jnp.where(is_red[:, None], logits, logits[:, rotated_idx])
+        logits = jnp.where(is_red[:, None], logits, logits[:, _ROTATED_IDX])
         
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         
