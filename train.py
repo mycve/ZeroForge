@@ -610,10 +610,10 @@ def save_checkpoint(
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     
-    # 保存 ELO 和历史模型索引
+    # 保存 ELO 和历史模型索引 (转换为 Python 原生类型，避免 JSON 序列化错误)
     with open(os.path.join(meta_dir, "metadata.json"), "w") as f:
         json.dump({
-            "iteration_elos": {str(k): v for k, v in train_state.iteration_elos.items()},
+            "iteration_elos": {str(k): float(v) for k, v in train_state.iteration_elos.items()},
             "history_model_keys": [int(k) for k in train_state.history_models.keys()],
         }, f)
     
