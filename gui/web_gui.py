@@ -1,317 +1,242 @@
 """
-Gradio Web GUI for Chinese Chess (中国象棋)
-使用 SVG 绘制棋盘，支持点击交互
+ZeroForge Web GUI - 现代化象棋对弈界面
+支持人机、双 AI、UCI 引擎对弈，自适应移动端
 """
 
+import os
+import time
+import subprocess
+import threading
+import queue
 import gradio as gr
 import numpy as np
-from typing import Optional, Callable, Tuple, List
+from typing import Optional, Tuple, List
 from dataclasses import dataclass
-import json
+import traceback
 
 import jax
 import jax.numpy as jnp
+import orbax.checkpoint as ocp
+import mctx
+
 from xiangqi.env import XiangqiEnv, XiangqiState
 from xiangqi.rules import (
     get_legal_moves_mask, is_in_check, find_king,
     BOARD_WIDTH, BOARD_HEIGHT
 )
-from xiangqi.actions import move_to_action, action_to_move
+from xiangqi.actions import (
+    move_to_action, action_to_move, move_to_uci, uci_to_move,
+    ACTION_SPACE_SIZE, rotate_action
+)
+from networks.alphazero import AlphaZeroNetwork
 
 # ============================================================================
-# 常量定义
+# 常量与配置
 # ============================================================================
 
-# 棋盘尺寸
 CELL_SIZE = 60
 BOARD_MARGIN = 40
 PIECE_RADIUS = 26
-
-# SVG 尺寸
 SVG_WIDTH = BOARD_MARGIN * 2 + CELL_SIZE * (BOARD_WIDTH - 1)
 SVG_HEIGHT = BOARD_MARGIN * 2 + CELL_SIZE * (BOARD_HEIGHT - 1)
 
-# 颜色
-COLOR_BG = "#DEB887"  # 棋盘背景
-COLOR_LINE = "#8B4513"  # 线条
-COLOR_RED = "#CC0000"  # 红方
-COLOR_BLACK = "#000000"  # 黑方
-COLOR_SELECTED = "#FFD700"  # 选中
-COLOR_LEGAL = "#00FF00"  # 合法走法
-COLOR_LAST_MOVE = "#87CEEB"  # 上一步
-COLOR_CHECK = "#FF6347"  # 将军
+COLOR_BG = "#F5DEB3"
+COLOR_LINE = "#5D4037"
+COLOR_RED = "#D32F2F"
+COLOR_BLACK = "#212121"
+COLOR_SELECTED = "#FFD600"
+COLOR_LEGAL = "#4CAF50"
+COLOR_LAST_MOVE = "#03A9F4"
+COLOR_CHECK = "#F44336"
 
-# 棋子名称
 PIECE_NAMES = {
-    1: ('帅', '将'),
-    2: ('仕', '士'),
-    3: ('相', '象'),
-    4: ('马', '马'),
-    5: ('车', '车'),
-    6: ('炮', '炮'),
-    7: ('兵', '卒'),
+    1: ('帅', '将'), 2: ('仕', '士'), 3: ('相', '象'),
+    4: ('马', '马'), 5: ('车', '车'), 6: ('炮', '炮'), 7: ('兵', '卒'),
 }
 
-# 初始 FEN
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 
-# FEN 字符映射
-FEN_TO_PIECE = {
-    'K': 1, 'A': 2, 'B': 3, 'N': 4, 'R': 5, 'C': 6, 'P': 7,
-    'k': -1, 'a': -2, 'b': -3, 'n': -4, 'r': -5, 'c': -6, 'p': -7,
-}
-PIECE_TO_FEN = {v: k for k, v in FEN_TO_PIECE.items()}
-
-
 # ============================================================================
-# FEN 解析
+# 工具函数
 # ============================================================================
+
+def list_checkpoints(ckpt_dir: str) -> List[int]:
+    """列出目录下所有的 step 编号"""
+    if not os.path.exists(ckpt_dir):
+        return []
+    steps = []
+    for d in os.listdir(ckpt_dir):
+        if os.path.isdir(os.path.join(ckpt_dir, d)) and d.isdigit():
+            steps.append(int(d))
+    return sorted(steps, reverse=True)
 
 def parse_fen(fen: str) -> Tuple[np.ndarray, int]:
-    """解析 FEN 字符串
-    
-    FEN 从上到下描述棋盘（黑方在上），但我们的坐标系：
-    - row 0-4 是红方（屏幕下方）
-    - row 5-9 是黑方（屏幕上方）
-    所以 FEN 第一行对应 row 9，最后一行对应 row 0
-    """
     parts = fen.strip().split()
     board_str = parts[0]
     player = 0 if len(parts) < 2 or parts[1].lower() in ['w', 'r'] else 1
-    
     board = np.zeros((BOARD_HEIGHT, BOARD_WIDTH), dtype=np.int8)
+    FEN_TO_PIECE = {'K':1,'A':2,'B':3,'N':4,'R':5,'C':6,'P':7,'k':-1,'a':-2,'b':-3,'n':-4,'r':-5,'c':-6,'p':-7}
     rows = board_str.split('/')
-    
-    for fen_row_idx, row_str in enumerate(rows):
-        # FEN row 0 -> board row 9, FEN row 9 -> board row 0
-        board_row = BOARD_HEIGHT - 1 - fen_row_idx
+    for r_idx, r_str in enumerate(rows):
+        row = 9 - r_idx
         col = 0
-        for char in row_str:
-            if char.isdigit():
-                col += int(char)
+        for char in r_str:
+            if char.isdigit(): col += int(char)
             elif char in FEN_TO_PIECE:
-                board[board_row, col] = FEN_TO_PIECE[char]
+                board[row, col] = FEN_TO_PIECE[char]
                 col += 1
-    
     return board, player
 
-
 def board_to_fen(board: np.ndarray, player: int) -> str:
-    """棋盘转 FEN（从 row 9 到 row 0）"""
+    PIECE_TO_FEN = {1:'K',2:'A',3:'B',4:'N',5:'R',6:'C',7:'P',-1:'k',-2:'a',-3:'b',-4:'n',-5:'r',-6:'c',-7:'p'}
     rows = []
-    for row in range(BOARD_HEIGHT - 1, -1, -1):  # 从 row 9 到 row 0
-        row_str = ""
-        empty = 0
-        for col in range(BOARD_WIDTH):
-            piece = board[row, col]
-            if piece == 0:
-                empty += 1
+    for r in range(9, -1, -1):
+        r_str, empty = "", 0
+        for c in range(9):
+            p = board[r, c]
+            if p == 0: empty += 1
             else:
-                if empty > 0:
-                    row_str += str(empty)
-                    empty = 0
-                row_str += PIECE_TO_FEN.get(int(piece), '?')
-        if empty > 0:
-            row_str += str(empty)
-        rows.append(row_str)
-    
-    player_str = 'w' if player == 0 else 'b'
-    return '/'.join(rows) + ' ' + player_str
-
+                if empty > 0: r_str += str(empty); empty = 0
+                r_str += PIECE_TO_FEN[int(p)]
+        if empty > 0: r_str += str(empty)
+        rows.append(r_str)
+    return "/".join(rows) + (" w" if player == 0 else " b")
 
 # ============================================================================
-# SVG 绘制
+# UCI 引擎支持
 # ============================================================================
 
-def render_board_svg(
-    board: np.ndarray,
-    current_player: int,
-    selected: Optional[Tuple[int, int]] = None,
-    legal_moves: List[Tuple[int, int]] = None,
-    last_move: Optional[Tuple[int, int, int, int]] = None,
-    is_check: bool = False,
-    king_pos: Optional[Tuple[int, int]] = None,
-) -> str:
-    """渲染棋盘 SVG"""
-    legal_moves = legal_moves or []
-    
-    svg_parts = []
-    
-    # SVG 头部
-    svg_parts.append(f'''<svg width="{SVG_WIDTH}" height="{SVG_HEIGHT}" 
-        xmlns="http://www.w3.org/2000/svg" 
-        style="font-family: 'PingFang SC', 'Microsoft YaHei', 'SimHei', sans-serif;">''')
-    
-    # 背景
-    svg_parts.append(f'<rect width="100%" height="100%" fill="{COLOR_BG}"/>')
-    
-    # 绘制网格线
-    svg_parts.append(_draw_grid())
-    
-    # 绘制九宫格斜线
-    svg_parts.append(_draw_palace())
-    
-    # 绘制河界
-    svg_parts.append(_draw_river())
-    
-    # 高亮上一步
-    if last_move:
-        fr, fc, tr, tc = last_move
-        for r, c in [(fr, fc), (tr, tc)]:
-            x, y = _board_to_svg(r, c)
-            svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS + 5}" '
-                           f'fill="none" stroke="{COLOR_LAST_MOVE}" stroke-width="3"/>')
-    
-    # 高亮选中的棋子
-    if selected:
-        r, c = selected
-        x, y = _board_to_svg(r, c)
-        svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS + 5}" '
-                       f'fill="none" stroke="{COLOR_SELECTED}" stroke-width="3"/>')
-    
-    # 显示合法走法
-    for r, c in legal_moves:
-        x, y = _board_to_svg(r, c)
-        if board[r, c] == 0:
-            svg_parts.append(f'<circle cx="{x}" cy="{y}" r="8" fill="{COLOR_LEGAL}" opacity="0.7"/>')
-        else:
-            svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS + 3}" '
-                           f'fill="none" stroke="{COLOR_LEGAL}" stroke-width="3" opacity="0.7"/>')
-    
-    # 将军警告
-    if is_check and king_pos:
-        r, c = king_pos
-        x, y = _board_to_svg(r, c)
-        svg_parts.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS + 8}" '
-                       f'fill="none" stroke="{COLOR_CHECK}" stroke-width="4"/>')
-    
-    # 绘制棋子
-    for row in range(BOARD_HEIGHT):
-        for col in range(BOARD_WIDTH):
-            piece = board[row, col]
-            if piece != 0:
-                svg_parts.append(_draw_piece(row, col, piece))
-    
-    # 绘制点击区域（透明，带 data 属性）
-    for row in range(BOARD_HEIGHT):
-        for col in range(BOARD_WIDTH):
-            x, y = _board_to_svg(row, col)
-            svg_parts.append(
-                f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS}" '
-                f'fill="transparent" style="cursor:pointer" '
-                f'class="click-area" data-row="{row}" data-col="{col}"/>'
+class UCIEngine:
+    def __init__(self, path: str):
+        self.path = path
+        self.process = None
+        self.output_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self.lock = threading.Lock()
+
+    def start(self):
+        try:
+            self.process = subprocess.Popen(
+                [self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1
             )
-    
-    svg_parts.append('</svg>')
-    
-    return '\n'.join(svg_parts)
+            self._stop_event.clear()
+            threading.Thread(target=self._read_stdout, daemon=True).start()
+            self.send("uci")
+            return True
+        except Exception as e:
+            print(f"[UCI] 启动失败: {e}")
+            return False
 
+    def _read_stdout(self):
+        while not self._stop_event.is_set() and self.process and self.process.poll() is None:
+            line = self.process.stdout.readline()
+            if line: self.output_queue.put(line.strip())
 
-def _board_to_svg(row: int, col: int) -> Tuple[int, int]:
-    """棋盘坐标转 SVG 坐标
-    
-    棋盘坐标: row 0-4 是红方(下方), row 5-9 是黑方(上方)
-    屏幕坐标: y=0 在上方
-    所以需要翻转: row 9 -> y 最小, row 0 -> y 最大
-    """
-    x = BOARD_MARGIN + col * CELL_SIZE
-    y = BOARD_MARGIN + (BOARD_HEIGHT - 1 - row) * CELL_SIZE  # 翻转 y 轴
-    return x, y
+    def send(self, cmd: str):
+        if self.process and self.process.stdin:
+            self.process.stdin.write(f"{cmd}\n")
+            self.process.stdin.flush()
 
+    def get_best_move(self, fen: str, movetime: int = 1000, depth: Optional[int] = None) -> Optional[str]:
+        with self.lock:
+            while not self.output_queue.empty(): self.output_queue.get()
+            self.send(f"position fen {fen}")
+            if depth is not None and depth > 0:
+                self.send(f"go depth {depth}")
+            else:
+                self.send(f"go movetime {movetime}")
+            start_time = time.time()
+            wait_seconds = (movetime / 1000.0 + 2.0) if depth is None else max(2.0, depth * 0.5)
+            while time.time() - start_time < wait_seconds:
+                try:
+                    line = self.output_queue.get(timeout=0.1)
+                    if line.startswith("bestmove"): return line.split()[1]
+                except queue.Empty: continue
+        return None
 
-def _draw_grid() -> str:
-    """绘制网格"""
-    lines = []
-    
-    # 竖线
-    for i in range(BOARD_WIDTH):
-        x = BOARD_MARGIN + i * CELL_SIZE
-        # 上半部分
-        lines.append(f'<line x1="{x}" y1="{BOARD_MARGIN}" '
-                    f'x2="{x}" y2="{BOARD_MARGIN + 4 * CELL_SIZE}" '
-                    f'stroke="{COLOR_LINE}" stroke-width="1"/>')
-        # 下半部分
-        lines.append(f'<line x1="{x}" y1="{BOARD_MARGIN + 5 * CELL_SIZE}" '
-                    f'x2="{x}" y2="{BOARD_MARGIN + 9 * CELL_SIZE}" '
-                    f'stroke="{COLOR_LINE}" stroke-width="1"/>')
-    
-    # 横线
-    for i in range(BOARD_HEIGHT):
-        y = BOARD_MARGIN + i * CELL_SIZE
-        width = 2 if i in [0, 9] else 1
-        lines.append(f'<line x1="{BOARD_MARGIN}" y1="{y}" '
-                    f'x2="{BOARD_MARGIN + 8 * CELL_SIZE}" y2="{y}" '
-                    f'stroke="{COLOR_LINE}" stroke-width="{width}"/>')
-    
-    # 边框
-    lines.append(f'<rect x="{BOARD_MARGIN - 2}" y="{BOARD_MARGIN - 2}" '
-                f'width="{CELL_SIZE * 8 + 4}" height="{CELL_SIZE * 9 + 4}" '
-                f'fill="none" stroke="{COLOR_LINE}" stroke-width="3"/>')
-    
-    return '\n'.join(lines)
-
-
-def _draw_palace() -> str:
-    """绘制九宫格斜线"""
-    lines = []
-    
-    # 上方九宫格（黑方）
-    x1 = BOARD_MARGIN + 3 * CELL_SIZE
-    x2 = BOARD_MARGIN + 5 * CELL_SIZE
-    y1 = BOARD_MARGIN
-    y2 = BOARD_MARGIN + 2 * CELL_SIZE
-    lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{COLOR_LINE}" stroke-width="1"/>')
-    lines.append(f'<line x1="{x2}" y1="{y1}" x2="{x1}" y2="{y2}" stroke="{COLOR_LINE}" stroke-width="1"/>')
-    
-    # 下方九宫格（红方）
-    y1 = BOARD_MARGIN + 7 * CELL_SIZE
-    y2 = BOARD_MARGIN + 9 * CELL_SIZE
-    lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{COLOR_LINE}" stroke-width="1"/>')
-    lines.append(f'<line x1="{x2}" y1="{y1}" x2="{x1}" y2="{y2}" stroke="{COLOR_LINE}" stroke-width="1"/>')
-    
-    return '\n'.join(lines)
-
-
-def _draw_river() -> str:
-    """绘制河界文字"""
-    y = BOARD_MARGIN + 4.5 * CELL_SIZE
-    return f'''
-    <text x="{BOARD_MARGIN + 1 * CELL_SIZE}" y="{y + 8}" 
-          font-size="20" fill="{COLOR_LINE}" text-anchor="middle">楚</text>
-    <text x="{BOARD_MARGIN + 2 * CELL_SIZE}" y="{y + 8}" 
-          font-size="20" fill="{COLOR_LINE}" text-anchor="middle">河</text>
-    <text x="{BOARD_MARGIN + 6 * CELL_SIZE}" y="{y + 8}" 
-          font-size="20" fill="{COLOR_LINE}" text-anchor="middle">汉</text>
-    <text x="{BOARD_MARGIN + 7 * CELL_SIZE}" y="{y + 8}" 
-          font-size="20" fill="{COLOR_LINE}" text-anchor="middle">界</text>
-    '''
-
-
-def _draw_piece(row: int, col: int, piece: int) -> str:
-    """绘制单个棋子"""
-    x, y = _board_to_svg(row, col)
-    is_red = piece > 0
-    piece_type = abs(piece)
-    
-    color = COLOR_RED if is_red else COLOR_BLACK
-    bg_color = "#FFEEDD" if is_red else "#EEEEEE"
-    name = PIECE_NAMES.get(piece_type, ('?', '?'))[0 if is_red else 1]
-    
-    return f'''
-    <circle cx="{x}" cy="{y}" r="{PIECE_RADIUS}" fill="{bg_color}" 
-            stroke="{color}" stroke-width="2"/>
-    <text x="{x}" y="{y + 8}" font-size="28" fill="{color}" 
-          text-anchor="middle" font-weight="bold">{name}</text>
-    '''
-
+    def stop(self):
+        self._stop_event.set()
+        if self.process: self.process.terminate()
 
 # ============================================================================
-# 游戏状态管理
+# AI 模型管理
+# ============================================================================
+
+class ModelManager:
+    def __init__(self):
+        self.params = None
+        self.net = None
+
+    def _infer_channels(self, params) -> Optional[int]:
+        try:
+            conv0 = params.get("Conv_0") if hasattr(params, "get") else params["Conv_0"]
+            kernel = conv0["kernel"]
+            return int(kernel.shape[-1])
+        except Exception:
+            return None
+
+    def _infer_num_blocks(self, params) -> int:
+        try:
+            keys = list(params.keys())
+            return len([k for k in keys if str(k).startswith("ResBlock_")])
+        except Exception:
+            return 0
+
+    def load(self, ckpt_dir: str, step: int):
+        ckpt_dir = os.path.abspath(ckpt_dir)
+        ckpt_manager = ocp.CheckpointManager(ckpt_dir)
+        if step == 0:
+            step = ckpt_manager.latest_step()
+        if step is None:
+            return False
+
+        restored = None
+        restore_err = None
+        try:
+            restored = ckpt_manager.restore(step)
+        except Exception as e:
+            restore_err = e
+
+        if restored is None:
+            try:
+                ckpt_path = os.path.join(ckpt_dir, str(step))
+                restored = ocp.StandardCheckpointer().restore(ckpt_path)
+            except Exception as e:
+                raise RuntimeError(f"Checkpoint 恢复失败: {restore_err or e}")
+
+        params = None
+        if isinstance(restored, dict) or hasattr(restored, "keys"):
+            if "params" in restored:
+                params = restored["params"]
+            elif "default" in restored and isinstance(restored["default"], dict) and "params" in restored["default"]:
+                params = restored["default"]["params"]
+
+        if params is None:
+            keys = list(restored.keys()) if hasattr(restored, "keys") else type(restored)
+            raise RuntimeError(f"Checkpoint 不包含 params，keys={keys}")
+
+        channels = self._infer_channels(params)
+        num_blocks = self._infer_num_blocks(params)
+        if not channels or num_blocks <= 0:
+            keys = list(params.keys()) if hasattr(params, "keys") else type(params)
+            raise RuntimeError(f"无法从参数推断网络结构，keys={keys}")
+
+        self.net = AlphaZeroNetwork(
+            action_space_size=ACTION_SPACE_SIZE,
+            channels=channels,
+            num_blocks=num_blocks,
+        )
+        self.params = params
+        print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}")
+        return True
+
+# ============================================================================
+# 游戏状态
 # ============================================================================
 
 @dataclass
 class GameState:
-    """游戏状态"""
     board: np.ndarray
     current_player: int
     selected: Optional[Tuple[int, int]] = None
@@ -324,567 +249,484 @@ class GameState:
     step_count: int = 0
     history: List = None
     jax_state: Optional[XiangqiState] = None
-    ai_value: float = 0.0  # AI 胜率评估
-    last_move_uci: str = "" # 上一步 UCI 坐标
-    
-    def __post_init__(self):
-        if self.legal_moves is None:
-            self.legal_moves = []
-        if self.history is None:
-            self.history = []
+    ai_value: float = 0.0
+    last_move_uci: str = ""
+    notice: str = ""
 
+    def __post_init__(self):
+        self.legal_moves = self.legal_moves or []
+        self.history = self.history or []
 
 class ChessGame:
-    """象棋游戏逻辑"""
-    
     def __init__(self):
         self.env = XiangqiEnv()
-        self._rng_key = jax.random.PRNGKey(42)
         self.state: Optional[GameState] = None
-        self.ai_callback: Optional[Callable] = None
-        self.ai_player: int = 1  # AI 执黑 (0=红, 1=黑, 2=双AI, -1=双人)
-        self.ai_mode: str = "人机对战 (AI执黑)"
-        self._ai_running: bool = False  # 防止 AI 并发执行
-        
-    def new_game(self, fen: str = STARTING_FEN) -> GameState:
-        """开始新游戏"""
+        self.model_mgr = ModelManager()
+        self.uci_engine: Optional[UCIEngine] = None
+        self._rng_key = jax.random.PRNGKey(int(time.time()))
+        self.red_type = "Human"
+        self.black_type = "ZeroForge AI"
+        self.uci_movetime = 1000
+        self.uci_depth = 3
+        self.ai_delay = 1.0
+
+    def new_game(self, fen: str = STARTING_FEN):
         board, player = parse_fen(fen)
-
-        jax_state = self._create_jax_state(board, player)
-        
-        self.state = GameState(
-            board=board,
-            current_player=player,
-            jax_state=jax_state,
-        )
-        self._update_check_status()
-        return self.state
-    
-    def _create_jax_state(self, board: np.ndarray, player: int) -> XiangqiState:
-        """创建 JAX 状态"""
-        self._rng_key, init_key = jax.random.split(self._rng_key)
-        state = self.env.init(init_key)
-        
-        # 替换棋盘和玩家
+        self._rng_key, sk = jax.random.split(self._rng_key)
+        jax_state = self.env.init(sk)
         jax_board = jnp.array(board, dtype=jnp.int8)
-        state = state.replace(
-            board=jax_board,
-            current_player=jnp.int32(player),
-            legal_action_mask=get_legal_moves_mask(jax_board, jnp.int32(player)),
+        jax_state = jax_state.replace(
+            board=jax_board, current_player=jnp.int32(player),
+            legal_action_mask=get_legal_moves_mask(jax_board, jnp.int32(player))
         )
-        return state
-    
-    def _update_check_status(self):
-        """更新将军状态"""
-        if self.state is None:
-            return
-        
-        jax_board = jnp.array(self.state.board, dtype=jnp.int8)
-        player = jnp.int32(self.state.current_player)
-        
-        self.state.is_check = bool(is_in_check(jax_board, player))
-        if self.state.is_check:
-            king_row, king_col = find_king(jax_board, player)
-            self.state.king_pos = (int(king_row), int(king_col))
-        else:
-            self.state.king_pos = None
-    
-    def get_legal_moves(self, row: int, col: int) -> List[Tuple[int, int]]:
-        """获取指定位置棋子的合法走法"""
-        if self.state is None:
-            return []
-        
-        piece = self.state.board[row, col]
-        if piece == 0:
-            return []
-        
-        # 检查是否是当前玩家的棋子
-        if (self.state.current_player == 0 and piece < 0) or \
-           (self.state.current_player == 1 and piece > 0):
-            return []
-        
-        moves = []
-        from_sq = row * BOARD_WIDTH + col
-        
-        legal_mask = self.state.jax_state.legal_action_mask
-        
-        for to_row in range(BOARD_HEIGHT):
-            for to_col in range(BOARD_WIDTH):
-                to_sq = to_row * BOARD_WIDTH + to_col
-                action = move_to_action(from_sq, to_sq)
-                if legal_mask[action]:
-                    moves.append((to_row, to_col))
-        
-        return moves
-    
-    def click(self, row: int, col: int) -> GameState:
-        """处理点击"""
-        if self.state is None or self.state.game_over:
-            return self.state
-        
-        piece = self.state.board[row, col]
-        is_own_piece = (self.state.current_player == 0 and piece > 0) or \
-                       (self.state.current_player == 1 and piece < 0)
-        
-        if self.state.selected is None:
-            # 没有选中棋子，尝试选择
-            if is_own_piece:
-                self.state.selected = (row, col)
-                self.state.legal_moves = self.get_legal_moves(row, col)
-        else:
-            # 已有选中的棋子
-            if (row, col) in self.state.legal_moves:
-                # 合法走法，执行
-                self._make_move(self.state.selected[0], self.state.selected[1], row, col)
-            elif is_own_piece:
-                # 选择另一个己方棋子
-                self.state.selected = (row, col)
-                self.state.legal_moves = self.get_legal_moves(row, col)
-            else:
-                # 取消选择
-                self.state.selected = None
-                self.state.legal_moves = []
-        
+        self.state = GameState(board=board, current_player=player, jax_state=jax_state)
+        self._update_status()
         return self.state
-    
-    def _make_move(self, from_row: int, from_col: int, to_row: int, to_col: int):
-        """执行走棋"""
 
-        # 保存历史
+    def _update_status(self):
+        jb = jnp.array(self.state.board, dtype=jnp.int8)
+        p = jnp.int32(self.state.current_player)
+        self.state.is_check = bool(is_in_check(jb, p))
+        if self.state.is_check:
+            r, c = find_king(jb, p)
+            self.state.king_pos = (int(r), int(c))
+        else: self.state.king_pos = None
+
+    def make_move(self, action: int):
+        if self.state.game_over: return
         self.state.history.append({
-            'board': self.state.board.copy(),
-            'player': self.state.current_player,
-            'jax_state': self.state.jax_state,
-            'ai_value': self.state.ai_value,
-            'last_move_uci': self.state.last_move_uci,
+            'jax_state': self.state.jax_state, 'last_move': self.state.last_move,
+            'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value
         })
-        
-        # 执行走棋
-        from_sq = from_row * BOARD_WIDTH + from_col
-        to_sq = to_row * BOARD_WIDTH + to_col
-        action = move_to_action(from_sq, to_sq)
-        
+        fs, ts = action_to_move(action)
+        fr, fc, tr, tc = int(fs)//9, int(fs)%9, int(ts)//9, int(ts)%9
         new_jax_state = self.env.step(self.state.jax_state, action)
-        
-        # 生成 UCI 坐标
-        cols = 'abcdefghi'
-        self.state.last_move_uci = f"{cols[from_col]}{from_row}{cols[to_col]}{to_row}"
-        
-        # 更新状态
+        self.state.jax_state = new_jax_state
         self.state.board = np.array(new_jax_state.board)
         self.state.current_player = int(new_jax_state.current_player)
-        self.state.jax_state = new_jax_state
-        self.state.last_move = (from_row, from_col, to_row, to_col)
-        self.state.selected = None
-        self.state.legal_moves = []
+        self.state.last_move = (fr, fc, tr, tc)
+        self.state.last_move_uci = move_to_uci(int(fs), int(ts))
         self.state.step_count += 1
         self.state.game_over = bool(new_jax_state.terminated)
         self.state.winner = int(new_jax_state.winner)
-        
-        self._update_check_status()
-    
-    def undo(self) -> GameState:
-        """悔棋"""
-        if self.state is None or len(self.state.history) == 0:
-            return self.state
-        
-        prev = self.state.history.pop()
-        self.state.board = prev['board']
-        self.state.current_player = prev['player']
-        self.state.jax_state = prev['jax_state']
-        self.state.ai_value = prev.get('ai_value', 0.0)
-        self.state.last_move_uci = prev.get('last_move_uci', "")
         self.state.selected = None
         self.state.legal_moves = []
-        self.state.last_move = None
-        self.state.step_count = max(0, self.state.step_count - 1)
-        self.state.game_over = False
-        self.state.winner = -1
-        
-        self._update_check_status()
-        return self.state
-    
-    def ai_move(self) -> GameState:
-        """AI 走棋"""
-        if self.state is None or self.state.game_over:
-            return self.state
-        if self.ai_callback is None:
-            return self.state
-        
-        # 防止并发执行
-        if self._ai_running:
-            print("[GUI警告] AI 正在执行中，跳过本次调用")
-            return self.state
-        
-        self._ai_running = True
-        try:
-            return self._ai_move_impl()
-        finally:
-            self._ai_running = False
-    
-    def _ai_move_impl(self) -> GameState:
-        """AI 走棋的实际实现"""
-        # 在 AI 计算前，确保 GUI 状态和 JAX 状态同步
-        jax_board = np.array(self.state.jax_state.board)
-        jax_player = int(self.state.jax_state.current_player)
-        
-        # 始终打印状态对比
-        boards_equal = np.array_equal(self.state.board, jax_board)
-        players_equal = self.state.current_player == jax_player
-        print(f"\n[AI计算前状态] 玩家: GUI={self.state.current_player}, JAX={jax_player}, 一致={players_equal}")
-        print(f"[AI计算前状态] 棋盘一致={boards_equal}")
-        if not boards_equal:
-            print(f"[AI计算前状态] GUI board:")
-            print(self.state.board)
-            print(f"[AI计算前状态] JAX board:")
-            print(jax_board)
-            # 找出差异
-            diff = self.state.board != jax_board
-            diff_positions = np.argwhere(diff)
-            for pos in diff_positions:
-                r, c = pos
-                print(f"  差异: ({r},{c}) GUI={self.state.board[r,c]} JAX={jax_board[r,c]}")
-        
-        if not boards_equal or not players_equal:
-            print(f"[GUI严重警告] ⚠️ 状态不同步！强制同步...")
-            self.state.board = jax_board.copy()
-            self.state.current_player = jax_player
-        
-        # 调用 AI
-        result = self.ai_callback(self.state.jax_state)
-        if isinstance(result, tuple):
-            action, value = result
-        else:
-            action, value = result, 0.0
-            
-        if action is not None:
-            self.state.ai_value = value
-            from_sq, to_sq = action_to_move(action)
-            from_row, from_col = int(from_sq) // BOARD_WIDTH, int(from_sq) % BOARD_WIDTH
-            to_row, to_col = int(to_sq) // BOARD_WIDTH, int(to_sq) % BOARD_WIDTH
-            
-            # 调试验证：检查状态一致性和动作合法性
-            jax_board = np.array(self.state.jax_state.board)
-            jax_player = int(self.state.jax_state.current_player)
-            
-            # 首先检查 GUI board 和 jax_state.board 是否一致
-            if not np.array_equal(self.state.board, jax_board):
-                print(f"[GUI严重警告] ⚠️ 状态不一致！GUI board 和 jax_state.board 不同！")
-                print(f"[GUI警告] GUI board:")
-                print(self.state.board)
-                print(f"[GUI警告] jax_state.board:")
-                print(jax_board)
-                # 同步状态
-                self.state.board = jax_board.copy()
-                self.state.current_player = jax_player
-                print(f"[GUI警告] 已强制同步状态")
-            
-            if self.state.current_player != jax_player:
-                print(f"[GUI严重警告] ⚠️ 玩家不一致！GUI={self.state.current_player}, JAX={jax_player}")
-                self.state.current_player = jax_player
-            
-            piece_at_from = self.state.board[from_row, from_col]
-            current_player = self.state.current_player
-            is_own_piece = (current_player == 0 and piece_at_from > 0) or \
-                          (current_player == 1 and piece_at_from < 0)
-            
-            if piece_at_from == 0:
-                print(f"[GUI警告] AI选择的动作起点没有棋子！")
-                print(f"[GUI警告] 动作: {action}, 起点: ({from_row},{from_col})")
-                print(f"[GUI警告] 棋盘状态:")
-                print(self.state.board)
-            elif not is_own_piece:
-                print(f"[GUI警告] AI选择的动作起点不是己方棋子！")
-                print(f"[GUI警告] 玩家: {current_player}, 起点棋子: {piece_at_from}")
-                print(f"[GUI警告] 动作: {action}, 起点: ({from_row},{from_col})")
-                print(f"[GUI警告] 棋盘状态:")
-                print(self.state.board)
-            
-            self._make_move(from_row, from_col, to_row, to_col)
-        
-        return self.state
+        self._update_status()
 
+    def undo(self):
+        if self.state.history:
+            h = self.state.history.pop()
+            self.state.jax_state = h['jax_state']
+            self.state.board = np.array(h['jax_state'].board)
+            self.state.current_player = int(h['jax_state'].current_player)
+            self.state.last_move = h['last_move']
+            self.state.last_move_uci = h['last_move_uci']
+            self.state.ai_value = h['ai_value']
+            self.state.step_count -= 1
+            self.state.game_over = False
+            self.state.selected = None
+            self.state.legal_moves = []
+            self._update_status()
 
-# ============================================================================
-# Gradio 界面
-# ============================================================================
-
-def create_gui(ai_callback: Optional[Callable] = None):
-    """创建 Gradio 界面"""
-    
-    game = ChessGame()
-    game.ai_callback = ai_callback
-    
-    # 预热 JAX (第一次运行会编译，比较慢)
-    print("[Web GUI] 预热 JAX JIT 编译 (首次启动较慢，请等待)...")
-    print("[Web GUI] - 初始化环境...")
-    game.new_game()
-    print("[Web GUI] - 预编译走棋函数...")
-    # 执行一次走棋来预编译 step 函数
-    if game.state and game.state.jax_state:
-        legal_actions = jnp.where(game.state.jax_state.legal_action_mask)[0]
-        if len(legal_actions) > 0:
-            test_action = int(legal_actions[0])
-            _ = game.env.step(game.state.jax_state, test_action)
-    print("[Web GUI] JAX 预热完成!")
-    
-    def render():
-        """渲染当前状态"""
-        if game.state is None:
-            game.new_game()
+    def get_ai_action(self) -> Optional[int]:
+        if not self.model_mgr.params: return None
+        obs = self.env.observe(self.state.jax_state)[None, ...]
+        logits, value = self.model_mgr.net.apply({'params': self.model_mgr.params}, obs, train=False)
         
-        svg = render_board_svg(
-            board=game.state.board,
-            current_player=game.state.current_player,
-            selected=game.state.selected,
-            legal_moves=game.state.legal_moves,
-            last_move=game.state.last_move,
-            is_check=game.state.is_check,
-            king_pos=game.state.king_pos,
+        _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
+        
+        if self.state.current_player == 1: logits = logits[:, _ROTATED_IDX]
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        logits = jnp.where(self.state.jax_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        
+        def recurrent_fn(model, rng_key, action, state):
+            prev_p = state.current_player
+            ns = jax.vmap(self.env.step)(state, action)
+            obs = jax.vmap(self.env.observe)(ns)
+            l, v = self.model_mgr.net.apply({'params': self.model_mgr.params}, obs, train=False)
+            l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
+            l = l - jnp.max(l, axis=-1, keepdims=True)
+            l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
+            return mctx.RecurrentFnOutput(reward=ns.rewards[jnp.arange(ns.rewards.shape[0]), prev_p], 
+                                          discount=jnp.where(ns.terminated, 0.0, -1.0), prior_logits=l, value=v), ns
+
+        self._rng_key, sk = jax.random.split(self._rng_key)
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), self.state.jax_state))
+        policy_output = mctx.gumbel_muzero_policy(params=None, rng_key=sk, root=root, recurrent_fn=recurrent_fn,
+            num_simulations=256, max_num_considered_actions=32, invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
+        self.state.ai_value = float(value[0])
+        return int(jnp.argmax(policy_output.action_weights[0]))
+
+    def get_uci_action(self) -> Optional[int]:
+        if not self.uci_engine: return None
+        bm = self.uci_engine.get_best_move(
+            board_to_fen(self.state.board, self.state.current_player),
+            self.uci_movetime,
+            self.uci_depth
         )
-        
-        # 状态信息
-        player_name = "红方" if game.state.current_player == 0 else "黑方"
-        status = f"当前: {player_name} | 步数: {game.state.step_count}"
-        
-        if game.state.game_over:
-            if game.state.winner == 0:
-                status = "🎉 游戏结束 - 红方胜！"
-            elif game.state.winner == 1:
-                status = "🎉 游戏结束 - 黑方胜！"
-            else:
-                status = "🤝 游戏结束 - 和棋"
-        elif game.state.is_check:
-            status += " | ⚠️ 将军！"
-        
-        # 胜率评估
-        # ai_value 已经是红方视角的评价 (-1 to 1)，直接转换为百分比
-        red_val = game.state.ai_value
-        win_rate_red = (red_val + 1) / 2 * 100
-        
-        eval_text = f"红方胜率评估: {win_rate_red:.1f}%"
-        if game.state.last_move_uci:
-            eval_text += f" | 上一着: {game.state.last_move_uci}"
-            
-        fen = board_to_fen(game.state.board, game.state.current_player)
-        
-        return svg, status, eval_text, fen
-    
-    def on_click(row: int, col: int):
-        """处理点击"""
-        game.click(row, col)
-        # 如果当前是 AI 回合，且不是双人模式，则触发 AI 走棋
-        if not game.state.game_over:
-            if (game.ai_player == game.state.current_player) or (game.ai_player == 2):
-                game.ai_move()
-        return render()
-    
-    def new_game_click():
-        """新游戏"""
-        game.new_game()
-        # 如果 AI 执红，则立即走第一步
-        if game.ai_player == 0 or game.ai_player == 2:
-            game.ai_move()
-        return render()
-    
-    def undo_click():
-        """悔棋"""
-        game.undo()
-        # 人机模式下，悔棋通常要悔两步
-        if game.ai_player != -1 and game.ai_player != 2:
-            game.undo()
-        return render()
-    
-    def ai_move_click():
-        """手动触发 AI 走棋"""
-        game.ai_move()
-        return render()
-    
-    def switch_mode_click(mode):
-        """切换模式"""
-        if mode == "人机 (AI执黑)":
-            game.ai_player = 1
-        elif mode == "人机 (AI执红)":
-            game.ai_player = 0
-        elif mode == "双AI对弈":
-            game.ai_player = 2
-        else: # 双人对弈
-            game.ai_player = -1
-        
-        game.ai_mode = mode
-        # 如果切换到 AI 回合，自动走棋
-        if not game.state.game_over:
-            if (game.ai_player == game.state.current_player) or (game.ai_player == 2):
-                game.ai_move()
-        return render()
-    
-    def auto_play_loop():
-        """自动对弈循环"""
-        if not game.state.game_over and game.ai_player == 2:
-            game.ai_move()
-            return render()
-        return render()
-    
-    def import_fen_click(fen: str):
-        """导入 FEN"""
+        if not bm:
+            return None
+        if bm in ("(none)", "0000"):
+            print(f"[UCI] bestmove 无效: {bm}")
+            return None
         try:
-            game.new_game(fen)
-            return render() + ("导入成功",)
+            f, t = uci_to_move(bm)
         except Exception as e:
-            svg, status, current_fen = render()
-            return svg, status, current_fen, f"导入失败: {e}"
-    
-    # JavaScript 注入到全局 - 使用事件委托
-    js_init = """
-    function setupChessBoard() {
-        document.addEventListener('click', function(e) {
-            const target = e.target;
-            if (target.classList && target.classList.contains('click-area')) {
-                const row = target.getAttribute('data-row');
-                const col = target.getAttribute('data-col');
-                if (row !== null && col !== null) {
-                    triggerMove(row, col);
-                }
-            }
-        });
-    }
-    
-    function triggerMove(row, col) {
-        let rowInput = document.querySelector('#row-input textarea') 
-                    || document.querySelector('#row-input input')
-                    || document.querySelector('[id*="row-input"] textarea')
-                    || document.querySelector('[id*="row-input"] input');
-        let colInput = document.querySelector('#col-input textarea')
-                    || document.querySelector('#col-input input')
-                    || document.querySelector('[id*="col-input"] textarea')
-                    || document.querySelector('[id*="col-input"] input');
-        let clickBtn = document.querySelector('#click-handler')
-                    || document.querySelector('[id*="click-handler"]')
-                    || document.querySelector('button[id*="click-handler"]');
-        
-        if (rowInput && colInput && clickBtn) {
-            const setter = rowInput.tagName === 'TEXTAREA' 
-                ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
-                : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            
-            setter.call(rowInput, row.toString());
-            setter.call(colInput, col.toString());
-            
-            rowInput.dispatchEvent(new Event('input', { bubbles: true }));
-            colInput.dispatchEvent(new Event('input', { bubbles: true }));
-            
-            setTimeout(() => clickBtn.click(), 30);
-        }
-    }
-    
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', setupChessBoard);
-    } else {
-        setupChessBoard();
-    }
-    """
-    
-    # 创建界面
-    with gr.Blocks(title="中国象棋 - ZeroForge", theme=gr.themes.Soft(), js=js_init) as demo:
-        gr.Markdown("# 🎮 中国象棋 - ZeroForge AI")
-        
+            print(f"[UCI] bestmove 解析失败: {bm}, err={e}")
+            return None
+        return int(move_to_action(f, t))
+        return None
+
+# ============================================================================
+# GUI 绘制
+# ============================================================================
+
+def render_svg(game: ChessGame) -> str:
+    s = game.state
+    svg = [f'<svg width="100%" height="100%" viewBox="0 0 {SVG_WIDTH} {SVG_HEIGHT}" xmlns="http://www.w3.org/2000/svg">']
+    svg.append(f'<rect width="100%" height="100%" fill="{COLOR_BG}"/>')
+    for i in range(9):
+        x = BOARD_MARGIN + i * CELL_SIZE
+        svg.append(f'<line x1="{x}" y1="{BOARD_MARGIN}" x2="{x}" y2="{BOARD_MARGIN+4*CELL_SIZE}" stroke="{COLOR_LINE}"/>')
+        svg.append(f'<line x1="{x}" y1="{BOARD_MARGIN+5*CELL_SIZE}" x2="{x}" y2="{BOARD_MARGIN+9*CELL_SIZE}" stroke="{COLOR_LINE}"/>')
+    for i in range(10):
+        y = BOARD_MARGIN + i * CELL_SIZE
+        svg.append(f'<line x1="{BOARD_MARGIN}" y1="{y}" x2="{BOARD_MARGIN+8*CELL_SIZE}" y2="{y}" stroke="{COLOR_LINE}"/>')
+    for y_off in [0, 7*CELL_SIZE]:
+        x1, x2, y1, y2 = BOARD_MARGIN+3*CELL_SIZE, BOARD_MARGIN+5*CELL_SIZE, BOARD_MARGIN+y_off, BOARD_MARGIN+y_off+2*CELL_SIZE
+        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{COLOR_LINE}"/><line x1="{x2}" y1="{y1}" x2="{x1}" y2="{y2}" stroke="{COLOR_LINE}"/>')
+    if s.last_move:
+        for r, c in [(s.last_move[0], s.last_move[1]), (s.last_move[2], s.last_move[3])]:
+            x, y = BOARD_MARGIN + c*CELL_SIZE, BOARD_MARGIN + (9-r)*CELL_SIZE
+            svg.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS+4}" fill="none" stroke="{COLOR_LAST_MOVE}" stroke-width="3"/>')
+    if s.selected:
+        x, y = BOARD_MARGIN + s.selected[1]*CELL_SIZE, BOARD_MARGIN + (9-s.selected[0])*CELL_SIZE
+        svg.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS+4}" fill="none" stroke="{COLOR_SELECTED}" stroke-width="3"/>')
+    for r, c in s.legal_moves:
+        x, y = BOARD_MARGIN + c*CELL_SIZE, BOARD_MARGIN + (9-r)*CELL_SIZE
+        svg.append(f'<circle cx="{x}" cy="{y}" r="6" fill="{COLOR_LEGAL}" opacity="0.6"/>')
+    for r in range(10):
+        for c in range(9):
+            p = s.board[r, c]
+            if p != 0:
+                x, y = BOARD_MARGIN + c*CELL_SIZE, BOARD_MARGIN + (9-r)*CELL_SIZE
+                color = COLOR_RED if p > 0 else COLOR_BLACK
+                svg.append(f'<circle cx="{x}" cy="{y}" r="{PIECE_RADIUS}" fill="#FDF5E6" stroke="{color}" stroke-width="2"/>')
+                svg.append(f'<text x="{x}" y="{y+8}" font-size="26" fill="{color}" text-anchor="middle" font-weight="bold">{PIECE_NAMES[abs(p)][0 if p > 0 else 1]}</text>')
+    for r in range(10):
+        for c in range(9):
+            x, y = BOARD_MARGIN + c*CELL_SIZE, BOARD_MARGIN + (9-r)*CELL_SIZE
+            svg.append(f'<rect x="{x-PIECE_RADIUS}" y="{y-PIECE_RADIUS}" width="{PIECE_RADIUS*2}" height="{PIECE_RADIUS*2}" fill="transparent" style="cursor:pointer" onclick="clickBoard({r},{c})"/>')
+    svg.append('</svg>')
+    return "".join(svg)
+
+# ============================================================================
+# Gradio UI
+# ============================================================================
+
+def create_ui():
+    game = ChessGame()
+    css = (
+        ".board-col { max-width: 600px; margin: 0 auto; } "
+        ".control-col { padding: 15px; } "
+        "#hidden_ui { display: none; }"
+    )
+    with gr.Blocks(css=css, title="ZeroForge") as demo:
+        gr.HTML("<h2 style='text-align: center;'>ZeroForge 象棋对弈</h2>")
         with gr.Row():
-            with gr.Column(scale=2):
-                board_html = gr.HTML(label="棋盘")
-                with gr.Row():
-                    status_text = gr.Textbox(label="状态", interactive=False, scale=1)
-                    eval_text = gr.Textbox(label="AI 评估", interactive=False, scale=1)
+            with gr.Column(scale=3, elem_classes="board-col"):
+                board_svg = gr.HTML()
+                status_box = gr.Markdown()
+                eval_box = gr.Markdown()
+            with gr.Column(scale=2, elem_classes="control-col"):
+                with gr.Tabs():
+                    with gr.Tab("对弈"):
+                        red_p = gr.Dropdown(["Human", "ZeroForge AI", "UCI Engine"], value="Human", label="红方")
+                        black_p = gr.Dropdown(["Human", "ZeroForge AI", "UCI Engine"], value="ZeroForge AI", label="黑方")
+                        new_btn = gr.Button("开始新局", variant="primary")
+                        undo_btn = gr.Button("悔棋")
+                    with gr.Tab("设置"):
+                        ckpt_dir = gr.Textbox("checkpoints", label="AI 路径")
+                        with gr.Row():
+                            ckpt_dropdown = gr.Dropdown(choices=[], label="选择步数 (Step)", scale=2)
+                            refresh_ckpt = gr.Button("🔄 刷新", scale=1)
+                        load_ai = gr.Button("加载所选 AI 模型")
+                        uci_path = gr.Textbox("./pikafish", label="UCI 路径")
+                        uci_load = gr.Button("启动 UCI")
+                        uci_depth = gr.Slider(1, 20, value=3, step=1, label="UCI 深度")
+                        ai_delay = gr.Slider(0, 5, value=1, step=0.1, label="AI 延迟(秒)")
+                    with gr.Tab("高级"):
+                        fen_box = gr.Textbox(label="FEN")
+                        apply_fen = gr.Button("应用 FEN")
+        
+        # 隐藏的点击触发器（保持 DOM 存在，JS 才能找到）
+        with gr.Row(elem_id="hidden_ui", visible=True):
+            click_r = gr.Textbox(elem_id="click_r")
+            click_c = gr.Textbox(elem_id="click_c")
+            click_btn = gr.Button("Click", elem_id="click_btn")
+
+        def update():
+            p_name = "红方" if game.state.current_player == 0 else "黑方"
+            status = f"### 当前: {p_name} | 第 {game.state.step_count} 步"
+            if game.state.game_over:
+                res = "红胜" if game.state.winner == 0 else ("黑胜" if game.state.winner == 1 else "和棋")
+                status = f"## 🎉 结束: {res}"
+            elif game.state.is_check:
+                status += " | ⚠️ **将军**"
+
+            if game.state.notice:
+                status += f"\n\n**提示**: {game.state.notice}"
+                game.state.notice = ""
             
-            with gr.Column(scale=1):
-                gr.Markdown("### 模式选择")
-                mode_radio = gr.Radio(
-                    choices=["人机 (AI执黑)", "人机 (AI执红)", "双AI对弈", "双人对弈"],
-                    value="人机 (AI执黑)",
-                    label="对弈模式"
-                )
-                
-                gr.Markdown("### 操作")
-                with gr.Row():
-                    new_game_btn = gr.Button("🆕 新游戏", variant="primary")
-                    undo_btn = gr.Button("↩️ 悔棋")
-                
-                with gr.Row():
-                    ai_move_btn = gr.Button("🤖 AI走棋", variant="secondary")
-                
-                gr.Markdown("### FEN")
-                fen_input = gr.Textbox(label="FEN 字符串", placeholder="输入 FEN...")
-                
-                with gr.Row():
-                    import_btn = gr.Button("📥 导入")
-                
-                fen_output = gr.Textbox(label="当前 FEN", interactive=False)
-                import_status = gr.Textbox(label="", interactive=False, visible=False)
-                
-                gr.Markdown("### 说明")
-                gr.Markdown("""
-                - **人机模式**: 点击棋子选择，点击目标位置走棋。AI 会在您的回合结束后自动落子。
-                - **双AI对弈**: AI 将自动循环走棋，点击“AI走棋”或切换模式可启动。
-                - **胜率评估**: 显示 AI 对红方胜算的百分比判断。
-                """)
-        
-        # 隐藏的输入用于接收点击
-        with gr.Row(elem_id="hidden-controls"):
-            row_input = gr.Textbox(elem_id="row-input", value="", visible=True, 
-                                   container=False, show_label=False)
-            col_input = gr.Textbox(elem_id="col-input", value="", visible=True,
-                                   container=False, show_label=False)
-            click_btn = gr.Button("Click", elem_id="click-handler", visible=True)
-        
-        # CSS 隐藏这些元素
-        gr.HTML("<style>#hidden-controls { display: none !important; }</style>")
-        
-        # 事件绑定
-        def handle_board_click(row_str, col_str):
+            # 胜率评估
+            winrate = (game.state.ai_value + 1) / 2 * 100
+            eval_str = f"红方胜率: {winrate:.1f}% | 上一着: {game.state.last_move_uci or '无'}"
+            return render_svg(game), status, board_to_fen(game.state.board, game.state.current_player), eval_str
+
+        def ai_step():
+            if game.state.game_over:
+                yield update()
+                return
+
+            # 防止递归爆栈：用循环并加安全上限
+            max_auto_plies = 200
+            plies = 0
+            while not game.state.game_over:
+                t = game.red_type if game.state.current_player == 0 else game.black_type
+                if t == "Human":
+                    break
+
+                if t == "ZeroForge AI":
+                    if not game.model_mgr.params:
+                        msg = "AI 未加载模型，无法走子，请先在设置中加载模型"
+                        print(f"[AI] {msg} (player={game.state.current_player}, step={game.state.step_count})")
+                        gr.Warning(msg)
+                        break
+                    a = game.get_ai_action()
+                    if a is None:
+                        raise RuntimeError(
+                            "AI 未返回动作(模型已加载): "
+                            f"player={game.state.current_player}, step={game.state.step_count}, "
+                            f"last={game.state.last_move_uci}"
+                        )
+                    game.make_move(a)
+                elif t == "UCI Engine":
+                    if not game.uci_engine:
+                        msg = "UCI 引擎未启动，无法走子，请先启动 UCI"
+                        print(f"[UCI] {msg} (player={game.state.current_player}, step={game.state.step_count})")
+                        gr.Warning(msg)
+                        break
+                    a = game.get_uci_action()
+                    if a is None:
+                        raise RuntimeError(
+                            "UCI 未返回动作(引擎已启动): "
+                            f"player={game.state.current_player}, step={game.state.step_count}, "
+                            f"last={game.state.last_move_uci}"
+                        )
+                    game.make_move(a)
+                else:
+                    raise RuntimeError(f"未知玩家类型: {t}")
+
+                # 实时渲染：每走一步就产出一次 UI
+                yield update()
+                if game.ai_delay > 0:
+                    time.sleep(game.ai_delay)
+
+                plies += 1
+                if plies >= max_auto_plies:
+                    raise RuntimeError(
+                        "自动走子超过上限，可能出现死循环。"
+                        f" player={game.state.current_player}, step={game.state.step_count}"
+                    )
+            yield update()
+
+        def on_click(r, c):
             try:
-                row = int(row_str)
-                col = int(col_str)
-                return on_click(row, col)
-            except:
-                return render()
+                r, c = int(r), int(c)
+                s = game.state
+                p = s.board[r, c]
+                own = (s.current_player == 0 and p > 0) or (s.current_player == 1 and p < 0)
+
+                if s.selected:
+                    a = move_to_action(s.selected[0]*9 + s.selected[1], r*9 + c)
+                    if a != -1 and s.jax_state.legal_action_mask[a]:
+                        game.make_move(int(a))
+                        yield from ai_step()
+                        return
+                    elif own:
+                        s.selected = (r, c)
+                        s.legal_moves = []
+                        mask = s.jax_state.legal_action_mask
+                        for tr in range(10):
+                            for tc in range(9):
+                                if mask[move_to_action(r*9+c, tr*9+tc)]: s.legal_moves.append((tr, tc))
+                    else:
+                        s.selected, s.legal_moves = None, []
+                elif own:
+                    s.selected = (r, c)
+                    s.legal_moves = []
+                    mask = s.jax_state.legal_action_mask
+                    for tr in range(10):
+                        for tc in range(9):
+                            if mask[move_to_action(r*9+c, tr*9+tc)]: s.legal_moves.append((tr, tc))
+            except Exception as e:
+                print(f"Click logic error: {e}")
+            yield update()
+
+        def handle_load_ai(d, s):
+            try:
+                if not d or not os.path.isdir(d):
+                    msg = f"AI 路径不存在: {d}"
+                    print(f"[AI] {msg}")
+                    gr.Warning(msg)
+                    game.state.notice = msg
+                    return gr.update(), update()
+
+                if not s:
+                    steps = list_checkpoints(d)
+                    if not steps:
+                        msg = f"未找到检查点: {d}"
+                        print(f"[AI] {msg}")
+                        gr.Warning(msg)
+                        game.state.notice = msg
+                        return gr.update(), update()
+                    s = steps[0]
+                else:
+                    steps = list_checkpoints(d)
+                    if steps and int(s) not in steps:
+                        msg = f"检查点不存在: step={s}, dir={d}"
+                        print(f"[AI] {msg}, steps={steps}")
+                        gr.Warning(msg)
+                        game.state.notice = msg
+                        return gr.update(), update()
+
+                print(f"[AI] 加载模型: dir={d}, step={s}, steps={steps}")
+                success = game.model_mgr.load(d, int(s))
+                if success:
+                    msg = f"模型加载成功: step {s}"
+                    gr.Info(msg)
+                    game.state.notice = msg
+                else:
+                    msg = f"模型加载失败: step {s}"
+                    print(f"[AI] {msg}")
+                    gr.Warning(msg)
+                    game.state.notice = msg
+            except Exception as e:
+                print(f"[AI] 加载异常: {e}")
+                print(traceback.format_exc())
+                gr.Error(f"加载异常: {str(e)}")
+                game.state.notice = f"加载异常: {str(e)}"
+            return gr.update(), update() # First update is for Info/Warning, not used
+
+        def handle_refresh_ckpt(d):
+            steps = list_checkpoints(d)
+            if not steps:
+                gr.Warning(f"目录 {d} 下未找到数字编号的检查点")
+                return gr.update(choices=[], value=None)
+            return gr.update(choices=[str(s) for s in steps], value=str(steps[0]))
+
+        def handle_load_uci(p):
+            try:
+                if game.uci_engine:
+                    game.uci_engine.stop()
+                game.uci_engine = UCIEngine(p)
+                if game.uci_engine.start():
+                    gr.Info("UCI 引擎启动成功")
+                else:
+                    gr.Warning("UCI 引擎启动失败，请检查路径 (默认 ./pikafish)")
+            except Exception as e:
+                gr.Error(f"引擎异常: {str(e)}")
+            return update()
+
+        def handle_uci_depth(d):
+            game.uci_depth = int(d)
+            print(f"[UCI] 深度已设置为 {game.uci_depth}")
+            return update()
+
+        def handle_ai_delay(d):
+            game.ai_delay = float(d)
+            print(f"[AI] 延迟已设置为 {game.ai_delay} 秒")
+            return update()
+
+        def handle_init():
+            # 初始化时自动刷新一次检查点列表
+            steps = list_checkpoints("checkpoints")
+            game.new_game()
+            u = update()
+            return u[0], u[1], u[2], u[3], gr.update(
+                choices=[str(s) for s in steps],
+                value=str(steps[0]) if steps else None
+            )
+
+        def handle_new_game(r, b):
+            game.red_type = r
+            game.black_type = b
+            game.new_game()
+            yield from ai_step()
+
+        def handle_undo():
+            game.undo()
+            return update()
+
+        def handle_apply_fen(f):
+            game.new_game(f)
+            return update()
+
+        # --- 事件绑定 ---
+        ui_outputs = [board_svg, status_box, fen_box, eval_box]
         
-        outputs = [board_html, status_text, eval_text, fen_output]
+        click_btn.click(on_click, [click_r, click_c], ui_outputs)
         
-        click_btn.click(
-            handle_board_click,
-            inputs=[row_input, col_input],
-            outputs=outputs
-        )
+        new_btn.click(handle_new_game, [red_p, black_p], ui_outputs)
+        undo_btn.click(handle_undo, outputs=ui_outputs)
         
-        new_game_btn.click(new_game_click, outputs=outputs)
-        undo_btn.click(undo_click, outputs=outputs)
-        ai_move_btn.click(ai_move_click, outputs=outputs)
-        mode_radio.change(switch_mode_click, inputs=[mode_radio], outputs=outputs)
+        refresh_ckpt.click(handle_refresh_ckpt, [ckpt_dir], [ckpt_dropdown])
         
-        import_btn.click(
-            import_fen_click, 
-            inputs=[fen_input],
-            outputs=[board_html, status_text, eval_text, fen_output, import_status]
-        )
-        
-        # 自动对弈计时器：如果是双AI模式，每隔 1.5 秒尝试走一步
-        auto_timer = gr.Timer(value=1.5, active=True)
-        auto_timer.tick(auto_play_loop, outputs=outputs)
+        def handle_load_ai_final(d, s):
+            _, u = handle_load_ai(d, s)
+            return u
+        load_ai.click(handle_load_ai_final, [ckpt_dir, ckpt_dropdown], ui_outputs)
+
+        uci_load.click(handle_load_uci, [uci_path], ui_outputs)
+        uci_depth.change(handle_uci_depth, [uci_depth], ui_outputs)
+        ai_delay.change(handle_ai_delay, [ai_delay], ui_outputs)
+        apply_fen.click(handle_apply_fen, [fen_box], ui_outputs)
         
         # 初始化
-        demo.load(render, outputs=outputs)
-    
+        demo.load(handle_init, outputs=ui_outputs + [ckpt_dropdown])
+        
+        # JS 点击逻辑增强
+        js_code = """
+        function() {
+            window.clickBoard = function(r, c) {
+                console.log("Board clicked:", r, c);
+                const r_box = document.getElementById('click_r');
+                const c_box = document.getElementById('click_c');
+                const btn = document.getElementById('click_btn');
+                const r_el = r_box ? r_box.querySelector('input, textarea') : null;
+                const c_el = c_box ? c_box.querySelector('input, textarea') : null;
+                
+                if (r_el && c_el && btn) {
+                    const setValue = (el, val) => {
+                        el.value = val;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    };
+                    setValue(r_el, r.toString());
+                    setValue(c_el, c.toString());
+                    // 延迟触发按钮点击
+                    setTimeout(() => {
+                        btn.click();
+                    }, 20);
+                } else {
+                    console.error("Required elements not found:", {r_box, c_box, r_el, c_el, btn});
+                }
+            };
+        }
+        """
+        demo.load(None, None, js=js_code)
+        demo.queue()
     return demo
 
-
-def run_web_gui(ai_callback: Optional[Callable] = None, fen: Optional[str] = None, share: bool = False):
-    """启动 Web GUI"""
-    demo = create_gui(ai_callback)
-    demo.launch(share=share, server_name="0.0.0.0")
-
-
-# ============================================================================
-# 入口
-# ============================================================================
-
-if __name__ == "__main__":
-    run_web_gui()
+def run_web_gui(share=False): create_ui().launch(share=share, server_name="0.0.0.0")
+if __name__ == "__main__": run_web_gui()

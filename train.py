@@ -66,7 +66,7 @@ class Config:
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
-    replay_buffer_size: int = 500000  # 回放缓冲区大小
+    replay_buffer_size: int = 1000000  # 回放缓冲区大小
     sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
