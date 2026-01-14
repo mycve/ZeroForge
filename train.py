@@ -18,11 +18,13 @@ import optax
 import mctx
 import orbax.checkpoint as ocp
 
-# --- JAX 极速优化配置 ---
-# 1. 开启编译缓存，第二次运行秒开
-cache_dir = "jax_cache"
+# --- JAX 编译缓存配置 ---
+# 开启持久化编译缓存，二次启动秒开
+cache_dir = os.path.abspath("jax_cache")
 os.makedirs(cache_dir, exist_ok=True)
-jax.config.update("jax_compilation_cache_dir", os.path.abspath(cache_dir))
+jax.config.update("jax_compilation_cache_dir", cache_dir)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)  # 缓存所有编译结果
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # 不管编译时间都缓存
 
 from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
@@ -87,6 +89,13 @@ config = Config()
 
 devices = jax.local_devices()
 num_devices = len(devices)
+
+def replicate_to_devices(pytree):
+    """将 pytree 复制到所有设备 (替代已废弃的 device_put_replicated)"""
+    return jax.device_put(
+        jax.tree.map(lambda x: jnp.stack([x] * num_devices), pytree),
+        devices
+    )
 
 env = XiangqiEnv(
     max_steps=config.max_steps,
@@ -696,7 +705,13 @@ def restore_checkpoint(
             replay_buffer.load_state_dict(buf_data)
             print(f"[Checkpoint] 回放缓冲区恢复: {replay_buffer.size} 样本")
     
-    print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={iteration_elos.get(iteration, 'N/A')}")
+    # 获取最近的 ELO（可能不是当前 iteration）
+    if iteration_elos:
+        latest_elo_iter = max(iteration_elos.keys())
+        latest_elo = iteration_elos[latest_elo_iter]
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
+    else:
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}")
     
     return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
 
@@ -746,8 +761,8 @@ def main():
         iteration_elos = {0: 1500.0}
     
     # 分发到所有设备
-    params = jax.device_put_replicated(params, devices)
-    opt_state = jax.device_put_replicated(opt_state, devices)
+    params = replicate_to_devices(params)
+    opt_state = replicate_to_devices(opt_state)
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
@@ -888,7 +903,7 @@ def main():
             past_iter = max([k for k in available_iters if k <= past_iter], default=0)
             
             if past_iter in history_models:
-                past_params = jax.device_put_replicated(history_models[past_iter], devices)
+                past_params = replicate_to_devices(history_models[past_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
                 # 双边评估
                 winners_r = evaluate(params, past_params, jax.random.split(sk5, num_devices))
