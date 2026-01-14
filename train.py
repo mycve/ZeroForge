@@ -245,17 +245,23 @@ def compute_targets(data: SelfplayOutput):
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
     # 计算 n-step TD 目标
+    # 预计算：每个位置之前是否已经终止（用于过滤无效步骤）
+    # terminated[i] = True 表示第 i 步执行后游戏结束
+    # 我们需要 cumsum 来标记"游戏已经在之前结束"的步骤
+    terminated_cumsum = jnp.cumsum(data.terminated.astype(jnp.int32), axis=0)
+    already_done = terminated_cumsum > 1  # >1 表示之前某步已经终止，当前是无效数据
+    
     def compute_td_target(t):
         """计算时刻 t 的 n-step TD 目标"""
         # 累积 n 步奖励
         def accum_reward(carry, i):
             accum, gamma_power = carry
             step_idx = jnp.minimum(t + i, max_steps - 1)
-            # 如果已经终止，奖励为 0
-            is_valid = (t + i < max_steps) & ~data.terminated[step_idx]
+            # 只在有效步骤累积奖励（包括终局那一步，但排除之后的无效步骤）
+            is_valid = (t + i < max_steps) & ~already_done[step_idx]
             r = jnp.where(is_valid, data.reward[step_idx], 0.0)
             new_accum = accum + gamma_power * r
-            # discount 是 -1 (交替)，所以 gamma_power 会交替变号
+            # discount: -1 (交替) 或 0 (终止)
             new_gamma = gamma_power * data.discount[step_idx]
             return (new_accum, new_gamma), None
         
