@@ -17,10 +17,11 @@ import mctx
 import numpy as np
 
 
-def load_model(path, net):
+def load_model(path):
+    """加载模型参数"""
     with open(path, 'rb') as f:
         ckpt = pickle.load(f)
-    return ckpt['model']
+    return ckpt['params']
 
 def main():
     ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/ckpt_000100.pkl"
@@ -36,20 +37,17 @@ def main():
     
     # 加载参数
     try:
-        params, batch_stats = load_model(ckpt_path, net)
+        params = load_model(ckpt_path)
     except FileNotFoundError:
         print(f"错误: 找不到模型文件 {ckpt_path}")
         return
 
     def ai_callback(state):
         # 准备观察
-        obs = env.observe(state)[None, ...] # 添加 batch 维度
+        obs = env.observe(state)[None, ...]  # 添加 batch 维度
         
-        # 前向计算 (获取初始胜率评估)
-        (logits, value), _ = net.apply(
-            {'params': params, 'batch_stats': batch_stats},
-            obs, train=False, mutable=['batch_stats']
-        )
+        # 前向计算
+        logits, value = net.apply({'params': params}, obs, train=False)
         
         # 视角修正 (如果是黑方，将网络输出的视角 logits 转回真实坐标)
         if state.current_player == 1:
@@ -57,7 +55,7 @@ def main():
             rotated_idx = rotate_action(rotate_idx)
             logits = logits[:, rotated_idx]
         
-        # 掩码
+        # 掩码非法动作
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
         
@@ -66,10 +64,7 @@ def main():
             prev_player = state.current_player
             state = jax.vmap(env.step)(state, action)
             obs = jax.vmap(env.observe)(state)
-            (l, v), _ = net.apply(
-                {'params': params, 'batch_stats': batch_stats},
-                obs, train=False, mutable=['batch_stats']
-            )
+            l, v = net.apply({'params': params}, obs, train=False)
             
             # 视角修正
             rotate_idx = jnp.arange(ACTION_SPACE_SIZE)
