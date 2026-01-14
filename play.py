@@ -109,7 +109,7 @@ def main():
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=256, # 实际下棋可以用更高的模拟次数
-            max_num_considered_actions=16,
+            max_num_considered_actions=32,
             invalid_actions=(~state.legal_action_mask)[None, ...],
         )
         

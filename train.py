@@ -28,17 +28,7 @@ from xiangqi.env import XiangqiEnv
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
 from xiangqi.mirror import mirror_observation, mirror_policy
 from networks.alphazero import AlphaZeroNetwork
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    try:
-        from tensorboardX import SummaryWriter
-    except ImportError:
-        class SummaryWriter:
-            def __init__(self, *args, **kwargs): pass
-            def add_scalar(self, *args, **kwargs): pass
-            def close(self): pass
+from torch.utils.tensorboard import SummaryWriter
 
 # ============================================================================
 # 配置
@@ -65,7 +55,7 @@ class Config:
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
-    replay_buffer_size: int = 200000  # 回放缓冲区大小
+    replay_buffer_size: int = 500000  # 回放缓冲区大小
     sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
@@ -81,7 +71,7 @@ class Config:
     
     # ELO 评估
     eval_interval: int = 20
-    eval_games: int = 64
+    eval_games: int = 100
     past_model_offset: int = 20
     
     # Checkpoint 配置
@@ -567,7 +557,10 @@ def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
     - 异步保存
     - 最多保留 N 个 checkpoint
     """
+    # orbax 要求绝对路径
+    ckpt_dir = os.path.abspath(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
+    
     options = ocp.CheckpointManagerOptions(
         max_to_keep=config.max_to_keep,
         keep_period=config.keep_period,
@@ -608,7 +601,7 @@ def save_checkpoint(
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
     
     # 单独保存 metadata (history_models keys, elos) 和 replay buffer
-    meta_dir = os.path.join(config.ckpt_dir, f"meta_{step}")
+    meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     
     # 保存 ELO 和历史模型索引
@@ -660,7 +653,7 @@ def restore_checkpoint(
     rng_key = restored["rng_key"]
     
     # 恢复 metadata
-    meta_dir = os.path.join(config.ckpt_dir, f"meta_{latest_step}")
+    meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{latest_step}")
     
     history_models = {}
     iteration_elos = {}
@@ -811,9 +804,9 @@ def main():
         frames += new_frames
         
         # --- 从缓冲区采样训练 ---
-        # 计算训练次数：确保每个样本平均被训练 reuse_times 次
-        num_updates = max(1, (replay_buffer.size * config.sample_reuse_times) // (config.training_batch_size * config.sample_reuse_times))
-        num_updates = min(num_updates, new_frames // config.training_batch_size * config.sample_reuse_times)  # 限制训练量
+        # 正确逻辑：新增 N 个样本，训练 N * reuse_times / batch_size 次
+        # 这样新样本平均被训练 reuse_times 次（因为采样是均匀随机的）
+        num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
         policy_losses, value_losses = [], []
@@ -833,7 +826,7 @@ def main():
         buf_stats = replay_buffer.stats()
         
         print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
-              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k avg_use={buf_stats['avg_train_count']:.1f} | "
+              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         
         # TensorBoard 记录
@@ -841,16 +834,19 @@ def main():
         writer.add_scalar("train/value_loss", np.mean(value_losses), iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
-        writer.add_scalar("stats/win_rate_red", r_wins / max(1, num_games), iteration)
-        writer.add_scalar("stats/draw_rate", draws / max(1, num_games), iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
-        writer.add_scalar("replay/avg_train_count", buf_stats['avg_train_count'], iteration)
         
-        if draws > 0:
-            writer.add_scalar("draw_reasons/max_steps", d_max_steps / draws, iteration)
-            writer.add_scalar("draw_reasons/no_capture", d_no_capture / draws, iteration)
-            writer.add_scalar("draw_reasons/repetition", d_repetition / draws, iteration)
-            writer.add_scalar("draw_reasons/perpetual_check", d_perpetual / draws, iteration)
+        # 胜负和统计 (数量)
+        writer.add_scalar("games/red_wins", r_wins, iteration)
+        writer.add_scalar("games/black_wins", b_wins, iteration)
+        writer.add_scalar("games/draws", draws, iteration)
+        writer.add_scalar("games/total", num_games, iteration)
+        
+        # 和棋原因 (数量)
+        writer.add_scalar("draw_reasons/max_steps", d_max_steps, iteration)
+        writer.add_scalar("draw_reasons/no_capture", d_no_capture, iteration)
+        writer.add_scalar("draw_reasons/repetition", d_repetition, iteration)
+        writer.add_scalar("draw_reasons/perpetual_check", d_perpetual, iteration)
         
         # === Checkpoint 保存 (使用 orbax 官方方案) ===
         if iteration % config.ckpt_interval == 0:
