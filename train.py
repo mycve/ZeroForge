@@ -367,12 +367,12 @@ def evaluate(params_red, params_black, rng_key):
         policy_output = mctx.gumbel_muzero_policy(
             params=(params_red, params_black), rng_key=k_search, root=root,
             recurrent_fn=evaluate_recurrent_fn,
-            num_simulations=96, max_num_considered_actions=16, 
+            num_simulations=config.num_simulations, max_num_considered_actions=config.top_k,
             invalid_actions=~state.legal_action_mask,
         )
         
         # 评估多样性：前 30 步高温度采样
-        temp = jnp.where(state.step_count < 30, 1.0, 0.01)
+        temp = jnp.where(state.step_count < 30, 1.0, 0.1)
         
         def _sample_action(w, t, k, legal_mask):
             """温度采样 (log 空间避免数值下溢)"""
