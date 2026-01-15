@@ -252,6 +252,7 @@ class GameState:
     ai_value: float = 0.0
     last_move_uci: str = ""
     notice: str = ""
+    replay_index: Optional[int] = None
 
     def __post_init__(self):
         self.legal_moves = self.legal_moves or []
@@ -269,6 +270,40 @@ class ChessGame:
         self.uci_movetime = 1000
         self.uci_depth = 3
         self.ai_delay = 1.0
+
+    def _build_replay_snapshots(self) -> List[dict]:
+        """构建回放快照列表（每一步的局面）"""
+        if not self.state or self.state.jax_state is None:
+            return []
+
+        snapshots = []
+        for h in self.state.history:
+            js = h.get("jax_state")
+            if js is None:
+                continue
+            snapshots.append({
+                "board": np.array(js.board),
+                "current_player": int(js.current_player),
+                "last_move": h.get("last_move"),
+                "last_move_uci": h.get("last_move_uci", ""),
+                "step_count": int(js.step_count),
+                "game_over": bool(js.terminated),
+                "winner": int(js.winner),
+                "ai_value": float(h.get("ai_value", 0.0)),
+            })
+
+        js = self.state.jax_state
+        snapshots.append({
+            "board": np.array(js.board),
+            "current_player": int(js.current_player),
+            "last_move": self.state.last_move,
+            "last_move_uci": self.state.last_move_uci,
+            "step_count": int(js.step_count),
+            "game_over": bool(js.terminated),
+            "winner": int(js.winner),
+            "ai_value": float(self.state.ai_value),
+        })
+        return snapshots
 
     def new_game(self, fen: str = STARTING_FEN):
         board, player = parse_fen(fen)
@@ -294,6 +329,7 @@ class ChessGame:
 
     def make_move(self, action: int):
         if self.state.game_over: return
+        self.state.replay_index = None
         self.state.history.append({
             'jax_state': self.state.jax_state, 'last_move': self.state.last_move,
             'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value
@@ -326,6 +362,7 @@ class ChessGame:
             self.state.game_over = False
             self.state.selected = None
             self.state.legal_moves = []
+            self.state.replay_index = None
             self._update_status()
 
     def get_ai_action(self) -> Optional[int]:
@@ -445,6 +482,11 @@ def create_ui():
                         black_p = gr.Dropdown(["Human", "ZeroForge AI", "UCI Engine"], value="ZeroForge AI", label="黑方")
                         new_btn = gr.Button("开始新局", variant="primary")
                         undo_btn = gr.Button("悔棋")
+                        with gr.Row():
+                            replay_prev = gr.Button("回放上一步")
+                            replay_next = gr.Button("回放下一步")
+                        replay_current = gr.Button("回到当前")
+                        replay_list = gr.Markdown()
                     with gr.Tab("设置"):
                         ckpt_dir = gr.Textbox("checkpoints", label="AI 路径")
                         with gr.Row():
@@ -456,7 +498,8 @@ def create_ui():
                         uci_depth = gr.Slider(1, 20, value=3, step=1, label="UCI 深度")
                         ai_delay = gr.Slider(0, 5, value=1, step=0.1, label="AI 延迟(秒)")
                     with gr.Tab("高级"):
-                        fen_box = gr.Textbox(label="FEN")
+                        fen_box = gr.Textbox(label="起始 FEN")
+                        fen_current = gr.Textbox(label="当前 FEN", interactive=False)
                         apply_fen = gr.Button("应用 FEN")
         
         # 隐藏的点击触发器（保持 DOM 存在，JS 才能找到）
@@ -465,23 +508,72 @@ def create_ui():
             click_c = gr.Textbox(elem_id="click_c")
             click_btn = gr.Button("Click", elem_id="click_btn")
 
+        def build_replay_markdown(snapshots, replay_idx):
+            if not snapshots:
+                return "暂无回放记录"
+            lines = []
+            total = len(snapshots) - 1
+            for i, snap in enumerate(snapshots):
+                move_uci = snap.get("last_move_uci") or "初始局面"
+                tag = ">>" if replay_idx == i else "  "
+                lines.append(f"{tag} 第{i}步/{total}: {move_uci}")
+            return "\n".join(lines)
+
         def update():
-            p_name = "红方" if game.state.current_player == 0 else "黑方"
-            status = f"### 当前: {p_name} | 第 {game.state.step_count} 步"
-            if game.state.game_over:
-                res = "红胜" if game.state.winner == 0 else ("黑胜" if game.state.winner == 1 else "和棋")
+            snapshots = game._build_replay_snapshots()
+            replay_idx = game.state.replay_index
+            if replay_idx is not None and snapshots:
+                replay_idx = max(0, min(replay_idx, len(snapshots) - 1))
+                snap = snapshots[replay_idx]
+                board = snap["board"]
+                current_player = snap["current_player"]
+                last_move = snap["last_move"]
+                last_move_uci = snap["last_move_uci"]
+                ai_value = snap["ai_value"]
+                game_over = snap["game_over"]
+                winner = snap["winner"]
+                step_count = snap["step_count"]
+            else:
+                board = game.state.board
+                current_player = game.state.current_player
+                last_move = game.state.last_move
+                last_move_uci = game.state.last_move_uci
+                ai_value = game.state.ai_value
+                game_over = game.state.game_over
+                winner = game.state.winner
+                step_count = game.state.step_count
+
+            p_name = "红方" if current_player == 0 else "黑方"
+            status = f"### 当前: {p_name} | 第 {step_count} 步"
+            if replay_idx is not None:
+                status = f"### 回放: 第 {replay_idx} / {len(snapshots) - 1} 步\n\n" + status
+
+            if game_over:
+                res = "红胜" if winner == 0 else ("黑胜" if winner == 1 else "和棋")
                 status = f"## 🎉 结束: {res}"
-            elif game.state.is_check:
-                status += " | ⚠️ **将军**"
+            else:
+                is_check = bool(is_in_check(jnp.array(board, dtype=jnp.int8), jnp.int32(current_player)))
+                if is_check:
+                    status += " | ⚠️ **将军**"
 
             if game.state.notice:
                 status += f"\n\n**提示**: {game.state.notice}"
                 game.state.notice = ""
             
             # 胜率评估
-            winrate = (game.state.ai_value + 1) / 2 * 100
-            eval_str = f"红方胜率: {winrate:.1f}% | 上一着: {game.state.last_move_uci or '无'}"
-            return render_svg(game), status, board_to_fen(game.state.board, game.state.current_player), eval_str
+            winrate = (ai_value + 1) / 2 * 100
+            eval_str = f"红方胜率: {winrate:.1f}% | 上一着: {last_move_uci or '无'}"
+
+            # 为回放渲染临时视图
+            if replay_idx is not None:
+                temp_game = ChessGame()
+                temp_game.state = GameState(board=board, current_player=current_player)
+                temp_game.state.last_move = last_move
+                svg = render_svg(temp_game)
+            else:
+                svg = render_svg(game)
+            move_list_md = build_replay_markdown(snapshots, replay_idx)
+            return svg, status, board_to_fen(board, current_player), eval_str, move_list_md
 
         def ai_step():
             if game.state.game_over:
@@ -542,6 +634,7 @@ def create_ui():
 
         def on_click(r, c):
             try:
+                game.state.replay_index = None
                 r, c = int(r), int(c)
                 s = game.state
                 p = s.board[r, c]
@@ -653,15 +746,22 @@ def create_ui():
             steps = list_checkpoints("checkpoints")
             game.new_game()
             u = update()
-            return u[0], u[1], u[2], u[3], gr.update(
+            return u[0], u[1], u[2], u[3], u[4], gr.update(
                 choices=[str(s) for s in steps],
                 value=str(steps[0]) if steps else None
             )
 
-        def handle_new_game(r, b):
+        def handle_new_game(r, b, f):
             game.red_type = r
             game.black_type = b
-            game.new_game()
+            game.state.replay_index = None
+            fen = f.strip() if isinstance(f, str) else ""
+            try:
+                game.new_game(fen if fen else STARTING_FEN)
+            except Exception as e:
+                print(f"[FEN] 新局 FEN 解析失败: {e}")
+                gr.Error(f"FEN 解析失败: {str(e)}")
+                game.new_game()
             yield from ai_step()
 
         def handle_undo():
@@ -669,16 +769,44 @@ def create_ui():
             return update()
 
         def handle_apply_fen(f):
+            game.state.replay_index = None
             game.new_game(f)
             return update()
 
+        def handle_replay_prev():
+            snaps = game._build_replay_snapshots()
+            if not snaps:
+                return update()
+            idx = game.state.replay_index
+            if idx is None:
+                idx = len(snaps) - 1
+            game.state.replay_index = max(0, idx - 1)
+            return update()
+
+        def handle_replay_next():
+            snaps = game._build_replay_snapshots()
+            if not snaps:
+                return update()
+            idx = game.state.replay_index
+            if idx is None:
+                idx = len(snaps) - 1
+            game.state.replay_index = min(len(snaps) - 1, idx + 1)
+            return update()
+
+        def handle_replay_current():
+            game.state.replay_index = None
+            return update()
+
         # --- 事件绑定 ---
-        ui_outputs = [board_svg, status_box, fen_box, eval_box]
+        ui_outputs = [board_svg, status_box, fen_current, eval_box, replay_list]
         
         click_btn.click(on_click, [click_r, click_c], ui_outputs)
         
-        new_btn.click(handle_new_game, [red_p, black_p], ui_outputs)
+        new_btn.click(handle_new_game, [red_p, black_p, fen_box], ui_outputs)
         undo_btn.click(handle_undo, outputs=ui_outputs)
+        replay_prev.click(handle_replay_prev, outputs=ui_outputs)
+        replay_next.click(handle_replay_next, outputs=ui_outputs)
+        replay_current.click(handle_replay_current, outputs=ui_outputs)
         
         refresh_ckpt.click(handle_refresh_ckpt, [ckpt_dir], [ckpt_dropdown])
         

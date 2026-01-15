@@ -476,17 +476,12 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
         [-2, -1], [-2, 1], [-1, -2], [-1, 2],
         [1, -2], [1, 2], [2, -1], [2, 1]
     ])
-    # 马腿位置
-    leg_deltas = jnp.array([
-        [-1, 0], [-1, 0], [0, -1], [0, 1],
-        [0, -1], [0, 1], [1, 0], [1, 0]
-    ])
     
     def check_knight(i):
         dr, dc = knight_deltas[i]
-        lr, lc = leg_deltas[i]
         tr, tc = king_row + dr, king_col + dc
-        lr, lc = king_row + lr, king_col + lc
+        # 马腿位置：从将/帅出发，取 dr/dc 的符号方向
+        lr, lc = king_row + jnp.sign(dr), king_col + jnp.sign(dc)
         
         in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
         leg_in_bounds = (lr >= 0) & (lr < BOARD_HEIGHT) & (lc >= 0) & (lc < BOARD_WIDTH)
