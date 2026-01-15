@@ -533,6 +533,8 @@ def is_legal_move(
     """
     验证一个移动是否完全合法（包括不能送将）
     
+    优化：使用 jax.lax.cond 条件执行，只有基本移动合法时才进行将军检测
+    
     Args:
         board: 棋盘状态
         from_sq: 起始格子
@@ -545,17 +547,25 @@ def is_legal_move(
     # 首先验证基本移动规则
     basic_valid = is_valid_move(board, from_sq, to_sq, player)
     
-    # 模拟移动后检查是否被将军
-    new_board = apply_move(board, from_sq, to_sq)
-    still_in_check = is_in_check(new_board, player)
+    def check_not_in_check(_):
+        """基本移动合法时，进一步检查不会送将"""
+        new_board = apply_move(board, from_sq, to_sq)
+        still_in_check = is_in_check(new_board, player)
+        return ~still_in_check
     
-    return basic_valid & ~still_in_check
+    def skip_check(_):
+        """基本移动不合法，直接返回 False"""
+        return jnp.array(False)
+    
+    # 条件执行：只有 basic_valid 为 True 时才执行昂贵的将军检测
+    return jax.lax.cond(basic_valid, check_not_in_check, skip_check, None)
 
 
 # ============================================================================
 # 合法动作生成
 # ============================================================================
 
+@jax.jit
 def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     """
     获取所有合法动作的掩码
