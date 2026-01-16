@@ -594,8 +594,13 @@ def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray
     v_advisor = _is_valid_advisor_move(board, from_rows, from_cols, to_rows, to_cols, player)
     v_bishop = _is_valid_bishop_move(board, from_rows, from_cols, to_rows, to_cols, player)
     v_knight = _is_valid_knight_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    v_rook = _is_valid_rook_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    v_cannon = _is_valid_cannon_move(board, from_rows, from_cols, to_rows, to_cols, player)
+    
+    # 车和炮内部有扫描逻辑，需要显式 vmap
+    v_rook = jax.vmap(lambda fr, fc, tr, tc: _is_valid_rook_move(board, fr, fc, tr, tc, player))(
+        from_rows, from_cols, to_rows, to_cols)
+    v_cannon = jax.vmap(lambda fr, fc, tr, tc: _is_valid_cannon_move(board, fr, fc, tr, tc, player))(
+        from_rows, from_cols, to_rows, to_cols)
+    
     v_pawn = _is_valid_pawn_move(board, from_rows, from_cols, to_rows, to_cols, player)
 
     piece_valid = jnp.where(piece_types == 1, v_king,
