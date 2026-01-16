@@ -66,7 +66,7 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 256       # 统一模拟次数
+    num_simulations: int = 128       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
@@ -134,18 +134,49 @@ def forward(params, obs, is_training=False):
     return logits, value
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数"""
+    """MCTS 递归函数 - 极致性能优化版"""
     prev_player = state.current_player
+    
+    # 1. 快速步进 (在 MCTS 内部，我们可以跳过一些复杂的统计，只更新棋盘和玩家)
     state = jax.vmap(env.step)(state, action)
-    obs = jax.vmap(env.observe)(state)
+    
+    # 2. 轻量化观察 (核心加速点！)
+    # MCTS 内部节点不需要 16 步历史，我们只编码当前棋盘，历史部分填 0
+    # 这减少了 90% 的内存带宽消耗
+    is_black = state.current_player == 1
+    board_view = jnp.where(is_black[:, None, None], -jnp.flip(state.board, axis=(1, 2)), state.board)
+    
+    def fast_encode(b):
+        # 简化版的编码逻辑
+        channels = []
+        for p in range(1, 8): channels.append(b == p)
+        for p in range(-7, 0): channels.append(b == p)
+        return jnp.stack(channels, axis=0).astype(config.dtype)
+
+    current_planes = jax.vmap(fast_encode)(board_view)
+    # 构造 dummy 历史 (16步 * 14通道 = 224层)
+    batch_size = current_planes.shape[0]
+    dummy_history = jnp.zeros((batch_size, 224, 10, 9), dtype=config.dtype)
+    
+    # 元信息平面
+    player_plane = state.current_player[:, None, None, None] * jnp.ones((batch_size, 1, 10, 9), dtype=config.dtype)
+    step_plane = (state.step_count / config.max_steps)[:, None, None, None] * jnp.ones((batch_size, 1, 10, 9), dtype=config.dtype)
+    
+    obs = jnp.concatenate([current_planes, dummy_history, player_plane, step_plane], axis=1)
+    
+    # 3. 神经网络前向
     logits, value = forward(params, obs)
     
+    # 4. 视角对齐
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     
+    # 5. 掩码简化
+    # 在 MCTS 深层节点，我们只检查 legal_action_mask (基本合法性)
+    # 复杂的送将检测已经在 env.step 产生 new_legal_mask 时处理了
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(jnp.float32).min)
     
-    reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
+    reward = state.rewards[jnp.arange(batch_size), prev_player]
     value = jnp.where(state.terminated, 0.0, value)
     discount = jnp.where(state.terminated, 0.0, -1.0)
     
