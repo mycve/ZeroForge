@@ -53,7 +53,7 @@ class Config:
     
     # 网络架构
     num_channels: int = 128
-    num_blocks: int = 12
+    num_blocks: int = 8
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -70,14 +70,14 @@ class Config:
     sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
-    temperature_steps: int = 60
+    temperature_steps: int = 50
     temperature_initial: float = 1.0
-    temperature_final: float = 0.5
+    temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 300
+    max_steps: int = 250
     max_no_capture_steps: int = 100
-    repetition_threshold: int = 4
+    repetition_threshold: int = 3
     perpetual_check_threshold: int = 6
     
     # ELO 评估
@@ -761,10 +761,14 @@ def main():
     dummy_samples = compute_targets(dummy_data)
     
     # 2. 编译 Train Step
+    # 直接构造正确形状的 dummy 数据，避免从 selfplay 输出切片时形状不匹配
+    # （selfplay_batch_per_device 可能小于 training_batch_per_device）
     batch_per_device = config.training_batch_size // num_devices
-    dummy_batch = jax.tree.map(
-        lambda x: x[:, 0, :batch_per_device].reshape((num_devices, batch_per_device) + x.shape[3:]), 
-        dummy_samples
+    dummy_batch = Sample(
+        obs=jnp.zeros((num_devices, batch_per_device, *dummy_samples.obs.shape[3:]), dtype=dummy_samples.obs.dtype),
+        policy_tgt=jnp.zeros((num_devices, batch_per_device, *dummy_samples.policy_tgt.shape[3:]), dtype=dummy_samples.policy_tgt.dtype),
+        value_tgt=jnp.zeros((num_devices, batch_per_device), dtype=dummy_samples.value_tgt.dtype),
+        mask=jnp.ones((num_devices, batch_per_device), dtype=dummy_samples.mask.dtype),
     )
     _ = train_step(params, opt_state, dummy_batch, dummy_keys)
     
