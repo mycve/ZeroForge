@@ -66,8 +66,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 256       # 统一模拟次数
-    top_k: int = 32                 # top-k ≈ simulations / 4
+    num_simulations: int = 64       # 统一模拟次数
+    top_k: int = 8                 # top-k ≈ simulations / 4
     
     # 经验回放配置
     replay_buffer_size: int = 1000000  # 回放缓冲区大小
