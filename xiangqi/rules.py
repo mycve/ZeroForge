@@ -320,38 +320,25 @@ def is_valid_move_for_piece(
     piece_type: jnp.ndarray,
     player: jnp.ndarray
 ) -> jnp.ndarray:
-    """根据棋子类型验证移动"""
-    # 使用 switch/case 风格的条件选择
-    valid = jnp.where(
-        piece_type == 1,  # KING
-        _is_valid_king_move(board, from_row, from_col, to_row, to_col, player),
-        jnp.where(
-            piece_type == 2,  # ADVISOR
-            _is_valid_advisor_move(board, from_row, from_col, to_row, to_col, player),
-            jnp.where(
-                piece_type == 3,  # BISHOP
-                _is_valid_bishop_move(board, from_row, from_col, to_row, to_col, player),
-                jnp.where(
-                    piece_type == 4,  # KNIGHT
-                    _is_valid_knight_move(board, from_row, from_col, to_row, to_col, player),
-                    jnp.where(
-                        piece_type == 5,  # ROOK
-                        _is_valid_rook_move(board, from_row, from_col, to_row, to_col, player),
-                        jnp.where(
-                            piece_type == 6,  # CANNON
-                            _is_valid_cannon_move(board, from_row, from_col, to_row, to_col, player),
-                            jnp.where(
-                                piece_type == 7,  # PAWN
-                                _is_valid_pawn_move(board, from_row, from_col, to_row, to_col, player),
-                                False  # 空或无效棋子
-                            )
-                        )
-                    )
-                )
-            )
-        )
+    """根据棋子类型验证移动 (使用 jax.lax.switch 优化分支)"""
+    
+    # 定义各个棋子的验证逻辑，统一函数签名
+    def check_empty(_): return jnp.array(False)
+    def check_king(_): return _is_valid_king_move(board, from_row, from_col, to_row, to_col, player)
+    def check_advisor(_): return _is_valid_advisor_move(board, from_row, from_col, to_row, to_col, player)
+    def check_bishop(_): return _is_valid_bishop_move(board, from_row, from_col, to_row, to_col, player)
+    def check_knight(_): return _is_valid_knight_move(board, from_row, from_col, to_row, to_col, player)
+    def check_rook(_): return _is_valid_rook_move(board, from_row, from_col, to_row, to_col, player)
+    def check_cannon(_): return _is_valid_cannon_move(board, from_row, from_col, to_row, to_col, player)
+    def check_pawn(_): return _is_valid_pawn_move(board, from_row, from_col, to_row, to_col, player)
+
+    # jax.lax.switch 会编译成更高效的 XLA 分支逻辑
+    # piece_type 对应: 0:Empty, 1:King, 2:Advisor, 3:Bishop, 4:Knight, 5:Rook, 6:Cannon, 7:Pawn
+    return jax.lax.switch(
+        piece_type,
+        [check_empty, check_king, check_advisor, check_bishop, check_knight, check_rook, check_cannon, check_pawn],
+        None
     )
-    return valid
 
 
 @jax.jit
@@ -419,13 +406,10 @@ def find_king(board: jnp.ndarray, player: jnp.ndarray) -> tuple[jnp.ndarray, jnp
 
 
 @jax.jit
-def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
+def is_in_check_at(board: jnp.ndarray, player: jnp.ndarray, king_row, king_col) -> jnp.ndarray:
     """
-    以将/帅为中心的快速将军检测 (King-centric)
-    由原来的 O(90) 降低为 O(1) 的固定检测，极大减少 XLA 图节点数量
+    以指定位置为中心的快速将军检测
     """
-    king_row, king_col = find_king(board, player)
-    
     # 敌方棋子类型
     is_red = player == 0
     E_KING = jnp.where(is_red, B_KING, R_KING)
@@ -436,34 +420,27 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     
     # 1. 探测四个方向的直线攻击 (车、炮、王见王)
     def scan_line(dr, dc):
-        # 使用 arange 探测
         idx = jnp.arange(1, 10)
         rows = jnp.clip(king_row + dr * idx, 0, BOARD_HEIGHT - 1)
         cols = jnp.clip(king_col + dc * idx, 0, BOARD_WIDTH - 1)
         
-        # 边界掩码
         in_bounds = (king_row + dr * idx >= 0) & (king_row + dr * idx < BOARD_HEIGHT) & \
                     (king_col + dc * idx >= 0) & (king_col + dc * idx < BOARD_WIDTH)
         
         pieces = jnp.where(in_bounds, board[rows, cols], EMPTY)
         
-        # 找到第一个和第二个非空棋子
         is_piece = pieces != EMPTY
         first_idx = jnp.argmax(is_piece)
         first_exists = jnp.any(is_piece)
         first_piece = jnp.where(first_exists, pieces[first_idx], EMPTY)
         
-        # 找第二个棋子
         mask_after_first = jnp.arange(9) > first_idx
         second_exists = jnp.any(is_piece & mask_after_first)
         second_idx = jnp.argmax(is_piece & mask_after_first)
         second_piece = jnp.where(second_exists, pieces[second_idx], EMPTY)
         
-        # 将见将/车将军：第一个棋子是敌方王或车
-        # 注意：王见王仅在同列(dc=0)有效
         is_king_face_to_face = (dc == 0) & (first_piece == E_KING)
         is_rook_check = first_piece == E_ROOK
-        # 炮将军：第二个棋子是敌方炮
         is_cannon_check = second_piece == E_CANNON
         
         return is_king_face_to_face | is_rook_check | is_cannon_check
@@ -480,20 +457,16 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     def check_knight(i):
         dr, dc = knight_deltas[i]
         tr, tc = king_row + dr, king_col + dc
-        # 马腿位置：从将/帅出发，取 dr/dc 的符号方向
         lr, lc = king_row + jnp.sign(dr), king_col + jnp.sign(dc)
         
         in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
         leg_in_bounds = (lr >= 0) & (lr < BOARD_HEIGHT) & (lc >= 0) & (lc < BOARD_WIDTH)
         
-        # 无蹩马腿且目标是敌方马
         return in_bounds & leg_in_bounds & (board[lr, lc] == EMPTY) & (board[tr, tc] == E_KNIGHT)
 
     check_knight_all = jnp.any(jax.vmap(check_knight)(jnp.arange(8)))
     
     # 3. 探测兵的攻击
-    # 红方将(帅)在下方，会被黑方卒(向下走)攻击：dr = +1
-    # 黑方将(将)在上方，会被红方兵(向上走)攻击：dr = -1
     pawn_dr = jnp.where(is_red, 1, -1)
     pawn_deltas = jnp.array([[pawn_dr, 0], [0, -1], [0, 1]])
     
@@ -506,6 +479,13 @@ def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     check_pawn_all = jnp.any(jax.vmap(check_pawn)(jnp.arange(3)))
     
     return check_h | check_v | check_knight_all | check_pawn_all
+
+
+@jax.jit
+def is_in_check(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
+    """封装原本的接口，自动寻找将/帅位置"""
+    king_row, king_col = find_king(board, player)
+    return is_in_check_at(board, player, king_row, king_col)
 
 
 @jax.jit
@@ -528,29 +508,46 @@ def is_legal_move(
     board: jnp.ndarray,
     from_sq: jnp.ndarray,
     to_sq: jnp.ndarray,
-    player: jnp.ndarray
+    player: jnp.ndarray,
+    king_row: jnp.ndarray = None,
+    king_col: jnp.ndarray = None
 ) -> jnp.ndarray:
     """
     验证一个移动是否完全合法（包括不能送将）
-    
-    优化：使用 jax.lax.cond 条件执行，只有基本移动合法时才进行将军检测
     
     Args:
         board: 棋盘状态
         from_sq: 起始格子
         to_sq: 目标格子
         player: 当前玩家
+        king_row, king_col: 预计算的将/帅位置，若为 None 则内部寻找
         
     Returns:
         是否合法
     """
+    # 如果没传王的位置，先找一下
+    if king_row is None or king_col is None:
+        king_row, king_col = find_king(board, player)
+
     # 首先验证基本移动规则
     basic_valid = is_valid_move(board, from_sq, to_sq, player)
     
     def check_not_in_check(_):
         """基本移动合法时，进一步检查不会送将"""
+        from_row = from_sq // BOARD_WIDTH
+        from_col = from_sq % BOARD_WIDTH
+        to_row = to_sq // BOARD_WIDTH
+        to_col = to_sq % BOARD_WIDTH
+        
         new_board = apply_move(board, from_sq, to_sq)
-        still_in_check = is_in_check(new_board, player)
+        
+        # 优化：如果移动的是将/帅，使用新位置；否则使用旧位置
+        piece_type = get_piece_type(board[from_row, from_col])
+        is_king = piece_type == 1
+        new_king_row = jnp.where(is_king, to_row, king_row)
+        new_king_col = jnp.where(is_king, to_col, king_col)
+        
+        still_in_check = is_in_check_at(new_board, player, new_king_row, new_king_col)
         return ~still_in_check
     
     def skip_check(_):
@@ -577,15 +574,27 @@ def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray
     Returns:
         合法动作掩码 (ACTION_SPACE_SIZE,) bool 数组
     """
+    # 预计算王的位置，避免在 vmap 内部重复寻找
+    king_row, king_col = find_king(board, player)
+    
+    # 预计算起始位置是否为己方棋子，作为第一层过滤
+    from_sqs = _ACTION_TO_FROM_SQ
+    pieces_at_from = board[from_sqs // BOARD_WIDTH, from_sqs % BOARD_WIDTH]
+    is_own = is_own_piece(pieces_at_from, player)
+
     # 对每个可能的动作检查是否合法
-    def check_action(action_id):
-        from_sq = _ACTION_TO_FROM_SQ[action_id]
-        to_sq = _ACTION_TO_TO_SQ[action_id]
-        return is_legal_move(board, from_sq, to_sq, player)
+    def check_action(action_id, own_mask):
+        # 如果起始格子根本没有己方棋子，直接返回 False
+        return jax.lax.cond(
+            own_mask,
+            lambda _: is_legal_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id], player, king_row, king_col),
+            lambda _: jnp.array(False),
+            None
+        )
     
     # 向量化检查所有动作
     action_ids = jnp.arange(ACTION_SPACE_SIZE, dtype=jnp.int32)
-    legal_mask = jax.vmap(check_action)(action_ids)
+    legal_mask = jax.vmap(check_action)(action_ids, is_own)
     
     return legal_mask
 
