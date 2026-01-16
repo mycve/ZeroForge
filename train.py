@@ -51,6 +51,10 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
+    # 混合精度配置 (针对高级 CUDA 显卡优化)
+    # 如果在 Mac 或普通硬件上运行，JAX 会自动处理或你可以手动切回 float32
+    dtype: jnp.dtype = jnp.bfloat16 if jax.default_backend() == "gpu" else jnp.float32
+    
     # 网络架构
     num_channels: int = 128
     num_blocks: int = 8
@@ -75,7 +79,7 @@ class Config:
     temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 200
+    max_steps: int = 300
     max_no_capture_steps: int = 100
     repetition_threshold: int = 3
     perpetual_check_threshold: int = 6
@@ -121,6 +125,7 @@ net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
+    dtype=config.dtype,  # 传入混合精度配置
 )
 
 def forward(params, obs, is_training=False):
@@ -298,12 +303,18 @@ def loss_fn(params, samples: Sample, rng_key):
     
     logits, value = forward(params, obs, is_training=True)
     
+    # 强制转换为 float32 进行损失计算，避免数值不稳定
+    logits = logits.astype(jnp.float32)
+    value = value.astype(jnp.float32)
+    policy_tgt = policy_tgt.astype(jnp.float32)
+    value_tgt = samples.value_tgt.astype(jnp.float32)
+    
     # 策略损失（所有样本）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     # 价值损失 (n-step TD 目标)
-    value_loss = jnp.sum(optax.l2_loss(value, samples.value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+    value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     # 熵正则化
     probs = jax.nn.softmax(logits)

@@ -565,36 +565,46 @@ def is_legal_move(
 @jax.jit
 def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     """
-    获取所有合法动作的掩码
-    
-    Args:
-        board: 棋盘状态 (10, 9)
-        player: 当前玩家 (0=红, 1=黑)
-        
-    Returns:
-        合法动作掩码 (ACTION_SPACE_SIZE,) bool 数组
+    获取所有合法动作的掩码 (极致性能优化版)
     """
-    # 预计算王的位置，避免在 vmap 内部重复寻找
+    # 1. 快速定位王的位置
     king_row, king_col = find_king(board, player)
     
-    # 预计算起始位置是否为己方棋子，作为第一层过滤
+    # 2. 预计算必要的中间信息
     from_sqs = _ACTION_TO_FROM_SQ
-    pieces_at_from = board[from_sqs // BOARD_WIDTH, from_sqs % BOARD_WIDTH]
+    to_sqs = _ACTION_TO_TO_SQ
+    
+    # 3. 向量化提取棋子信息 (一次性处理，利用 GPU 内存带宽)
+    from_rows = from_sqs // BOARD_WIDTH
+    from_cols = from_sqs % BOARD_WIDTH
+    pieces_at_from = board[from_rows, from_cols]
+    
+    # 第一层过滤：起始位置必须是己方棋子
     is_own = is_own_piece(pieces_at_from, player)
+    
+    # 第二层过滤：目标位置不能是己方棋子
+    to_rows = to_sqs // BOARD_WIDTH
+    to_cols = to_sqs % BOARD_WIDTH
+    pieces_at_to = board[to_rows, to_cols]
+    not_own_target = ~is_own_piece(pieces_at_to, player) | (pieces_at_to == EMPTY)
+    
+    # 合并前两层过滤
+    basic_mask = is_own & not_own_target
 
-    # 对每个可能的动作检查是否合法
-    def check_action(action_id, own_mask):
-        # 如果起始格子根本没有己方棋子，直接返回 False
+    def check_full_legality(action_id, mask):
+        # 只有通过前两层过滤的才进行深度验证
         return jax.lax.cond(
-            own_mask,
+            mask,
             lambda _: is_legal_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id], player, king_row, king_col),
             lambda _: jnp.array(False),
             None
         )
-    
-    # 向量化检查所有动作
+
+    # 4. 向量化执行，但内部由于 cond 的存在，XLA 会进行路径优化
+    # 注意：jax.vmap 在这里仍然会处理所有 action_id，
+    # 但由于 basic_mask 为 False 的比例很高（通常 > 90%），执行流会变快
     action_ids = jnp.arange(ACTION_SPACE_SIZE, dtype=jnp.int32)
-    legal_mask = jax.vmap(check_action)(action_ids, is_own)
+    legal_mask = jax.vmap(check_full_legality)(action_ids, basic_mask)
     
     return legal_mask
 
