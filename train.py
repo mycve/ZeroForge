@@ -66,7 +66,7 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 128       # 统一模拟次数
+    num_simulations: int = 256       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
@@ -74,13 +74,13 @@ class Config:
     sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
-    temperature_steps: int = 50
+    temperature_steps: int = 60
     temperature_initial: float = 1.0
     temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 300
-    max_no_capture_steps: int = 100
+    max_steps: int = 200
+    max_no_capture_steps: int = 60
     repetition_threshold: int = 3
     perpetual_check_threshold: int = 6
     
