@@ -79,7 +79,7 @@ class Config:
     temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 250
+    max_steps: int = 200
     max_no_capture_steps: int = 60
     repetition_threshold: int = 3
     perpetual_check_threshold: int = 6
