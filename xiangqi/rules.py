@@ -565,73 +565,46 @@ def is_legal_move(
 @jax.jit
 def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
     """
-    获取所有合法动作的掩码 (极致编译优化版)
-    
-    使用 static_argnums 的思想，将 2086 个动作分块处理，避免编译器崩溃
+    获取所有合法动作的掩码 (极致性能优化版)
     """
+    # 1. 快速定位王的位置
     king_row, king_col = find_king(board, player)
     
-    # 预过滤：起始必须有子，目标不能是己子
+    # 2. 预计算必要的中间信息
     from_sqs = _ACTION_TO_FROM_SQ
     to_sqs = _ACTION_TO_TO_SQ
     
-    pieces_at_from = board[from_sqs // BOARD_WIDTH, from_sqs % BOARD_WIDTH]
-    pieces_at_to = board[to_sqs // BOARD_WIDTH, to_sqs % BOARD_WIDTH]
+    # 3. 向量化提取棋子信息 (一次性处理，利用 GPU 内存带宽)
+    from_rows = from_sqs // BOARD_WIDTH
+    from_cols = from_sqs % BOARD_WIDTH
+    pieces_at_from = board[from_rows, from_cols]
     
+    # 第一层过滤：起始位置必须是己方棋子
     is_own = is_own_piece(pieces_at_from, player)
+    
+    # 第二层过滤：目标位置不能是己方棋子
+    to_rows = to_sqs // BOARD_WIDTH
+    to_cols = to_sqs % BOARD_WIDTH
+    pieces_at_to = board[to_rows, to_cols]
     not_own_target = ~is_own_piece(pieces_at_to, player) | (pieces_at_to == EMPTY)
+    
+    # 合并前两层过滤
     basic_mask = is_own & not_own_target
 
-    # 核心优化：避免对 2086 个动作直接 vmap 复杂函数
-    # 我们可以把 is_valid_move 拆解开，先做简单的几何验证
-    
-    from_rows, from_cols = from_sqs // BOARD_WIDTH, from_sqs % BOARD_WIDTH
-    to_rows, to_cols = to_sqs // BOARD_WIDTH, to_sqs % BOARD_WIDTH
-    piece_types = get_piece_type(pieces_at_from)
-
-    # 向量化验证各子走法 (不使用 switch，改用更平坦的逻辑减少编译深度)
-    v_king = _is_valid_king_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    v_advisor = _is_valid_advisor_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    v_bishop = _is_valid_bishop_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    v_knight = _is_valid_knight_move(board, from_rows, from_cols, to_rows, to_cols, player)
-    
-    # 车和炮内部有扫描逻辑，需要显式 vmap
-    v_rook = jax.vmap(lambda fr, fc, tr, tc: _is_valid_rook_move(board, fr, fc, tr, tc, player))(
-        from_rows, from_cols, to_rows, to_cols)
-    v_cannon = jax.vmap(lambda fr, fc, tr, tc: _is_valid_cannon_move(board, fr, fc, tr, tc, player))(
-        from_rows, from_cols, to_rows, to_cols)
-    
-    v_pawn = _is_valid_pawn_move(board, from_rows, from_cols, to_rows, to_cols, player)
-
-    piece_valid = jnp.where(piece_types == 1, v_king,
-                  jnp.where(piece_types == 2, v_advisor,
-                  jnp.where(piece_types == 3, v_bishop,
-                  jnp.where(piece_types == 4, v_knight,
-                  jnp.where(piece_types == 5, v_rook,
-                  jnp.where(piece_types == 6, v_cannon,
-                  jnp.where(piece_types == 7, v_pawn, False)))))))
-
-    # 最终合法性掩码（此时还不考虑送将）
-    pseudo_legal = basic_mask & piece_valid
-
-    # 【深度优化】：只有 pseudo_legal 为真的动作，才进行“送将”检测
-    # 由于 pseudo_legal 的 True 数量很少，这里使用 cond 能极大地减轻编译器负担
-    def check_check(action_id, p_legal):
+    def check_full_legality(action_id, mask):
+        # 只有通过前两层过滤的才进行深度验证
         return jax.lax.cond(
-            p_legal,
-            lambda _: ~is_in_check_at(apply_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id]), 
-                                     player, 
-                                     jnp.where(get_piece_type(board[_ACTION_TO_FROM_SQ[action_id]//9, _ACTION_TO_FROM_SQ[action_id]%9]) == 1, 
-                                               _ACTION_TO_TO_SQ[action_id]//9, king_row),
-                                     jnp.where(get_piece_type(board[_ACTION_TO_FROM_SQ[action_id]//9, _ACTION_TO_FROM_SQ[action_id]%9]) == 1, 
-                                               _ACTION_TO_TO_SQ[action_id]%9, king_col)),
-            lambda _: False,
+            mask,
+            lambda _: is_legal_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id], player, king_row, king_col),
+            lambda _: jnp.array(False),
             None
         )
 
-    # 对 pseudo_legal 后的动作进行最终送将过滤
-    # 使用较小的 action_ids 范围进行映射
-    legal_mask = jax.vmap(check_check)(jnp.arange(ACTION_SPACE_SIZE), pseudo_legal)
+    # 4. 向量化执行，但内部由于 cond 的存在，XLA 会进行路径优化
+    # 注意：jax.vmap 在这里仍然会处理所有 action_id，
+    # 但由于 basic_mask 为 False 的比例很高（通常 > 90%），执行流会变快
+    action_ids = jnp.arange(ACTION_SPACE_SIZE, dtype=jnp.int32)
+    legal_mask = jax.vmap(check_full_legality)(action_ids, basic_mask)
     
     return legal_mask
 
