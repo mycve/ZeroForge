@@ -51,10 +51,6 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 混合精度配置 (针对高级 CUDA 显卡优化)
-    # 如果在 Mac 或普通硬件上运行，JAX 会自动处理或你可以手动切回 float32
-    dtype: jnp.dtype = jnp.bfloat16 if jax.default_backend() == "gpu" else jnp.float32
-    
     # 网络架构
     num_channels: int = 128
     num_blocks: int = 8
@@ -125,7 +121,6 @@ net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
-    dtype=config.dtype,  # 传入混合精度配置
 )
 
 def forward(params, obs, is_training=False):
@@ -326,16 +321,53 @@ def loss_fn(params, samples: Sample, rng_key):
     return total_loss, (policy_loss, value_loss)
 
 @jax.pmap
-def evaluate(params_red, params_black, rng_key):
-    """高性能评估算子：双模型对战"""
+def generate_random_openings(rng_key, num_random_moves: int = 8):
+    """生成随机开局局面（用于镜像对局评估）
+    
+    从合法走法中均匀随机选择，走偶数步确保轮到红方
+    """
     batch_size = config.eval_games // num_devices
+    # 确保走偶数步（回到红方先手）
+    num_random_moves = (num_random_moves // 2) * 2
+    
+    def random_step(state, key):
+        """从合法走法中均匀随机选择一步"""
+        # 直接从合法走法中均匀随机（无策略偏向）
+        legal_mask = state.legal_action_mask
+        # 合法走法概率均等
+        probs = legal_mask.astype(jnp.float32)
+        probs = probs / jnp.sum(probs, axis=-1, keepdims=True)
+        
+        sample_keys = jax.random.split(key, batch_size)
+        action = jax.vmap(lambda p, k: jax.random.choice(k, ACTION_SPACE_SIZE, p=p))(probs, sample_keys)
+        
+        next_state = jax.vmap(env.step)(state, action)
+        return next_state, None
+    
+    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
+    state, _ = jax.lax.scan(random_step, state, jax.random.split(rng_key, num_random_moves))
+    return state
+
+
+@jax.pmap
+def evaluate_from_position(params_red, params_black, start_state, rng_key):
+    """从指定局面开始评估（镜像对局的核心）
+    
+    Args:
+        params_red: 执红方的模型参数
+        params_black: 执黑方的模型参数
+        start_state: 起始局面（由 generate_random_openings 生成）
+        rng_key: 随机数 key
+    
+    Returns:
+        winner: 每局的胜者 (0=红胜, 1=黑胜, -1=和棋)
+    """
+    batch_size = start_state.board.shape[0]
     
     def evaluate_recurrent_fn(params_pair, rng_key, action, state):
         p_red, p_black = params_pair
-        # 分别计算两个模型的输出
         out_red, next_state = recurrent_fn(p_red, rng_key, action, state)
         out_black, _ = recurrent_fn(p_black, rng_key, action, state)
-        # 根据搜索模型索引进行合并
         use_red = state.search_model_index == 0
         out = jax.tree.map(
             lambda r, b: jnp.where(use_red[:, None] if r.ndim > 1 else use_red, r, b),
@@ -344,7 +376,6 @@ def evaluate(params_red, params_black, rng_key):
         return out, next_state
     
     def step_fn(state, key):
-        # 在根节点确定当前搜索归属于哪个模型
         is_red = state.current_player == 0
         state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
         
@@ -354,7 +385,6 @@ def evaluate(params_red, params_black, rng_key):
         
         logits = jnp.where(is_red[:, None], logits_r, logits_b)
         value = jnp.where(is_red, value_r, value_b)
-        
         logits = jnp.where(is_red[:, None], logits, logits[:, _ROTATED_IDX])
         
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
@@ -367,29 +397,25 @@ def evaluate(params_red, params_black, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
-        # 评估多样性：前 30 步高温度采样
-        temp = jnp.where(state.step_count < 30, 1.0, 0.1)
+        # 评估时低温度（更接近最优走法）
+        temp = 0.1
         
-        def _sample_action(w, t, k, legal_mask):
-            """温度采样 (log 空间避免数值下溢)"""
-            t = jnp.maximum(t, 1e-3)
+        def _sample_action(w, k, legal_mask):
             w_masked = jnp.where(legal_mask, w, 0.0)
-            log_w = jnp.log(w_masked + 1e-10)
-            log_w_temp = log_w / t
-            log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
-            log_w_temp = log_w_temp - jnp.max(log_w_temp)
-            w_temp = jnp.exp(log_w_temp)
+            log_w = jnp.log(w_masked + 1e-10) / temp
+            log_w = jnp.where(legal_mask, log_w, -jnp.inf)
+            log_w = log_w - jnp.max(log_w)
+            w_temp = jnp.exp(log_w)
             w_temp = jnp.where(legal_mask, w_temp, 0.0)
             w_prob = w_temp / jnp.maximum(jnp.sum(w_temp), 1e-10)
             return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
         
         sample_keys = jax.random.split(k_sample, batch_size)
-        action = jax.vmap(_sample_action)(policy_output.action_weights, temp, sample_keys, state.legal_action_mask)
+        action = jax.vmap(_sample_action)(policy_output.action_weights, sample_keys, state.legal_action_mask)
         
         next_state = jax.vmap(env.step)(state, action)
         return next_state, next_state.terminated
 
-    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
     terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
     
     def body_fn(args):
@@ -400,9 +426,52 @@ def evaluate(params_red, params_black, rng_key):
         
     state, _, _ = jax.lax.while_loop(
         lambda args: (~jnp.all(args[1])) & (args[0].step_count[0] < config.max_steps), 
-        body_fn, (state, terminated, rng_key)
+        body_fn, (start_state, terminated, rng_key)
     )
     return state.winner
+
+
+def evaluate_mirrored(params_new, params_old, rng_key):
+    """镜像对局评估：同一开局局面，双方各执红黑一次
+    
+    这种方法消除了开局随机性带来的噪声，更准确地衡量模型实力差异。
+    
+    Returns:
+        score: 新模型的得分率 (0~1)
+        wins_as_red: 新模型执红时的胜局数
+        wins_as_black: 新模型执黑时的胜局数
+        draws: 和棋数
+    """
+    # 1. 生成随机开局局面（从合法走法均匀随机，8步）
+    rng_key, sk1, sk2, sk3 = jax.random.split(rng_key, 4)
+    opening_states = generate_random_openings(jax.random.split(sk1, num_devices), num_random_moves=8)
+    
+    # 2. 镜像对局：同一局面，新模型分别执红和执黑
+    # 新模型执红 vs 旧模型执黑
+    winners_new_red = evaluate_from_position(params_new, params_old, opening_states, jax.random.split(sk2, num_devices))
+    # 旧模型执红 vs 新模型执黑
+    winners_old_red = evaluate_from_position(params_old, params_new, opening_states, jax.random.split(sk3, num_devices))
+    
+    # 3. 统计结果
+    # 新模型执红时：红胜(winner=0)算新模型赢，黑胜(winner=1)算新模型输
+    wins_as_red = int((winners_new_red == 0).sum())
+    losses_as_red = int((winners_new_red == 1).sum())
+    draws_as_red = int((winners_new_red == -1).sum())
+    
+    # 新模型执黑时：黑胜(winner=1)算新模型赢，红胜(winner=0)算新模型输
+    wins_as_black = int((winners_old_red == 1).sum())
+    losses_as_black = int((winners_old_red == 0).sum())
+    draws_as_black = int((winners_old_red == -1).sum())
+    
+    total_wins = wins_as_red + wins_as_black
+    total_losses = losses_as_red + losses_as_black
+    total_draws = draws_as_red + draws_as_black
+    total_games = config.eval_games * 2
+    
+    # 得分：胜=1分，和=0.5分，负=0分
+    score = (total_wins + 0.5 * total_draws) / total_games
+    
+    return score, wins_as_red, wins_as_black, total_draws
 
 # ============================================================================
 # 经验回放缓冲区
@@ -874,17 +943,16 @@ def main():
             
             if past_iter in history_models:
                 past_params = replicate_to_devices(history_models[past_iter])
-                rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-                # 双边评估
-                winners_r = evaluate(params, past_params, jax.random.split(sk5, num_devices))
-                winners_b = evaluate(past_params, params, jax.random.split(sk6, num_devices))
-                wr = (winners_r == 0).sum()
-                wb = (winners_b == 1).sum()
-                score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
+                rng_key, sk5 = jax.random.split(rng_key)
+                # 镜像对局评估：同一开局局面，双方各执红黑一次
+                score, wins_red, wins_black, draws = evaluate_mirrored(params, past_params, sk5)
                 elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
                 iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
-                print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
+                print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%} (红胜{wins_red} 黑胜{wins_black} 和{draws}), ELO {iteration_elos[iteration]:.0f}")
                 writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
+                writer.add_scalar("eval/wins_as_red", wins_red, iteration)
+                writer.add_scalar("eval/wins_as_black", wins_black, iteration)
+                writer.add_scalar("eval/draws", draws, iteration)
             else:
                 print(f"[警告] 无可用历史模型，跳过本次评估")
 

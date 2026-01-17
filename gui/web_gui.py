@@ -138,7 +138,8 @@ class UCIEngine:
             self.process.stdin.write(f"{cmd}\n")
             self.process.stdin.flush()
 
-    def get_best_move(self, fen: str, movetime: int = 1000, depth: Optional[int] = None) -> Optional[str]:
+    def get_best_move(self, fen: str, movetime: int = 1000, depth: Optional[int] = None) -> Tuple[Optional[str], Optional[float]]:
+        """返回 (bestmove, score)，score 为当前方视角的评估值 (-1 到 +1)"""
         with self.lock:
             while not self.output_queue.empty(): self.output_queue.get()
             self.send(f"position fen {fen}")
@@ -148,11 +149,38 @@ class UCIEngine:
                 self.send(f"go movetime {movetime}")
             start_time = time.time()
             wait_seconds = (movetime / 1000.0 + 2.0) if depth is None else max(2.0, depth * 0.5)
+            last_score = None  # 记录最后一次的评估分数
             while time.time() - start_time < wait_seconds:
                 try:
                     line = self.output_queue.get(timeout=0.1)
-                    if line.startswith("bestmove"): return line.split()[1]
+                    # 解析 info 行中的评估分数
+                    if line.startswith("info") and " score " in line:
+                        last_score = self._parse_score(line)
+                    if line.startswith("bestmove"):
+                        return line.split()[1], last_score
                 except queue.Empty: continue
+        return None, None
+    
+    def _parse_score(self, info_line: str) -> Optional[float]:
+        """从 UCI info 行解析评估分数，转换为 -1 到 +1 的值"""
+        try:
+            parts = info_line.split()
+            if "score" not in parts:
+                return None
+            idx = parts.index("score")
+            score_type = parts[idx + 1]
+            score_val = int(parts[idx + 2])
+            
+            if score_type == "mate":
+                # mate N 表示 N 步杀棋，正数是己方赢，负数是对方赢
+                return 1.0 if score_val > 0 else -1.0
+            elif score_type == "cp":
+                # centipawn，使用 tanh 归一化到 -1 ~ +1
+                # cp=400 约等于 0.76，cp=1000 约等于 0.96
+                import math
+                return math.tanh(score_val / 400.0)
+        except Exception as e:
+            print(f"[UCI] 评估解析失败: {info_line}, err={e}")
         return None
 
     def stop(self):
@@ -249,7 +277,10 @@ class GameState:
     step_count: int = 0
     history: List = None
     jax_state: Optional[XiangqiState] = None
-    ai_value: float = 0.0
+    ai_value: float = 0.0  # 保留兼容，但不再主要使用
+    # 分别记录红方和黑方的评估（谁接管谁输出）
+    red_eval: Optional[float] = None    # 红方AI/UCI的评估（红方视角胜率）
+    black_eval: Optional[float] = None  # 黑方AI/UCI的评估（黑方视角胜率）
     last_move_uci: str = ""
     notice: str = ""
     replay_index: Optional[int] = None
@@ -290,6 +321,8 @@ class ChessGame:
                 "game_over": bool(js.terminated),
                 "winner": int(js.winner),
                 "ai_value": float(h.get("ai_value", 0.0)),
+                "red_eval": h.get("red_eval"),
+                "black_eval": h.get("black_eval"),
             })
 
         js = self.state.jax_state
@@ -302,6 +335,8 @@ class ChessGame:
             "game_over": bool(js.terminated),
             "winner": int(js.winner),
             "ai_value": float(self.state.ai_value),
+            "red_eval": self.state.red_eval,
+            "black_eval": self.state.black_eval,
         })
         return snapshots
 
@@ -332,7 +367,8 @@ class ChessGame:
         self.state.replay_index = None
         self.state.history.append({
             'jax_state': self.state.jax_state, 'last_move': self.state.last_move,
-            'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value
+            'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value,
+            'red_eval': self.state.red_eval, 'black_eval': self.state.black_eval
         })
         fs, ts = action_to_move(action)
         fr, fc, tr, tc = int(fs)//9, int(fs)%9, int(ts)//9, int(ts)%9
@@ -358,6 +394,8 @@ class ChessGame:
             self.state.last_move = h['last_move']
             self.state.last_move_uci = h['last_move_uci']
             self.state.ai_value = h['ai_value']
+            self.state.red_eval = h.get('red_eval')
+            self.state.black_eval = h.get('black_eval')
             self.state.step_count -= 1
             self.state.game_over = False
             self.state.selected = None
@@ -391,12 +429,24 @@ class ChessGame:
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), self.state.jax_state))
         policy_output = mctx.gumbel_muzero_policy(params=None, rng_key=sk, root=root, recurrent_fn=recurrent_fn,
             num_simulations=256, max_num_considered_actions=32, invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
-        self.state.ai_value = float(value[0])
+        
+        # 模型输出的 value 是从当前玩家视角的评估
+        current_player_eval = float(value[0])
+        self.state.ai_value = current_player_eval  # 保留兼容
+        
+        # 根据当前玩家存储到对应字段（各方只显示自己的评估）
+        if self.state.current_player == 0:
+            self.state.red_eval = current_player_eval
+            print(f"[AI] 红方评估: {current_player_eval:.4f} (胜率 {(current_player_eval+1)/2*100:.1f}%)")
+        else:
+            self.state.black_eval = current_player_eval
+            print(f"[AI] 黑方评估: {current_player_eval:.4f} (胜率 {(current_player_eval+1)/2*100:.1f}%)")
+        
         return int(jnp.argmax(policy_output.action_weights[0]))
 
     def get_uci_action(self) -> Optional[int]:
         if not self.uci_engine: return None
-        bm = self.uci_engine.get_best_move(
+        bm, score = self.uci_engine.get_best_move(
             board_to_fen(self.state.board, self.state.current_player),
             self.uci_movetime,
             self.uci_depth
@@ -406,13 +456,22 @@ class ChessGame:
         if bm in ("(none)", "0000"):
             print(f"[UCI] bestmove 无效: {bm}")
             return None
+        
+        # UCI 返回的 score 是从当前方视角的评估
+        if score is not None:
+            if self.state.current_player == 0:
+                self.state.red_eval = score
+                print(f"[UCI] 红方评估: {score:.4f} (胜率 {(score+1)/2*100:.1f}%)")
+            else:
+                self.state.black_eval = score
+                print(f"[UCI] 黑方评估: {score:.4f} (胜率 {(score+1)/2*100:.1f}%)")
+        
         try:
             f, t = uci_to_move(bm)
         except Exception as e:
             print(f"[UCI] bestmove 解析失败: {bm}, err={e}")
             return None
         return int(move_to_action(f, t))
-        return None
 
 # ============================================================================
 # GUI 绘制
@@ -520,6 +579,9 @@ def create_ui():
             return "\n".join(lines)
 
         def update():
+            # 如果游戏状态未初始化，先初始化
+            if game.state is None:
+                game.new_game()
             snapshots = game._build_replay_snapshots()
             replay_idx = game.state.replay_index
             if replay_idx is not None and snapshots:
@@ -530,6 +592,8 @@ def create_ui():
                 last_move = snap["last_move"]
                 last_move_uci = snap["last_move_uci"]
                 ai_value = snap["ai_value"]
+                red_eval = snap.get("red_eval")
+                black_eval = snap.get("black_eval")
                 game_over = snap["game_over"]
                 winner = snap["winner"]
                 step_count = snap["step_count"]
@@ -539,6 +603,8 @@ def create_ui():
                 last_move = game.state.last_move
                 last_move_uci = game.state.last_move_uci
                 ai_value = game.state.ai_value
+                red_eval = game.state.red_eval
+                black_eval = game.state.black_eval
                 game_over = game.state.game_over
                 winner = game.state.winner
                 step_count = game.state.step_count
@@ -560,9 +626,21 @@ def create_ui():
                 status += f"\n\n**提示**: {game.state.notice}"
                 game.state.notice = ""
             
-            # 胜率评估
-            winrate = (ai_value + 1) / 2 * 100
-            eval_str = f"红方胜率: {winrate:.1f}% | 上一着: {last_move_uci or '无'}"
+            # 分别显示红方和黑方的评估（各方只显示自己的评估，可能是AI或UCI）
+            eval_parts = []
+            if red_eval is not None:
+                red_winrate = (red_eval + 1) / 2 * 100
+                eval_parts.append(f"**红方评估**: {red_winrate:.1f}%")
+            else:
+                eval_parts.append("**红方评估**: --")
+            
+            if black_eval is not None:
+                black_winrate = (black_eval + 1) / 2 * 100
+                eval_parts.append(f"**黑方评估**: {black_winrate:.1f}%")
+            else:
+                eval_parts.append("**黑方评估**: --")
+            
+            eval_str = " | ".join(eval_parts) + f" | 上一着: {last_move_uci or '无'}"
 
             # 为回放渲染临时视图
             if replay_idx is not None:
