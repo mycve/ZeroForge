@@ -365,16 +365,15 @@ class XiangqiEnv:
             
             # ========== 计算奖励 ==========
             
-            # 2. 终局奖励
-            # 激进规则：只有胜负！和棋 = 双方判负（鼓励进攻，杜绝苟活）
+            # 2. 终局奖励 (纯血零和博弈，保证 MCTS 搜索树逻辑严密)
             # - 将死/困毙: 胜者 +1, 负者 -1
             # - 长将判负: 长将方 -1, 对方 +1
-            # - 和棋(步数到限/无吃子/重复): 双方 -1（强制进攻）
+            # - 和棋: 0.0
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.array([-1.0, -1.0]),  # 和棋 = 双方判负！杜绝拖延苟活
+                    jnp.array([0.0, 0.0]),  # 标准零和：和棋 = 0
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
@@ -385,8 +384,7 @@ class XiangqiEnv:
             )
             
             # 3. 总奖励 = 终局奖励
-            # 3. 总奖励 = 终局奖励
-            # 纯血 AlphaZero 逻辑：奖励只在对局结束时产生 (1, -1, 0)
+            # 激进逻辑将通过 train.py 中的时间衰减 (Discounting) 来实现
             rewards = terminal_reward
             
             # 获取新的合法动作

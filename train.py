@@ -134,7 +134,7 @@ def forward(params, obs, is_training=False):
     return logits, value
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数"""
+    """MCTS 递归函数 (引入 -0.995 折扣强制激进搜索)"""
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
@@ -147,7 +147,10 @@ def recurrent_fn(params, rng_key, action, state):
     
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
     value = jnp.where(state.terminated, 0.0, value)
-    discount = jnp.where(state.terminated, 0.0, -1.0)
+    
+    # 将 discount 从 -1.0 减小为 -0.995
+    # 这让 MCTS 在搜索时也会优先选择步数更短的获胜路径
+    discount = jnp.where(state.terminated, 0.0, -0.995)
     
     return mctx.RecurrentFnOutput(reward=reward, discount=discount, prior_logits=logits, value=value), state
 
@@ -254,52 +257,35 @@ def selfplay(params, rng_key):
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
     """
-    计算 value target（激进规则：和棋 = 双方负）
+    计算价值目标：引入时间衰减 (Time Discounting) 强制激进
     
-    使用 associative_scan 并行化 winner 传播，避免顺序 scan 的性能瓶颈
+    公式: Target = Winner_Reward * (gamma ^ remaining_steps)
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
+    gamma = 0.995  # 时间衰减因子。值越小，模型越激进（越想快点结束对局）
     
-    # 1. 只保留已完成对局的步骤（向量化计算，无需反转）
-    # 从后往前累积 terminated，值 >= 1 表示该位置之后有对局结束
+    # 1. 确定每局对局的有效掩码
     term_cumsum_rev = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :]
     value_mask = term_cumsum_rev >= 1
     
-    # 2. 使用 associative_scan 并行传播 winner（比顺序 scan 快很多）
-    # 定义 associative 操作: (w1, t1) ⊕ (w2, t2) = (w2 if t2 else w1, t1|t2)
-    def merge_winner(left, right):
-        lw, lt = left   # left winner, left has_terminated
-        rw, rt = right  # right winner, right has_terminated
-        # 优先取右边（更接近末尾）的 winner
-        merged_w = jnp.where(rt, rw, lw)
-        merged_t = lt | rt
-        return merged_w, merged_t
-    
-    # 从后往前：反转 -> associative_scan -> 反转
-    rev_winner = data.winner[::-1, :]
-    rev_term = data.terminated[::-1, :]
-    
-    # associative_scan 并行计算前缀
-    game_winners_rev, _ = jax.lax.associative_scan(
-        merge_winner, (rev_winner, rev_term), axis=0
-    )
-    game_winners = game_winners_rev[::-1, :]
-    
-    # 3. 计算 value target（向量化）
-    actor = data.actor  # (max_steps, batch_size)
-    
-    # actor == winner: 自己赢 → +1
-    # actor != winner 且 winner != -1: 自己输 → -1
-    # winner == -1 (和棋): → -1（激进规则：和棋 = 双方负）
-    value_tgt = jnp.where(
-        game_winners == -1,
-        -1.0,  # 和棋 = 双方负
-        jnp.where(
-            actor == game_winners,
-            1.0,   # 自己赢
-            -1.0   # 自己输
-        )
-    )
+    # 2. 从后往前传播终局胜负，并应用时间衰减
+    def scan_fn(acc_value, i):
+        # acc_value 是后一步回传的价值（已经过符号翻转）
+        # 如果当前步结束，acc_value 取当前步的 reward
+        # 否则，acc_value = -acc_value * gamma (符号翻转 + 时间衰减)
+        
+        # 当前步是否有玩家获得终局奖励 (Win=1, Loss=-1, Draw=0)
+        r = data.reward[i]
+        term = data.terminated[i]
+        
+        # 核心逻辑：
+        # 如果结束了：价值就是终局奖励。
+        # 如果没结束：价值是“下一步价值的翻转”再乘以“衰减系数”。
+        current_step_val = jnp.where(term, r, -acc_value * gamma)
+        return current_step_val, current_step_val
+
+    _, value_tgt = jax.lax.scan(scan_fn, jnp.zeros(batch_size), jnp.arange(max_steps)[::-1])
+    value_tgt = value_tgt[::-1, :]
     
     return Sample(
         obs=data.obs, 
@@ -943,7 +929,7 @@ def main():
         
         print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
-              f"红胜{r_wins:3d} 黑胜{b_wins:3d} 双负{draws:3d}")
+              f"红胜{r_wins:3d} 黑胜{b_wins:3d} 和棋{draws:3d}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
