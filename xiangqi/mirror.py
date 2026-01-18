@@ -165,14 +165,6 @@ def mirror_state(state):
     """
     from xiangqi.env import XiangqiState
     
-    # 镜像最近走法历史
-    # 注意：-1 是无效标记，需要保持不变
-    mirrored_actions = jnp.where(
-        state.recent_actions >= 0,
-        mirror_action(state.recent_actions),
-        state.recent_actions  # 保持 -1 不变
-    )
-    
     return XiangqiState(
         board=mirror_board(state.board),
         history=mirror_history(state.history),
@@ -183,16 +175,11 @@ def mirror_state(state):
         step_count=state.step_count,
         no_capture_count=state.no_capture_count,
         winner=state.winner,
-        draw_reason=state.draw_reason,
         # 违规检测状态 (镜像后保持不变，但哈希已失效)
         position_hashes=state.position_hashes,
         hash_count=state.hash_count,
         red_consecutive_checks=state.red_consecutive_checks,
         black_consecutive_checks=state.black_consecutive_checks,
-        # 走法循环检测状态 (镜像走法历史)
-        recent_actions=mirrored_actions,
-        action_history_count=state.action_history_count,
-        search_model_index=state.search_model_index,
     )
 
 

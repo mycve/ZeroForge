@@ -57,17 +57,17 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 512
+    training_batch_size: int = 256
     td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 512
-    num_simulations: int = 128       # 统一模拟次数
+    selfplay_batch_size: int = 256
+    num_simulations: int = 256       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
     replay_buffer_size: int = 500000  # 回放缓冲区大小
-    sample_reuse_times: int = 6       # 样本平均复用次数
+    sample_reuse_times: int = 4       # 样本平均复用次数
     
     # 探索策略
     temperature_steps: int = 40
@@ -75,10 +75,10 @@ class Config:
     temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 200
+    max_steps: int = 120
     max_no_capture_steps: int = 60
-    repetition_threshold: int = 3
-    perpetual_check_threshold: int = 6
+    repetition_threshold: int = 2
+    perpetual_check_threshold: int = 4
     
     # ELO 评估
     eval_interval: int = 20
@@ -159,6 +159,7 @@ class SelfplayOutput(NamedTuple):
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
     root_value: jnp.ndarray  # MCTS 搜索后的根节点价值 (用于 TD bootstrap)
+    actor: jnp.ndarray       # 每步走棋的玩家 (0=红, 1=黑)，用于正确计算 value target
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -233,6 +234,7 @@ def selfplay(params, rng_key):
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
             root_value=root_value,
+            actor=actor,  # 记录每步的走棋玩家
         )
         
         next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(
@@ -246,31 +248,57 @@ def selfplay(params, rng_key):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """优化后的 n-step TD 目标计算 (移除 nested vmap/scan)"""
-    max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
-    n = config.td_steps
+    """
+    计算 value target（激进规则：和棋 = 双方负）
     
-    # 1. 严格对齐原始掩码逻辑：只保留已完成对局的步骤，丢弃最后一段未完成的对局
+    直接使用 winner 计算，避免 TD 递推在非零和情况下的错误：
+    - actor == winner: value = 1（自己赢）
+    - actor != winner 且 winner != -1: value = -1（自己输）
+    - winner == -1（和棋）: value = -1（和棋 = 双方负）
+    """
+    max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
+    
+    # 1. 只保留已完成对局的步骤，丢弃最后一段未完成的对局
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # 2. 准备数据：填充 0 避免越界
-    padded_reward = jnp.concatenate([data.reward, jnp.zeros((n, batch_size))], axis=0)
-    padded_discount = jnp.concatenate([data.discount, jnp.zeros((n, batch_size))], axis=0)
-    padded_root_v = jnp.concatenate([data.root_value, jnp.zeros((n, batch_size))], axis=0)
+    # 2. 对每一步，找到它所属对局的最终 winner
+    # 策略：从后往前累积，terminated 位置的 winner 会被传播到该对局的所有前续步骤
     
-    def get_td_for_step(t):
-        # 初始为 n 步后的 bootstrap 价值
-        res_val = padded_root_v[t + n]
-        
-        # 逆向迭代累加奖励：G_t = r_t + gamma_t * G_{t+1}
-        # 当 gamma_i 为 0 时（即 terminated），会自动切断后续奖励和 bootstrap 的贡献
-        for i in reversed(range(n)):
-            curr_idx = t + i
-            res_val = padded_reward[curr_idx] + padded_discount[curr_idx] * res_val
-        return res_val
-
-    # 对所有 t 向量化
-    value_tgt = jax.vmap(get_td_for_step)(jnp.arange(max_steps))
+    def propagate_winner_backward(carry, step_data):
+        """从后往前传播 winner：遇到 terminated 就更新，否则保持"""
+        prev_winner = carry
+        terminated, winner = step_data
+        # 如果当前步是终局，使用这一步的 winner；否则使用后面传来的 winner
+        current_winner = jnp.where(terminated, winner, prev_winner)
+        return current_winner, current_winner
+    
+    # 初始 carry 是 -1（表示未完成的对局）
+    init_winner = jnp.full(batch_size, -1, dtype=jnp.int32)
+    # 从后往前扫描
+    _, game_winners = jax.lax.scan(
+        propagate_winner_backward,
+        init_winner,
+        (data.terminated[::-1], data.winner[::-1])  # 反转后从后往前
+    )
+    game_winners = game_winners[::-1]  # 再反转回来
+    
+    # 3. 计算 value target
+    # 视角归一化下，obs 总是从当前走棋玩家（actor）的视角
+    # 所以 value target 也是从 actor 的视角
+    actor = data.actor  # (max_steps, batch_size)
+    
+    # actor == winner: 自己赢 → +1
+    # actor != winner 且 winner != -1: 自己输 → -1
+    # winner == -1 (和棋): → -1（激进规则：和棋 = 双方负）
+    value_tgt = jnp.where(
+        game_winners == -1,
+        -1.0,  # 和棋 = 双方负
+        jnp.where(
+            actor == game_winners,
+            1.0,   # 自己赢
+            -1.0   # 自己输
+        )
+    )
     
     return Sample(
         obs=data.obs, 
@@ -810,8 +838,6 @@ def main():
     if restored is not None:
         # 从 checkpoint 恢复
         params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
-        # 确保 rng_key 在 CPU 上，避免后续 random.split 产生设备不匹配问题
-        rng_key = jax.device_put(rng_key, jax.devices('cpu')[0])
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         # 全新训练
