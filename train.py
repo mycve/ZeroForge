@@ -57,12 +57,12 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 256
+    training_batch_size: int = 512
     td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 256
-    num_simulations: int = 256       # 统一模拟次数
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 128       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
