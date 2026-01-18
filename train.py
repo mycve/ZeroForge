@@ -810,6 +810,8 @@ def main():
     if restored is not None:
         # 从 checkpoint 恢复
         params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        # 确保 rng_key 在 CPU 上，避免后续 random.split 产生设备不匹配问题
+        rng_key = jax.device_put(rng_key, jax.devices('cpu')[0])
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         # 全新训练
