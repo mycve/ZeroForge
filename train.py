@@ -344,7 +344,7 @@ def loss_fn(params, samples: Sample, rng_key):
     
     return total_loss, (policy_loss, value_loss)
 
-@jax.pmap
+@partial(jax.pmap, static_broadcasted_argnums=(1,))
 def generate_random_openings(rng_key, num_random_moves: int = 8):
     """生成随机开局局面（用于镜像对局评估）
     
