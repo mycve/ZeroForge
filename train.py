@@ -473,7 +473,7 @@ def evaluate_mirrored(params_new, params_old, rng_key):
     """
     # 1. 生成随机开局局面（从合法走法均匀随机，8步）
     rng_key, sk1, sk2, sk3 = jax.random.split(rng_key, 4)
-    opening_states = generate_random_openings(shard_keys(sk1), num_random_moves=8)
+    opening_states = generate_random_openings(shard_keys(sk1), 8)  # 必须用位置参数
     
     # 2. 镜像对局：同一局面，新模型分别执红和执黑
     # 新模型执红 vs 旧模型执黑
@@ -863,6 +863,22 @@ def main():
 
     writer = SummaryWriter(config.log_dir)
     start_time_total = time.time()
+    
+    # 恢复后立即补评估（如果上次在评估点崩溃）
+    if iteration > 0 and iteration % config.eval_interval == 0 and iteration not in iteration_elos:
+        print(f"[补评估] 检测到 iteration={iteration} 未评估，立即执行...")
+        past_iter = max(0, iteration - config.past_model_offset)
+        available_iters = sorted(history_models.keys())
+        past_iter = max([k for k in available_iters if k <= past_iter], default=0)
+        
+        if past_iter in history_models:
+            past_params = replicate_to_devices(history_models[past_iter])
+            rng_key, sk_eval = jax.random.split(rng_key)
+            score, wins_red, wins_black, draws = evaluate_mirrored(params, past_params, sk_eval)
+            elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
+            iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
+            print(f"[补评估] vs Iter {past_iter}: 胜率 {score:.2%} (红胜{wins_red} 黑胜{wins_black} 和{draws}), ELO {iteration_elos[iteration]:.0f}")
+            writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
     
     print("启动训练（首次运行或参数变更将触发自动编译）...")
     
