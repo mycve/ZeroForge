@@ -110,6 +110,11 @@ def replicate_to_devices(pytree):
         warnings.simplefilter("ignore", DeprecationWarning)
         return jax.device_put_replicated(pytree, devices)
 
+def shard_keys(key):
+    """将 random key 分割并分发到各设备（用于 pmap）"""
+    keys = jax.random.split(key, num_devices)
+    return jax.device_put_sharded(list(keys), devices)
+
 env = XiangqiEnv(
     max_steps=config.max_steps,
     max_no_capture_steps=config.max_no_capture_steps,
@@ -468,13 +473,13 @@ def evaluate_mirrored(params_new, params_old, rng_key):
     """
     # 1. 生成随机开局局面（从合法走法均匀随机，8步）
     rng_key, sk1, sk2, sk3 = jax.random.split(rng_key, 4)
-    opening_states = generate_random_openings(jax.random.split(sk1, num_devices), num_random_moves=8)
+    opening_states = generate_random_openings(shard_keys(sk1), num_random_moves=8)
     
     # 2. 镜像对局：同一局面，新模型分别执红和执黑
     # 新模型执红 vs 旧模型执黑
-    winners_new_red = evaluate_from_position(params_new, params_old, opening_states, jax.random.split(sk2, num_devices))
+    winners_new_red = evaluate_from_position(params_new, params_old, opening_states, shard_keys(sk2))
     # 旧模型执红 vs 新模型执黑
-    winners_old_red = evaluate_from_position(params_old, params_new, opening_states, jax.random.split(sk3, num_devices))
+    winners_old_red = evaluate_from_position(params_old, params_new, opening_states, shard_keys(sk3))
     
     # 3. 统计结果
     # 新模型执红时：红胜(winner=0)算新模型赢，黑胜(winner=1)算新模型输
@@ -865,7 +870,7 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        data = selfplay(params, jax.random.split(sk1, num_devices))
+        data = selfplay(params, shard_keys(sk1))
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
@@ -909,7 +914,7 @@ def main():
             rng_key, sk_sample, sk_train = jax.random.split(rng_key, 3)
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
-            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, jax.random.split(sk_train, num_devices))
+            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, shard_keys(sk_train))
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
         # --- 清理已训练足够次数的样本 ---
