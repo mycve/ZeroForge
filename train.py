@@ -834,6 +834,8 @@ def main():
     if restored is not None:
         # 从 checkpoint 恢复
         params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        # 确保 rng_key 是 JAX 数组（orbax 恢复后可能变成 numpy）
+        rng_key = jnp.asarray(rng_key)
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         # 全新训练
