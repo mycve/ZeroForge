@@ -924,7 +924,7 @@ def main():
         
         print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
-              f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
+              f"红胜{r_wins:3d} 黑胜{b_wins:3d} 双负{draws:3d}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
