@@ -61,7 +61,7 @@ class Config:
     td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 1024
+    selfplay_batch_size: int = 512
     num_simulations: int = 128       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
@@ -251,40 +251,36 @@ def compute_targets(data: SelfplayOutput):
     """
     计算 value target（激进规则：和棋 = 双方负）
     
-    直接使用 winner 计算，避免 TD 递推在非零和情况下的错误：
-    - actor == winner: value = 1（自己赢）
-    - actor != winner 且 winner != -1: value = -1（自己输）
-    - winner == -1（和棋）: value = -1（和棋 = 双方负）
+    使用 associative_scan 并行化 winner 传播，避免顺序 scan 的性能瓶颈
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     
-    # 1. 只保留已完成对局的步骤，丢弃最后一段未完成的对局
-    value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
+    # 1. 只保留已完成对局的步骤（向量化计算，无需反转）
+    # 从后往前累积 terminated，值 >= 1 表示该位置之后有对局结束
+    term_cumsum_rev = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :]
+    value_mask = term_cumsum_rev >= 1
     
-    # 2. 对每一步，找到它所属对局的最终 winner
-    # 策略：从后往前累积，terminated 位置的 winner 会被传播到该对局的所有前续步骤
+    # 2. 使用 associative_scan 并行传播 winner（比顺序 scan 快很多）
+    # 定义 associative 操作: (w1, t1) ⊕ (w2, t2) = (w2 if t2 else w1, t1|t2)
+    def merge_winner(left, right):
+        lw, lt = left   # left winner, left has_terminated
+        rw, rt = right  # right winner, right has_terminated
+        # 优先取右边（更接近末尾）的 winner
+        merged_w = jnp.where(rt, rw, lw)
+        merged_t = lt | rt
+        return merged_w, merged_t
     
-    def propagate_winner_backward(carry, step_data):
-        """从后往前传播 winner：遇到 terminated 就更新，否则保持"""
-        prev_winner = carry
-        terminated, winner = step_data
-        # 如果当前步是终局，使用这一步的 winner；否则使用后面传来的 winner
-        current_winner = jnp.where(terminated, winner, prev_winner)
-        return current_winner, current_winner
+    # 从后往前：反转 -> associative_scan -> 反转
+    rev_winner = data.winner[::-1, :]
+    rev_term = data.terminated[::-1, :]
     
-    # 初始 carry 是 -1（表示未完成的对局）
-    init_winner = jnp.full(batch_size, -1, dtype=jnp.int32)
-    # 从后往前扫描
-    _, game_winners = jax.lax.scan(
-        propagate_winner_backward,
-        init_winner,
-        (data.terminated[::-1], data.winner[::-1])  # 反转后从后往前
+    # associative_scan 并行计算前缀
+    game_winners_rev, _ = jax.lax.associative_scan(
+        merge_winner, (rev_winner, rev_term), axis=0
     )
-    game_winners = game_winners[::-1]  # 再反转回来
+    game_winners = game_winners_rev[::-1, :]
     
-    # 3. 计算 value target
-    # 视角归一化下，obs 总是从当前走棋玩家（actor）的视角
-    # 所以 value target 也是从 actor 的视角
+    # 3. 计算 value target（向量化）
     actor = data.actor  # (max_steps, batch_size)
     
     # actor == winner: 自己赢 → +1
