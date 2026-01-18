@@ -428,7 +428,7 @@ class ChessGame:
         self._rng_key, sk = jax.random.split(self._rng_key)
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), self.state.jax_state))
         policy_output = mctx.gumbel_muzero_policy(params=None, rng_key=sk, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=256, max_num_considered_actions=32, invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
+            num_simulations=256, max_num_considered_actions=16, invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
         
         # 模型输出的 value 是从当前玩家视角的评估
         current_player_eval = float(value[0])

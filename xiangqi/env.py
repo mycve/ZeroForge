@@ -39,6 +39,12 @@ NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP + 2
 # 重复局面检测: 保存最近 N 步的局面哈希
 POSITION_HISTORY_SIZE = 256
 
+# 走法循环检测: 保存最近 N 步的走法
+ACTION_HISTORY_SIZE = 16
+
+# 走法循环检测的最大周期 (检测周期 2 到此值的循环)
+MAX_CYCLE_PERIOD = 6
+
 # ============================================================================
 # 状态定义
 # ============================================================================
@@ -74,7 +80,7 @@ class XiangqiState:
     # 胜者: -1=未结束/平局, 0=红胜, 1=黑胜
     winner: jnp.int32
     
-    # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=三次重复, 4=长将
+    # 终局原因: 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面, 4=长将, 5=走法循环
     draw_reason: jnp.int32
     
     # === 违规检测相关 ===
@@ -90,6 +96,15 @@ class XiangqiState:
     
     # 黑方连续将军次数
     black_consecutive_checks: jnp.int32
+    
+    # === 走法循环检测 ===
+    
+    # 最近走法历史 (ACTION_HISTORY_SIZE,) int32
+    # recent_actions[0] 是最新的走法，recent_actions[1] 是次新的...
+    recent_actions: jnp.ndarray
+    
+    # 有效走法历史数量
+    action_history_count: jnp.int32
     
     # === 搜索辅助 (不影响环境逻辑) ===
     # 标记当前搜索归属于哪个模型 (0=model_red/当前模型, 1=model_black/历史模型)
@@ -173,6 +188,69 @@ def count_repetitions(position_hash: jnp.int32,
 
 
 # ============================================================================
+# 走法循环检测
+# ============================================================================
+
+@jax.jit
+def detect_move_cycle(recent_actions: jnp.ndarray, action_count: jnp.int32) -> tuple[jnp.bool_, jnp.int32]:
+    """
+    检测走法循环
+    
+    检测周期 2 到 MAX_CYCLE_PERIOD 的循环。
+    周期 P 的循环定义：最近 P 步走法与之前 P 步走法完全相同。
+    
+    例如：
+    - 周期 2: A-B-A-B (红走A黑走B红走A黑走B)
+    - 周期 3: A-B-C-A-B-C
+    - 周期 4: A-B-C-D-A-B-C-D
+    
+    Args:
+        recent_actions: 最近走法历史，[0]是最新的，[1]是次新的...
+        action_count: 有效走法历史数量
+        
+    Returns:
+        (is_cycle, period): 是否检测到循环，以及循环的周期
+    """
+    def check_period(p: int) -> jnp.bool_:
+        """检查是否存在周期 p 的循环"""
+        # 需要至少 2*p 步历史
+        has_enough = action_count >= 2 * p
+        
+        # 比较最近 p 步与之前 p 步
+        # recent_actions[0:p] vs recent_actions[p:2p]
+        indices = jnp.arange(p)
+        recent = recent_actions[indices]
+        previous = recent_actions[indices + p]
+        
+        # 所有对应位置都相同才算循环
+        is_match = jnp.all(recent == previous)
+        
+        return is_match & has_enough
+    
+    # 检查周期 2 到 MAX_CYCLE_PERIOD
+    # 手动展开以兼容 JIT（避免 Python 循环的 trace 问题）
+    is_cycle_2 = check_period(2)
+    is_cycle_3 = check_period(3)
+    is_cycle_4 = check_period(4)
+    is_cycle_5 = check_period(5)
+    is_cycle_6 = check_period(6)
+    
+    # 返回是否有任何循环，以及最短的循环周期
+    is_any_cycle = is_cycle_2 | is_cycle_3 | is_cycle_4 | is_cycle_5 | is_cycle_6
+    
+    # 找到最短循环周期（用于调试/日志）
+    cycle_period = jnp.where(
+        is_cycle_2, 2,
+        jnp.where(is_cycle_3, 3,
+        jnp.where(is_cycle_4, 4,
+        jnp.where(is_cycle_5, 5,
+        jnp.where(is_cycle_6, 6, 0))))
+    )
+    
+    return is_any_cycle, cycle_period
+
+
+# ============================================================================
 # 环境类
 # ============================================================================
 
@@ -235,6 +313,9 @@ class XiangqiEnv:
             hash_count=jnp.int32(1),
             red_consecutive_checks=jnp.int32(0),
             black_consecutive_checks=jnp.int32(0),
+            # 走法循环检测
+            recent_actions=jnp.full(ACTION_HISTORY_SIZE, -1, dtype=jnp.int32),  # -1 表示无效
+            action_history_count=jnp.int32(0),
             search_model_index=jnp.int32(0),
         )
     
@@ -280,6 +361,18 @@ class XiangqiEnv:
             new_step_count = state.step_count + 1
             new_no_capture = jnp.where(is_capture, 0, state.no_capture_count + 1)
             
+            # ========== 更新走法历史 ==========
+            
+            # 滚动存储：新的 action 放在索引 0，旧的向后移动
+            new_recent_actions = jnp.concatenate([
+                jnp.array([action], dtype=jnp.int32),
+                state.recent_actions[:-1]
+            ])
+            new_action_history_count = jnp.minimum(
+                state.action_history_count + 1, 
+                ACTION_HISTORY_SIZE
+            )
+            
             # ========== 违规检测 ==========
             
             # 1. 计算新局面哈希
@@ -315,6 +408,13 @@ class XiangqiEnv:
             red_perpetual_check = new_red_checks >= self.perpetual_check_threshold
             black_perpetual_check = new_black_checks >= self.perpetual_check_threshold
             
+            # 7. 检测走法循环
+            # 注意：使用更新后的走法历史进行检测
+            is_move_cycle, cycle_period = detect_move_cycle(
+                new_recent_actions, 
+                new_action_history_count
+            )
+            
             # ========== 游戏结束判断 ==========
             
             # 检查基本游戏结束条件 (将死/困毙)
@@ -326,7 +426,7 @@ class XiangqiEnv:
             
             is_draw = is_max_steps | is_no_capture | is_threefold_repetition
             
-            # 记录和棋原因
+            # 记录终局原因
             new_draw_reason = jnp.where(
                 is_max_steps, 1,
                 jnp.where(
@@ -341,24 +441,36 @@ class XiangqiEnv:
             perpetual_check_loss = red_perpetual_check | black_perpetual_check
             perpetual_winner = jnp.where(red_perpetual_check, 1, jnp.where(black_perpetual_check, 0, -1))
             
-            # 长将也算一种和棋形式的终结（虽然有胜负）
+            # 长将终局原因
             new_draw_reason = jnp.where(perpetual_check_loss, 4, new_draw_reason)
             
+            # 检查走法循环判负
+            # 走法循环 -> 当前行棋方（state.current_player）负
+            # 即选择继续循环的一方判负，另一方（new_player）胜
+            move_cycle_winner = new_player  # 循环方（刚走完的）负，对方胜
+            
+            # 走法循环终局原因
+            new_draw_reason = jnp.where(is_move_cycle, 5, new_draw_reason)
+            
             # 综合判断
-            game_over = game_over | is_draw | perpetual_check_loss
+            game_over = game_over | is_draw | perpetual_check_loss | is_move_cycle
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 其他和棋
+            # 优先级: 将死 > 走法循环 > 长将判负 > 其他和棋
             winner = jnp.where(
                 winner != -1,
                 winner,  # 已有胜者 (将死)
                 jnp.where(
-                    perpetual_check_loss,
-                    perpetual_winner,  # 长将判负 (保留作为违规判负)
+                    is_move_cycle,
+                    move_cycle_winner,  # 走法循环判负
                     jnp.where(
-                        is_threefold_repetition,
-                        -1,  # --- 修改：三次重复务必算和 ---
-                        jnp.where(is_draw, -1, -1)  # 步数到限的和棋
+                        perpetual_check_loss,
+                        perpetual_winner,  # 长将判负
+                        jnp.where(
+                            is_threefold_repetition,
+                            -1,  # 三次重复算和
+                            jnp.where(is_draw, -1, -1)  # 步数到限的和棋
+                        )
                     )
                 )
             )
@@ -410,6 +522,9 @@ class XiangqiEnv:
                 hash_count=new_hash_count,
                 red_consecutive_checks=new_red_checks,
                 black_consecutive_checks=new_black_checks,
+                # 走法循环检测状态
+                recent_actions=new_recent_actions,
+                action_history_count=new_action_history_count,
                 search_model_index=state.search_model_index,
             )
         
@@ -523,12 +638,23 @@ class XiangqiEnv:
         lines.append(f"\n当前: {player_name} | 步数: {state.step_count}")
         
         if state.terminated:
+            # 终局原因
+            reason_map = {
+                0: "",
+                1: "(步数到限)",
+                2: "(无吃子到限)",
+                3: "(重复局面)",
+                4: "(长将)",
+                5: "(走法循环)",
+            }
+            reason = reason_map.get(int(state.draw_reason), "")
+            
             if state.winner == 0:
-                lines.append("游戏结束: 红方胜!")
+                lines.append(f"游戏结束: 红方胜! {reason}")
             elif state.winner == 1:
-                lines.append("游戏结束: 黑方胜!")
+                lines.append(f"游戏结束: 黑方胜! {reason}")
             else:
-                lines.append("游戏结束: 平局!")
+                lines.append(f"游戏结束: 平局! {reason}")
         
         return "\n".join(lines)
 
