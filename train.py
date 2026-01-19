@@ -58,12 +58,12 @@ class Config:
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
+    td_steps: int = 20  # 从 10 提升到 20，更适合长程战术博弈
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 128       # 统一模拟次数
-    top_k: int = 32                 # top-k ≈ simulations / 4
+    num_simulations: int = 128
+    top_k: int = 32
     
     # 经验回放配置
     replay_buffer_size: int = 500000  # 回放缓冲区大小
@@ -257,35 +257,52 @@ def selfplay(params, rng_key):
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
     """
-    计算价值目标：引入时间衰减 (Time Discounting) 强制激进
-    
-    公式: Target = Winner_Reward * (gamma ^ remaining_steps)
+    计算价值目标：切换为 n-step TD 模式 (TD-Lambda 简化版)
+    利用 MCTS 的 root_value 进行 bootstrapping，极大加快价值网络收敛速度。
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
-    gamma = 0.995  # 时间衰减因子。值越小，模型越激进（越想快点结束对局）
+    gamma = 0.995
+    n = config.td_steps # 默认 10 步
     
     # 1. 确定每局对局的有效掩码
     term_cumsum_rev = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :]
     value_mask = term_cumsum_rev >= 1
     
-    # 2. 从后往前传播终局胜负，并应用时间衰减
+    # 2. 计算全量折扣回报 G_t (用于提取 n-step 收益)
     def scan_fn(acc_value, i):
-        # acc_value 是后一步回传的价值（已经过符号翻转）
-        # 如果当前步结束，acc_value 取当前步的 reward
-        # 否则，acc_value = -acc_value * gamma (符号翻转 + 时间衰减)
-        
-        # 当前步是否有玩家获得终局奖励 (Win=1, Loss=-1, Draw=0)
         r = data.reward[i]
         term = data.terminated[i]
-        
-        # 核心逻辑：
-        # 如果结束了：价值就是终局奖励。
-        # 如果没结束：价值是“下一步价值的翻转”再乘以“衰减系数”。
-        current_step_val = jnp.where(term, r, -acc_value * gamma)
+        # 视角翻转：G_t = r_t - gamma * G_{t+1}
+        current_step_val = jnp.where(term, r, r - acc_value * gamma)
         return current_step_val, current_step_val
 
-    _, value_tgt = jax.lax.scan(scan_fn, jnp.zeros(batch_size), jnp.arange(max_steps)[::-1])
-    value_tgt = value_tgt[::-1, :]
+    _, g_t = jax.lax.scan(scan_fn, jnp.zeros(batch_size), jnp.arange(max_steps)[::-1])
+    g_t = g_t[::-1, :] # (max_steps, batch_size)
+
+    # 3. 计算 n-step TD 目标
+    # 目标 = (未来 n 步的折扣奖励和) + (n 步后的 MCTS 评估)
+    # T_t = G_t - (-gamma)^n * G_{t+n} + (-gamma)^n * V_mcts(t+n)
+    
+    # 准备偏移数据 (t+n)
+    # 我们将数据平移 n 步，超出部分补 0
+    shifted_g = jnp.zeros_like(g_t)
+    shifted_g = shifted_g.at[:-n].set(g_t[n:])
+    
+    shifted_v = jnp.zeros_like(data.root_value)
+    shifted_v = shifted_v.at[:-n].set(data.root_value[n:])
+    
+    # 检查 n 步内是否已经结束
+    # 如果已结束，则不使用 bootstrap (因为 shifted_v 已经是 0 或者属于下一局)
+    # 我们利用 associative_scan 预计算 n 步内是否有 terminated
+    has_term_in_n = jax.vmap(lambda x: jnp.convolve(x.astype(jnp.float32), 
+                                                    jnp.ones(n), mode='full')[:max_steps] > 0)(data.terminated.T).T
+    
+    # 计算折扣因子 (-gamma)^n
+    # 偶数步为正，奇数步为负
+    disc_n = (gamma ** n) * ((-1.0) ** n)
+    
+    # 最终 TD 目标
+    value_tgt = g_t - disc_n * shifted_g + jnp.where(has_term_in_n, 0.0, disc_n * shifted_v)
     
     return Sample(
         obs=data.obs, 
