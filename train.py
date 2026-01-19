@@ -435,7 +435,7 @@ class ReplayBuffer:
         """将新样本存入环形缓冲区"""
         # 展平数据并转换为 uint8 存储
         obs_flat = (samples.obs.reshape(-1, *samples.obs.shape[3:])).astype(jnp.uint8)
-        policy_flat = samples.policy_tgt.reshape(-1, samples.policy_tgt.shape[3:])
+        policy_flat = samples.policy_tgt.reshape(-1, *samples.policy_tgt.shape[3:])
         value_flat = samples.value_tgt.reshape(-1)
         mask_flat = samples.mask.reshape(-1)
         
@@ -715,35 +715,10 @@ def main():
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
-    # --- 启动预编译所有核心算子 ---
-    print("正在预编译 JAX Selfplay / Train 算子...")
-    comp_st = time.time()
-    dummy_key = jax.random.PRNGKey(0)
-    dummy_keys = jax.random.split(dummy_key, num_devices)
-    
-    # 1. 编译 Selfplay
-    dummy_data = selfplay(params, dummy_keys)
-    dummy_samples = compute_targets(dummy_data)
-    
-    # 2. 编译 Train Step
-    # 直接构造正确形状的 dummy 数据，避免从 selfplay 输出切片时形状不匹配
-    # （selfplay_batch_per_device 可能小于 training_batch_per_device）
-    batch_per_device = config.training_batch_size // num_devices
-    dummy_batch = Sample(
-        obs=jnp.zeros((num_devices, batch_per_device, *dummy_samples.obs.shape[3:]), dtype=dummy_samples.obs.dtype),
-        policy_tgt=jnp.zeros((num_devices, batch_per_device, *dummy_samples.policy_tgt.shape[3:]), dtype=dummy_samples.policy_tgt.dtype),
-        value_tgt=jnp.zeros((num_devices, batch_per_device), dtype=dummy_samples.value_tgt.dtype),
-        mask=jnp.ones((num_devices, batch_per_device), dtype=dummy_samples.mask.dtype),
-    )
-    _ = train_step(params, opt_state, dummy_batch, dummy_keys)
-    
-    # 3. 编译 Evaluate
-    _ = evaluate(params, params, dummy_keys)
-    
-    print(f"预编译完成，耗时: {time.time()-comp_st:.1f}s. 开始训练！")
-
     writer = SummaryWriter(config.log_dir)
     start_time_total = time.time()
+    
+    print("开始训练！")
     
     while True:
         iteration += 1
