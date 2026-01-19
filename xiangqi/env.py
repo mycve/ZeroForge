@@ -445,25 +445,21 @@ class XiangqiEnv:
         )
         
         # 编码当前棋盘和历史
+        _PIECE_TYPES = jnp.array([1, 2, 3, 4, 5, 6, 7, -7, -6, -5, -4, -3, -2, -1])
+
         def encode_board(b: jnp.ndarray) -> jnp.ndarray:
-            """将棋盘编码为 14 通道的 one-hot 表示"""
-            channels = []
-            # 己方 7 种棋子 (视角归一化后始终为正)
-            for piece_type in range(1, 8):
-                channels.append((b == piece_type).astype(jnp.float32))
-            # 对方 7 种棋子 (视角归一化后始终为负)
-            for piece_type in range(-7, 0):
-                channels.append((b == piece_type).astype(jnp.float32))
-            return jnp.stack(channels, axis=0)
-        
-        # 编码当前棋盘
+            """将棋盘编码为 14 通道的 one-hot 表示 (向量化加速)"""
+            # 形状: (14, 10, 9)
+            return (b[..., None, :, :] == _PIECE_TYPES[:, None, None]).astype(jnp.float32)
+
+        # 编码当前棋盘 (14, 10, 9)
         current_encoded = encode_board(board)
         
-        # 编码历史棋盘
+        # 编码历史棋盘 (NUM_HISTORY_STEPS, 14, 10, 9)
         history_encoded = jax.vmap(encode_board)(history)
         history_flat = history_encoded.reshape(-1, BOARD_HEIGHT, BOARD_WIDTH)
         
-        # 合并
+        # 合并 (240, 10, 9)
         board_planes = jnp.concatenate([current_encoded, history_flat], axis=0)
         
         # 添加元信息平面

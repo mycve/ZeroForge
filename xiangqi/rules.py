@@ -405,10 +405,17 @@ def find_king(board: jnp.ndarray, player: jnp.ndarray) -> tuple[jnp.ndarray, jnp
     return king_row, king_col
 
 
+# 预计算通用索引
+_IDX_1_9 = jnp.arange(1, 10)
+_KNIGHT_DELTAS = jnp.array([
+    [-2, -1], [-2, 1], [-1, -2], [-1, 2],
+    [1, -2], [1, 2], [2, -1], [2, 1]
+])
+
 @jax.jit
 def is_in_check_at(board: jnp.ndarray, player: jnp.ndarray, king_row, king_col) -> jnp.ndarray:
     """
-    以指定位置为中心的快速将军检测
+    以指定位置为中心的快速将军检测 (极致优化版)
     """
     # 敌方棋子类型
     is_red = player == 0
@@ -420,12 +427,11 @@ def is_in_check_at(board: jnp.ndarray, player: jnp.ndarray, king_row, king_col) 
     
     # 1. 探测四个方向的直线攻击 (车、炮、王见王)
     def scan_line(dr, dc):
-        idx = jnp.arange(1, 10)
-        rows = jnp.clip(king_row + dr * idx, 0, BOARD_HEIGHT - 1)
-        cols = jnp.clip(king_col + dc * idx, 0, BOARD_WIDTH - 1)
+        rows = jnp.clip(king_row + dr * _IDX_1_9, 0, BOARD_HEIGHT - 1)
+        cols = jnp.clip(king_col + dc * _IDX_1_9, 0, BOARD_WIDTH - 1)
         
-        in_bounds = (king_row + dr * idx >= 0) & (king_row + dr * idx < BOARD_HEIGHT) & \
-                    (king_col + dc * idx >= 0) & (king_col + dc * idx < BOARD_WIDTH)
+        in_bounds = (king_row + dr * _IDX_1_9 >= 0) & (king_row + dr * _IDX_1_9 < BOARD_HEIGHT) & \
+                    (king_col + dc * _IDX_1_9 >= 0) & (king_col + dc * _IDX_1_9 < BOARD_WIDTH)
         
         pieces = jnp.where(in_bounds, board[rows, cols], EMPTY)
         
@@ -439,46 +445,37 @@ def is_in_check_at(board: jnp.ndarray, player: jnp.ndarray, king_row, king_col) 
         second_idx = jnp.argmax(is_piece & mask_after_first)
         second_piece = jnp.where(second_exists, pieces[second_idx], EMPTY)
         
-        is_king_face_to_face = (dc == 0) & (first_piece == E_KING)
-        is_rook_check = first_piece == E_ROOK
-        is_cannon_check = second_piece == E_CANNON
-        
-        return is_king_face_to_face | is_rook_check | is_cannon_check
+        # 将见将只在垂直方向有效
+        is_king_face = (dc == 0) & (first_piece == E_KING)
+        return is_king_face | (first_piece == E_ROOK) | (second_piece == E_CANNON)
 
-    check_h = scan_line(0, 1) | scan_line(0, -1)
-    check_v = scan_line(1, 0) | scan_line(-1, 0)
+    check_any = scan_line(0, 1) | scan_line(0, -1) | scan_line(1, 0) | scan_line(-1, 0)
     
     # 2. 探测马的攻击
-    knight_deltas = jnp.array([
-        [-2, -1], [-2, 1], [-1, -2], [-1, 2],
-        [1, -2], [1, 2], [2, -1], [2, 1]
-    ])
-    
     def check_knight(i):
-        dr, dc = knight_deltas[i]
+        dr, dc = _KNIGHT_DELTAS[i]
         tr, tc = king_row + dr, king_col + dc
         lr, lc = king_row + jnp.sign(dr), king_col + jnp.sign(dc)
         
         in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
-        leg_in_bounds = (lr >= 0) & (lr < BOARD_HEIGHT) & (lc >= 0) & (lc < BOARD_WIDTH)
-        
-        return in_bounds & leg_in_bounds & (board[lr, lc] == EMPTY) & (board[tr, tc] == E_KNIGHT)
+        # 简化检查：马腿只需要在棋盘内且为空
+        return in_bounds & (board[lr, lc] == EMPTY) & (board[tr, tc] == E_KNIGHT)
 
     check_knight_all = jnp.any(jax.vmap(check_knight)(jnp.arange(8)))
     
     # 3. 探测兵的攻击
     pawn_dr = jnp.where(is_red, 1, -1)
+    # 兵只能从前方、左方、右方攻击（相对于被攻击者视角）
     pawn_deltas = jnp.array([[pawn_dr, 0], [0, -1], [0, 1]])
     
     def check_pawn(i):
-        dr, dc = pawn_deltas[i]
-        tr, tc = king_row + dr, king_col + dc
+        tr, tc = king_row + pawn_deltas[i, 0], king_col + pawn_deltas[i, 1]
         in_bounds = (tr >= 0) & (tr < BOARD_HEIGHT) & (tc >= 0) & (tc < BOARD_WIDTH)
         return in_bounds & (board[tr, tc] == E_PAWN)
         
     check_pawn_all = jnp.any(jax.vmap(check_pawn)(jnp.arange(3)))
     
-    return check_h | check_v | check_knight_all | check_pawn_all
+    return check_any | check_knight_all | check_pawn_all
 
 
 @jax.jit
@@ -510,7 +507,8 @@ def is_legal_move(
     to_sq: jnp.ndarray,
     player: jnp.ndarray,
     king_row: jnp.ndarray = None,
-    king_col: jnp.ndarray = None
+    king_col: jnp.ndarray = None,
+    basic_valid: jnp.ndarray = None
 ) -> jnp.ndarray:
     """
     验证一个移动是否完全合法（包括不能送将）
@@ -521,6 +519,7 @@ def is_legal_move(
         to_sq: 目标格子
         player: 当前玩家
         king_row, king_col: 预计算的将/帅位置，若为 None 则内部寻找
+        basic_valid: 外部已计算的基本移动合法性，若提供则跳过内部 is_valid_move
         
     Returns:
         是否合法
@@ -529,8 +528,9 @@ def is_legal_move(
     if king_row is None or king_col is None:
         king_row, king_col = find_king(board, player)
 
-    # 首先验证基本移动规则
-    basic_valid = is_valid_move(board, from_sq, to_sq, player)
+    # 如果外部没传，则内部校验
+    if basic_valid is None:
+        basic_valid = is_valid_move(board, from_sq, to_sq, player)
     
     def check_not_in_check(_):
         """基本移动合法时，进一步检查不会送将"""
@@ -574,37 +574,37 @@ def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray
     from_sqs = _ACTION_TO_FROM_SQ
     to_sqs = _ACTION_TO_TO_SQ
     
-    # 3. 向量化提取棋子信息 (一次性处理，利用 GPU 内存带宽)
+    # 3. 向量化提取棋子信息 (一次性处理)
     from_rows = from_sqs // BOARD_WIDTH
     from_cols = from_sqs % BOARD_WIDTH
-    pieces_at_from = board[from_rows, from_cols]
-    
-    # 第一层过滤：起始位置必须是己方棋子
-    is_own = is_own_piece(pieces_at_from, player)
-    
-    # 第二层过滤：目标位置不能是己方棋子
     to_rows = to_sqs // BOARD_WIDTH
     to_cols = to_sqs % BOARD_WIDTH
-    pieces_at_to = board[to_rows, to_cols]
-    not_own_target = ~is_own_piece(pieces_at_to, player) | (pieces_at_to == EMPTY)
     
-    # 合并前两层过滤
-    basic_mask = is_own & not_own_target
+    pieces_at_from = board[from_rows, from_cols]
+    pieces_at_to = board[to_rows, to_cols]
+    
+    # 第一层过滤：起始位置必须是己方棋子，目标不能是己方
+    is_own = is_own_piece(pieces_at_from, player)
+    not_own_target = ~is_own_piece(pieces_at_to, player) | (pieces_at_to == EMPTY)
+    basic_filter = is_own & not_own_target
+    
+    # 第二层过滤：符合棋子几何走法
+    # 这里我们使用 vmap 调用 is_valid_move_for_piece，它已经通过 switch 优化了分支
+    piece_types = get_piece_type(pieces_at_from)
+    move_valid = jax.vmap(lambda fr, fc, tr, tc, pt: is_valid_move_for_piece(board, fr, fc, tr, tc, pt, player))(
+        from_rows, from_cols, to_rows, to_cols, piece_types
+    )
+    
+    # 合并基本过滤结果，作为 is_legal_move 的输入
+    basic_valid_mask = basic_filter & move_valid
 
-    def check_full_legality(action_id, mask):
-        # 只有通过前两层过滤的才进行深度验证
-        return jax.lax.cond(
-            mask,
-            lambda _: is_legal_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id], player, king_row, king_col),
-            lambda _: jnp.array(False),
-            None
-        )
+    def check_full_legality(action_id, basic_valid):
+        return is_legal_move(board, _ACTION_TO_FROM_SQ[action_id], _ACTION_TO_TO_SQ[action_id], 
+                             player, king_row, king_col, basic_valid)
 
-    # 4. 向量化执行，但内部由于 cond 的存在，XLA 会进行路径优化
-    # 注意：jax.vmap 在这里仍然会处理所有 action_id，
-    # 但由于 basic_mask 为 False 的比例很高（通常 > 90%），执行流会变快
+    # 4. 最终校验：将军检测
     action_ids = jnp.arange(ACTION_SPACE_SIZE, dtype=jnp.int32)
-    legal_mask = jax.vmap(check_full_legality)(action_ids, basic_mask)
+    legal_mask = jax.vmap(check_full_legality)(action_ids, basic_valid_mask)
     
     return legal_mask
 

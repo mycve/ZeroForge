@@ -51,10 +51,6 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 混合精度配置 (针对高级 CUDA 显卡优化)
-    # 如果在 Mac 或普通硬件上运行，JAX 会自动处理或你可以手动切回 float32
-    dtype: jnp.dtype = jnp.bfloat16 if jax.default_backend() == "gpu" else jnp.float32
-    
     # 网络架构
     num_channels: int = 128
     num_blocks: int = 8
@@ -66,7 +62,7 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 256       # 统一模拟次数
+    num_simulations: int = 96       # 统一模拟次数
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
@@ -79,10 +75,10 @@ class Config:
     temperature_final: float = 0.1
     
     # 环境规则
-    max_steps: int = 250
+    max_steps: int = 150
     max_no_capture_steps: int = 60
-    repetition_threshold: int = 3
-    perpetual_check_threshold: int = 6
+    repetition_threshold: int = 2
+    perpetual_check_threshold: int = 4
     
     # ELO 评估
     eval_interval: int = 20
@@ -125,7 +121,6 @@ net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
-    dtype=config.dtype,  # 传入混合精度配置
 )
 
 def forward(params, obs, is_training=False):
