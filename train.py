@@ -246,36 +246,43 @@ def selfplay(params, rng_key):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """优化后的 n-step TD 目标计算 (移除 nested vmap/scan)"""
+    """向量化 n-step TD 目标计算 (消除 Python 循环)"""
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     n = config.td_steps
     
-    # 1. 严格对齐原始掩码逻辑：只保留已完成对局的步骤，丢弃最后一段未完成的对局
+    # 1. 严格对齐原始掩码逻辑
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # 2. 准备数据：填充 0 避免越界
+    # 2. 准备数据
     padded_reward = jnp.concatenate([data.reward, jnp.zeros((n, batch_size))], axis=0)
     padded_discount = jnp.concatenate([data.discount, jnp.zeros((n, batch_size))], axis=0)
     padded_root_v = jnp.concatenate([data.root_value, jnp.zeros((n, batch_size))], axis=0)
     
-    def get_td_for_step(t):
-        # 初始为 n 步后的 bootstrap 价值
-        res_val = padded_root_v[t + n]
-        
-        # 逆向迭代累加奖励：G_t = r_t + gamma_t * G_{t+1}
-        # 当 gamma_i 为 0 时（即 terminated），会自动切断后续奖励和 bootstrap 的贡献
-        for i in reversed(range(n)):
-            curr_idx = t + i
-            res_val = padded_reward[curr_idx] + padded_discount[curr_idx] * res_val
-        return res_val
+    # 使用 jax.lax.scan 向量化 TD 累加 (G_t = r_t + gamma_t * G_{t+1})
+    # 我们从末尾向前扫描
+    def scan_body(carry_v, t):
+        # 当前步的奖励和折扣
+        curr_r = padded_reward[t]
+        curr_d = padded_discount[t]
+        # 下一步的 G 值
+        next_v = curr_r + curr_d * carry_v
+        return next_v, next_v
 
-    # 对所有 t 向量化
-    value_tgt = jax.vmap(get_td_for_step)(jnp.arange(max_steps))
+    # 预计算所有可能的 n 步之后位置的 bootstrap 价值
+    bootstrap_values = padded_root_v[n : max_steps + n]
     
+    # 对于每一个 t，我们需要计算从 t 到 t+n-1 的累加
+    # 这里的优化方案是：直接利用 scan 计算全序列的折现奖励，然后做差分（类似前缀和优化）
+    # 但为了逻辑严谨且 n 通常较小，我们使用更加稳健的递归展开
+    
+    res_val = padded_root_v[n : max_steps + n]
+    for i in reversed(range(n)):
+        res_val = padded_reward[i : max_steps + i] + padded_discount[i : max_steps + i] * res_val
+        
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
-        value_tgt=value_tgt,
+        value_tgt=res_val,
         mask=value_mask,
     )
 
@@ -404,136 +411,87 @@ def evaluate(params_red, params_black, rng_key):
 # ============================================================================
 
 class ReplayBuffer:
-    """经验回放缓冲区，支持样本复用训练多次后丢弃"""
+    """高性能 JAX 环形缓冲区
     
-    def __init__(self, max_size: int, reuse_times: int):
+    - 预分配显存，避免频繁内存申请
+    - 纯 JAX 采样，消除 CPU-GPU 同步开销
+    - 环形覆盖逻辑，自动处理样本过期
+    """
+    
+    def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
-        self.reuse_times = reuse_times
         
-        # 存储样本数据
-        self.obs = None
-        self.policy_tgt = None
-        self.value_tgt = None
-        self.mask = None
-        self.train_count = None  # 每个样本被训练的次数
+        # 预分配 JAX 数组 (显存)
+        self.obs = jnp.zeros((max_size, *obs_shape), dtype=jnp.float32)
+        self.policy_tgt = jnp.zeros((max_size, action_size), dtype=jnp.float32)
+        self.value_tgt = jnp.zeros((max_size,), dtype=jnp.float32)
+        self.mask = jnp.zeros((max_size,), dtype=jnp.bool_)
         
-        self.size = 0
+        self.ptr = 0        # 当前写入位置
+        self.size = 0       # 当前有效样本数
         self.total_added = 0
-        self.total_removed = 0
-    
+
     def add(self, samples: Sample):
-        """添加新样本到缓冲区"""
-        # 展平样本 [max_steps, batch, ...] -> [N, ...]
-        flat_samples = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[3:]), jax.device_get(samples))
-        n_new = flat_samples.obs.shape[0]
+        """将新样本存入环形缓冲区"""
+        # 展平数据
+        obs_flat = samples.obs.reshape(-1, *samples.obs.shape[3:])
+        policy_flat = samples.policy_tgt.reshape(-1, samples.policy_tgt.shape[3:])
+        value_flat = samples.value_tgt.reshape(-1)
+        mask_flat = samples.mask.reshape(-1)
         
-        # 首次初始化
-        if self.obs is None:
-            self.obs = flat_samples.obs
-            self.policy_tgt = flat_samples.policy_tgt
-            self.value_tgt = flat_samples.value_tgt
-            self.mask = flat_samples.mask
-            self.train_count = np.zeros(n_new, dtype=np.int32)
-            self.size = n_new
-            self.total_added = n_new
-            return
+        n_new = obs_flat.shape[0]
         
-        # 追加新样本
-        self.obs = np.concatenate([self.obs, flat_samples.obs], axis=0)
-        self.policy_tgt = np.concatenate([self.policy_tgt, flat_samples.policy_tgt], axis=0)
-        self.value_tgt = np.concatenate([self.value_tgt, flat_samples.value_tgt], axis=0)
-        self.mask = np.concatenate([self.mask, flat_samples.mask], axis=0)
-        self.train_count = np.concatenate([self.train_count, np.zeros(n_new, dtype=np.int32)], axis=0)
+        # 计算切片索引 (处理跨越缓冲区末尾的情况)
+        indices = (jnp.arange(n_new) + self.ptr) % self.max_size
         
-        self.size = len(self.obs)
+        # 使用 at[].set() 更新，XLA 会将其优化为高效的显存写入
+        self.obs = self.obs.at[indices].set(obs_flat)
+        self.policy_tgt = self.policy_tgt.at[indices].set(policy_flat)
+        self.value_tgt = self.value_tgt.at[indices].set(value_flat)
+        self.mask = self.mask.at[indices].set(mask_flat)
+        
+        self.ptr = (self.ptr + n_new) % self.max_size
+        self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
-        
-        # 如果超过最大容量，移除最旧的样本
-        if self.size > self.max_size:
-            excess = self.size - self.max_size
-            self._remove_oldest(excess)
-    
-    def _remove_oldest(self, n: int):
-        """移除最旧的 n 个样本"""
-        self.obs = self.obs[n:]
-        self.policy_tgt = self.policy_tgt[n:]
-        self.value_tgt = self.value_tgt[n:]
-        self.mask = self.mask[n:]
-        self.train_count = self.train_count[n:]
-        self.size = len(self.obs)
-        self.total_removed += n
-    
-    def _remove_trained(self):
-        """移除已训练足够次数的样本"""
-        keep_mask = self.train_count < self.reuse_times
-        n_remove = np.sum(~keep_mask)
-        if n_remove > 0:
-            self.obs = self.obs[keep_mask]
-            self.policy_tgt = self.policy_tgt[keep_mask]
-            self.value_tgt = self.value_tgt[keep_mask]
-            self.mask = self.mask[keep_mask]
-            self.train_count = self.train_count[keep_mask]
-            self.size = len(self.obs)
-            self.total_removed += n_remove
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """从缓冲区采样一个批次并增加训练计数"""
-        if self.size < batch_size:
-            raise ValueError(f"缓冲区样本不足: {self.size} < {batch_size}")
+        """纯 JAX 异步采样"""
+        # 在有效范围内随机选择索引
+        idx = jax.random.randint(rng_key, (batch_size,), 0, self.size)
         
-        # 随机采样索引
-        indices = jax.random.choice(rng_key, self.size, shape=(batch_size,), replace=False)
-        indices = np.array(indices)
-        
-        # 增加被采样样本的训练计数
-        self.train_count[indices] += 1
-        
-        # 返回采样结果
         return Sample(
-            obs=self.obs[indices],
-            policy_tgt=self.policy_tgt[indices],
-            value_tgt=self.value_tgt[indices],
-            mask=self.mask[indices],
+            obs=self.obs[idx],
+            policy_tgt=self.policy_tgt[idx],
+            value_tgt=self.value_tgt[idx],
+            mask=self.mask[idx]
         )
     
     def cleanup(self):
-        """清理已训练足够次数的样本"""
-        self._remove_trained()
+        """环形缓冲区无需显式清理"""
+        pass
     
     def stats(self):
-        """返回缓冲区统计信息"""
-        if self.size == 0:
-            return {"size": 0, "avg_train_count": 0.0}
         return {
             "size": self.size,
-            "avg_train_count": float(np.mean(self.train_count)),
             "total_added": self.total_added,
-            "total_removed": self.total_removed,
+            "ptr": self.ptr
         }
-    
-    def state_dict(self) -> dict:
-        """导出状态用于 checkpoint 保存"""
+
+    def state_dict(self):
         return {
-            "obs": self.obs,
-            "policy_tgt": self.policy_tgt,
-            "value_tgt": self.value_tgt,
-            "mask": self.mask,
-            "train_count": self.train_count,
-            "size": self.size,
-            "total_added": self.total_added,
-            "total_removed": self.total_removed,
+            "obs": self.obs, "policy_tgt": self.policy_tgt,
+            "value_tgt": self.value_tgt, "mask": self.mask,
+            "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
-    
-    def load_state_dict(self, state: dict):
-        """从 checkpoint 恢复状态"""
+
+    def load_state_dict(self, state):
         self.obs = state["obs"]
         self.policy_tgt = state["policy_tgt"]
         self.value_tgt = state["value_tgt"]
         self.mask = state["mask"]
-        self.train_count = state["train_count"]
-        self.size = state["size"]
-        self.total_added = state["total_added"]
-        self.total_removed = state["total_removed"]
+        self.ptr = int(state["ptr"])
+        self.size = int(state["size"])
+        self.total_added = int(state["total_added"])
 
 # ============================================================================
 # Checkpoint 管理 (使用 orbax 官方方案)
@@ -713,10 +671,11 @@ def main():
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
     
-    # 初始化经验回放缓冲区
+    # 初始化经验回放缓冲区 (JAX 环形缓冲区)
     replay_buffer = ReplayBuffer(
         max_size=config.replay_buffer_size,
-        reuse_times=config.sample_reuse_times
+        obs_shape=(240, 10, 9),
+        action_size=ACTION_SPACE_SIZE
     )
     
     # 初始化模型模板 (用于恢复时的结构参考)
@@ -824,15 +783,18 @@ def main():
         frames += new_frames
         
         # --- 从缓冲区采样训练 ---
-        # 正确逻辑：新增 N 个样本，训练 N * reuse_times / batch_size 次
-        # 这样新样本平均被训练 reuse_times 次（因为采样是均匀随机的）
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
         policy_losses, value_losses = [], []
+        # 预生成所有采样 key，减少 Python 循环开销
+        sample_keys = jax.random.split(rng_key, num_updates + 1)
+        rng_key = sample_keys[0]
+        
         for i in range(num_updates):
-            rng_key, sk_sample, sk_train = jax.random.split(rng_key, 3)
+            sk_sample, sk_train = jax.random.split(sample_keys[i+1])
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
+            # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
             params, opt_state, ploss, vloss = train_step(params, opt_state, batch, jax.random.split(sk_train, num_devices))
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
