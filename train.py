@@ -66,7 +66,7 @@ class Config:
     top_k: int = 32                 # top-k ≈ simulations / 4
     
     # 经验回放配置
-    replay_buffer_size: int = 500000  # 回放缓冲区大小
+    replay_buffer_size: int = 200000  # 缩小到 20万，适配大多数显卡 (约 4GB 显存)
     sample_reuse_times: int = 6       # 样本平均复用次数
     
     # 探索策略
@@ -421,8 +421,8 @@ class ReplayBuffer:
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
         
-        # 预分配 JAX 数组 (显存)
-        self.obs = jnp.zeros((max_size, *obs_shape), dtype=jnp.float32)
+        # 使用 uint8 存储，节省 75% 显存
+        self.obs = jnp.zeros((max_size, *obs_shape), dtype=jnp.uint8)
         self.policy_tgt = jnp.zeros((max_size, action_size), dtype=jnp.float32)
         self.value_tgt = jnp.zeros((max_size,), dtype=jnp.float32)
         self.mask = jnp.zeros((max_size,), dtype=jnp.bool_)
@@ -433,8 +433,8 @@ class ReplayBuffer:
 
     def add(self, samples: Sample):
         """将新样本存入环形缓冲区"""
-        # 展平数据
-        obs_flat = samples.obs.reshape(-1, *samples.obs.shape[3:])
+        # 展平数据并转换为 uint8 存储
+        obs_flat = (samples.obs.reshape(-1, *samples.obs.shape[3:])).astype(jnp.uint8)
         policy_flat = samples.policy_tgt.reshape(-1, samples.policy_tgt.shape[3:])
         value_flat = samples.value_tgt.reshape(-1)
         mask_flat = samples.mask.reshape(-1)
@@ -460,7 +460,7 @@ class ReplayBuffer:
         idx = jax.random.randint(rng_key, (batch_size,), 0, self.size)
         
         return Sample(
-            obs=self.obs[idx],
+            obs=self.obs[idx].astype(jnp.float32),  # 采样时转回 float32
             policy_tgt=self.policy_tgt[idx],
             value_tgt=self.value_tgt[idx],
             mask=self.mask[idx]
