@@ -62,23 +62,23 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 96       # 统一模拟次数
-    top_k: int = 32                 # top-k ≈ simulations / 4
+    num_simulations: int = 144
+    top_k: int = 32
     
     # 经验回放配置
-    replay_buffer_size: int = 200000  # 缩小到 20万，适配大多数显卡 (约 4GB 显存)
-    sample_reuse_times: int = 6       # 样本平均复用次数
+    replay_buffer_size: int = 200000
+    sample_reuse_times: int = 3
     
     # 探索策略
-    temperature_steps: int = 40
-    temperature_initial: float = 1.0
+    temperature_steps: int = 45
+    temperature_initial: float = 1.1
     temperature_final: float = 0.1
     
     # 环境规则
     max_steps: int = 150
     max_no_capture_steps: int = 60
-    repetition_threshold: int = 2
-    perpetual_check_threshold: int = 4
+    repetition_threshold: int = 3
+    perpetual_check_threshold: int = 6
     
     # ELO 评估
     eval_interval: int = 20
@@ -318,12 +318,7 @@ def loss_fn(params, samples: Sample, rng_key):
     # 价值损失 (n-step TD 目标)
     value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 熵正则化
-    probs = jax.nn.softmax(logits)
-    entropy = -jnp.sum(probs * jax.nn.log_softmax(logits), axis=-1)
-    entropy_loss = -0.001 * jnp.mean(entropy)
-    
-    total_loss = policy_loss + 1.0 * value_loss + entropy_loss
+    total_loss = policy_loss + 1.0 * value_loss
     
     return total_loss, (policy_loss, value_loss)
 
