@@ -719,8 +719,8 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        # 消除弃用警告，使用现代 JAX 分发方式
-        data = selfplay(params, jax.device_put(list(jax.random.split(sk1, num_devices)), devices))
+        # 移除 list()，直接对 (8, 2) 形状的数组进行分片投放
+        data = selfplay(params, jax.device_put(jax.random.split(sk1, num_devices), devices))
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
@@ -767,8 +767,8 @@ def main():
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
-            # 这里的 Key 也需要分片
-            train_keys = jax.device_put(list(jax.random.split(sk_train, num_devices)), devices)
+            # 这里的 Key 也需要分片，同样不使用 list()
+            train_keys = jax.device_put(jax.random.split(sk_train, num_devices), devices)
             params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
@@ -830,9 +830,9 @@ def main():
             if past_iter in history_models:
                 past_params = replicate_to_devices(history_models[past_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-                # 评估时的 Key 同样需要分片
-                eval_keys_r = jax.device_put(list(jax.random.split(sk5, num_devices)), devices)
-                eval_keys_b = jax.device_put(list(jax.random.split(sk6, num_devices)), devices)
+                # 评估时的 Key 同样需要分片，不使用 list()
+                eval_keys_r = jax.device_put(jax.random.split(sk5, num_devices), devices)
+                eval_keys_b = jax.device_put(jax.random.split(sk6, num_devices), devices)
                 
                 # 双边评估
                 winners_r = evaluate(params, past_params, eval_keys_r)
