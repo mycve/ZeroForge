@@ -66,7 +66,7 @@ class Config:
     top_k: int = 32
     
     # 经验回放配置
-    replay_buffer_size: int = 300000
+    replay_buffer_size: int = 800000
     sample_reuse_times: int = 3
     
     # 探索策略
@@ -406,74 +406,62 @@ def evaluate(params_red, params_black, rng_key):
 # ============================================================================
 
 class ReplayBuffer:
-    """高性能 JAX 环形缓冲区
-    
-    - 预分配显存，避免频繁内存申请
-    - 纯 JAX 采样，消除 CPU-GPU 同步开销
-    - 环形覆盖逻辑，自动处理样本过期
-    """
+    """纯 NumPy 环形缓冲区 - 零设备冲突，极简稳定"""
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
         
-        # 强制将缓冲区放在第一个设备上，避免被 pmap 自动分片
-        first_device = jax.local_devices()[0]
-        self.obs = jax.device_put(jnp.zeros((max_size, *obs_shape), dtype=jnp.uint8), first_device)
-        self.policy_tgt = jax.device_put(jnp.zeros((max_size, action_size), dtype=jnp.float32), first_device)
-        self.value_tgt = jax.device_put(jnp.zeros((max_size,), dtype=jnp.float32), first_device)
-        self.mask = jax.device_put(jnp.zeros((max_size,), dtype=jnp.bool_), first_device)
+        # 全部用 NumPy 数组（CPU 内存）
+        self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
+        self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
+        self.value_tgt = np.zeros((max_size,), dtype=np.float32)
+        self.mask = np.zeros((max_size,), dtype=np.bool_)
         
-        self.ptr = 0        # 当前写入位置
-        self.size = 0       # 当前有效样本数
+        self.ptr = 0
+        self.size = 0
         self.total_added = 0
 
     def add(self, samples: Sample):
-        """将新样本存入环形缓冲区"""
-        # 展平数据并转换为 uint8 存储
-        obs_flat = (samples.obs.reshape(-1, *samples.obs.shape[3:])).astype(jnp.uint8)
-        policy_flat = samples.policy_tgt.reshape(-1, *samples.policy_tgt.shape[3:])
-        value_flat = samples.value_tgt.reshape(-1)
-        mask_flat = samples.mask.reshape(-1)
+        """存入样本（从 JAX 自动转 NumPy）"""
+        # jax.device_get 会自动聚合 8 GPU 的分片数据并转成 NumPy
+        samples_np = jax.device_get(samples)
+        
+        obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
+        policy_flat = samples_np.policy_tgt.reshape(-1, samples_np.policy_tgt.shape[3:])
+        value_flat = samples_np.value_tgt.reshape(-1)
+        mask_flat = samples_np.mask.reshape(-1)
         
         n_new = obs_flat.shape[0]
+        indices = (np.arange(n_new) + self.ptr) % self.max_size
         
-        # 计算切片索引 (处理跨越缓冲区末尾的情况)
-        indices = (jnp.arange(n_new) + self.ptr) % self.max_size
-        
-        # 使用 at[].set() 更新，XLA 会将其优化为高效的显存写入
-        self.obs = self.obs.at[indices].set(obs_flat)
-        self.policy_tgt = self.policy_tgt.at[indices].set(policy_flat)
-        self.value_tgt = self.value_tgt.at[indices].set(value_flat)
-        self.mask = self.mask.at[indices].set(mask_flat)
+        # NumPy 原地更新，永远不会有设备冲突
+        self.obs[indices] = obs_flat
+        self.policy_tgt[indices] = policy_flat
+        self.value_tgt[indices] = value_flat
+        self.mask[indices] = mask_flat
         
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """高性能采样：强制在单一设备执行索引，避免多 GPU 冲突"""
-        # 确保随机数生成和索引都在主设备完成
-        idx = jax.random.randint(rng_key, (batch_size,), 0, self.size)
+        """采样后转回 JAX 数组"""
+        # NumPy 随机采样
+        idx = np.random.randint(0, self.size, size=batch_size)
         
-        # 显式使用 jnp.take 并确保它在数据所在的逻辑轴上运行
-        # jnp.take 在分布式环境下比 [] 更健壮
+        # 返回时转回 JAX（会自动放到主设备）
         return Sample(
-            obs=jnp.take(self.obs, idx, axis=0).astype(jnp.float32),
-            policy_tgt=jnp.take(self.policy_tgt, idx, axis=0),
-            value_tgt=jnp.take(self.value_tgt, idx, axis=0),
-            mask=jnp.take(self.mask, idx, axis=0)
+            obs=jnp.array(self.obs[idx], dtype=jnp.float32),
+            policy_tgt=jnp.array(self.policy_tgt[idx]),
+            value_tgt=jnp.array(self.value_tgt[idx]),
+            mask=jnp.array(self.mask[idx])
         )
     
     def cleanup(self):
-        """环形缓冲区无需显式清理"""
         pass
     
     def stats(self):
-        return {
-            "size": self.size,
-            "total_added": self.total_added,
-            "ptr": self.ptr
-        }
+        return {"size": self.size, "total_added": self.total_added, "ptr": self.ptr}
 
     def state_dict(self):
         return {
@@ -483,11 +471,10 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, state):
-        first_device = jax.local_devices()[0]
-        self.obs = jax.device_put(jnp.array(state["obs"]), first_device)
-        self.policy_tgt = jax.device_put(jnp.array(state["policy_tgt"]), first_device)
-        self.value_tgt = jax.device_put(jnp.array(state["value_tgt"]), first_device)
-        self.mask = jax.device_put(jnp.array(state["mask"]), first_device)
+        self.obs = np.array(state["obs"])
+        self.policy_tgt = np.array(state["policy_tgt"])
+        self.value_tgt = np.array(state["value_tgt"])
+        self.mask = np.array(state["mask"])
         self.ptr = int(state["ptr"])
         self.size = int(state["size"])
         self.total_added = int(state["total_added"])
