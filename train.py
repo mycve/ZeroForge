@@ -427,7 +427,7 @@ class ReplayBuffer:
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
-        policy_flat = samples_np.policy_tgt.reshape(-1, samples_np.policy_tgt.shape[3:])
+        policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         value_flat = samples_np.value_tgt.reshape(-1)
         mask_flat = samples_np.mask.reshape(-1)
         
