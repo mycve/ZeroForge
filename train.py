@@ -450,15 +450,18 @@ class ReplayBuffer:
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """纯 JAX 异步采样"""
-        # 在有效范围内随机选择索引
+        """纯 JAX 异步采样 (兼容多 GPU 架构)"""
+        # 确保随机索引在主设备上生成
         idx = jax.random.randint(rng_key, (batch_size,), 0, self.size)
         
+        # 核心修复：JAX pmap 模式下，self.obs 可能带有 sharding。
+        # 我们需要确保索引操作能正确跨设备执行，最稳妥的方法是将 idx 放到与数据相同的 sharding 策略上，
+        # 或者将数据视为一个整体进行索引。
         return Sample(
-            obs=self.obs[idx].astype(jnp.float32),  # 采样时转回 float32
-            policy_tgt=self.policy_tgt[idx],
-            value_tgt=self.value_tgt[idx],
-            mask=self.mask[idx]
+            obs=jnp.take(self.obs, idx, axis=0).astype(jnp.float32),
+            policy_tgt=jnp.take(self.policy_tgt, idx, axis=0),
+            value_tgt=jnp.take(self.value_tgt, idx, axis=0),
+            mask=jnp.take(self.mask, idx, axis=0)
         )
     
     def cleanup(self):
