@@ -719,7 +719,8 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        data = selfplay(params, jax.random.split(sk1, num_devices))
+        # 将 Key 明确地分发到各个设备上
+        data = selfplay(params, jax.device_put_sharded(list(jax.random.split(sk1, num_devices)), devices))
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
@@ -766,7 +767,9 @@ def main():
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
-            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, jax.random.split(sk_train, num_devices))
+            # 这里的 Key 也需要分片
+            train_keys = jax.device_put_sharded(list(jax.random.split(sk_train, num_devices)), devices)
+            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
         # --- 清理已训练足够次数的样本 ---
@@ -827,9 +830,13 @@ def main():
             if past_iter in history_models:
                 past_params = replicate_to_devices(history_models[past_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
+                # 评估时的 Key 同样需要分片
+                eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
+                eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
+                
                 # 双边评估
-                winners_r = evaluate(params, past_params, jax.random.split(sk5, num_devices))
-                winners_b = evaluate(past_params, params, jax.random.split(sk6, num_devices))
+                winners_r = evaluate(params, past_params, eval_keys_r)
+                winners_b = evaluate(past_params, params, eval_keys_b)
                 wr = (winners_r == 0).sum()
                 wb = (winners_b == 1).sum()
                 score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
