@@ -66,12 +66,12 @@ class Config:
     top_k: int = 32
     
     # 经验回放配置
-    replay_buffer_size: int = 200000
+    replay_buffer_size: int = 300000
     sample_reuse_times: int = 3
     
     # 探索策略
-    temperature_steps: int = 45
-    temperature_initial: float = 1.1
+    temperature_steps: int = 12
+    temperature_initial: float = 1.0
     temperature_final: float = 0.1
     
     # 环境规则
