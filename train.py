@@ -61,7 +61,7 @@ class Config:
     td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 512
+    selfplay_batch_size: int = 128
     num_simulations: int = 144
     top_k: int = 32
     
@@ -416,11 +416,12 @@ class ReplayBuffer:
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
         
-        # 使用 uint8 存储，节省 75% 显存
-        self.obs = jnp.zeros((max_size, *obs_shape), dtype=jnp.uint8)
-        self.policy_tgt = jnp.zeros((max_size, action_size), dtype=jnp.float32)
-        self.value_tgt = jnp.zeros((max_size,), dtype=jnp.float32)
-        self.mask = jnp.zeros((max_size,), dtype=jnp.bool_)
+        # 强制将缓冲区放在第一个设备上，避免被 pmap 自动分片
+        first_device = jax.local_devices()[0]
+        self.obs = jax.device_put(jnp.zeros((max_size, *obs_shape), dtype=jnp.uint8), first_device)
+        self.policy_tgt = jax.device_put(jnp.zeros((max_size, action_size), dtype=jnp.float32), first_device)
+        self.value_tgt = jax.device_put(jnp.zeros((max_size,), dtype=jnp.float32), first_device)
+        self.mask = jax.device_put(jnp.zeros((max_size,), dtype=jnp.bool_), first_device)
         
         self.ptr = 0        # 当前写入位置
         self.size = 0       # 当前有效样本数
@@ -450,13 +451,12 @@ class ReplayBuffer:
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """纯 JAX 异步采样 (兼容多 GPU 架构)"""
-        # 确保随机索引在主设备上生成
+        """高性能采样：强制在单一设备执行索引，避免多 GPU 冲突"""
+        # 确保随机数生成和索引都在主设备完成
         idx = jax.random.randint(rng_key, (batch_size,), 0, self.size)
         
-        # 核心修复：JAX pmap 模式下，self.obs 可能带有 sharding。
-        # 我们需要确保索引操作能正确跨设备执行，最稳妥的方法是将 idx 放到与数据相同的 sharding 策略上，
-        # 或者将数据视为一个整体进行索引。
+        # 显式使用 jnp.take 并确保它在数据所在的逻辑轴上运行
+        # jnp.take 在分布式环境下比 [] 更健壮
         return Sample(
             obs=jnp.take(self.obs, idx, axis=0).astype(jnp.float32),
             policy_tgt=jnp.take(self.policy_tgt, idx, axis=0),
@@ -483,10 +483,11 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, state):
-        self.obs = jnp.array(state["obs"])
-        self.policy_tgt = jnp.array(state["policy_tgt"])
-        self.value_tgt = jnp.array(state["value_tgt"])
-        self.mask = jnp.array(state["mask"])
+        first_device = jax.local_devices()[0]
+        self.obs = jax.device_put(jnp.array(state["obs"]), first_device)
+        self.policy_tgt = jax.device_put(jnp.array(state["policy_tgt"]), first_device)
+        self.value_tgt = jax.device_put(jnp.array(state["value_tgt"]), first_device)
+        self.mask = jax.device_put(jnp.array(state["mask"]), first_device)
         self.ptr = int(state["ptr"])
         self.size = int(state["size"])
         self.total_added = int(state["total_added"])
