@@ -471,12 +471,35 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, state):
-        self.obs = np.array(state["obs"])
-        self.policy_tgt = np.array(state["policy_tgt"])
-        self.value_tgt = np.array(state["value_tgt"])
-        self.mask = np.array(state["mask"])
-        self.ptr = int(state["ptr"])
-        self.size = int(state["size"])
+        # 获取加载的数据
+        loaded_obs = np.array(state["obs"])
+        loaded_policy = np.array(state["policy_tgt"])
+        loaded_value = np.array(state["value_tgt"])
+        loaded_mask = np.array(state["mask"])
+        loaded_size = int(state["size"])
+        loaded_ptr = int(state["ptr"])
+        
+        # 如果加载的数据比当前缓冲区小，直接复制到前面
+        old_max = loaded_obs.shape[0]
+        actual_samples = min(loaded_size, old_max)
+        
+        if old_max <= self.max_size:
+            # 旧数据能放下，直接复制
+            self.obs[:old_max] = loaded_obs
+            self.policy_tgt[:old_max] = loaded_policy
+            self.value_tgt[:old_max] = loaded_value
+            self.mask[:old_max] = loaded_mask
+            self.size = actual_samples
+            self.ptr = loaded_ptr % self.max_size
+        else:
+            # 旧数据比新缓冲区大，只保留最新的部分
+            self.obs[:] = loaded_obs[:self.max_size]
+            self.policy_tgt[:] = loaded_policy[:self.max_size]
+            self.value_tgt[:] = loaded_value[:self.max_size]
+            self.mask[:] = loaded_mask[:self.max_size]
+            self.size = self.max_size
+            self.ptr = 0
+        
         self.total_added = int(state["total_added"])
 
 # ============================================================================
