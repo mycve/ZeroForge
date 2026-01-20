@@ -34,6 +34,9 @@ from networks.alphazero import AlphaZeroNetwork
 # 常量与配置
 # ============================================================================
 
+# 预计算旋转索引，避免每次推理重复计算 (JAX 性能优化)
+_ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
+
 CELL_SIZE = 60
 BOARD_MARGIN = 40
 PIECE_RADIUS = 26
@@ -270,6 +273,39 @@ class ChessGame:
         self.uci_movetime = 1000
         self.uci_depth = 3
         self.ai_delay = 1.0
+        
+        # 缓存编译后的 MCTS recurrent_fn，避免每次推理重新编译
+        self._mcts_recurrent_fn = self._create_mcts_recurrent_fn()
+    
+    def _create_mcts_recurrent_fn(self):
+        """
+        创建 MCTS 递归函数
+        
+        注意：此函数通过闭包引用 self.model_mgr，这样在加载新模型后
+        会自动使用新的网络结构。JAX 会根据网络结构的变化决定是否重新编译。
+        相比于每次推理都在函数内定义 recurrent_fn，这种方式可以：
+        1. 同一网络结构下复用编译结果
+        2. 网络结构变化时自动重新编译
+        """
+        env = self.env
+        model_mgr = self.model_mgr  # 闭包引用，获取最新的 net
+        
+        def recurrent_fn(params, rng_key, action, state):
+            prev_p = state.current_player
+            ns = jax.vmap(env.step)(state, action)
+            obs = jax.vmap(env.observe)(ns)
+            # model_mgr.net 会在运行时获取，支持动态加载新模型
+            l, v = model_mgr.net.apply({'params': params}, obs, train=False)
+            l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
+            l = l - jnp.max(l, axis=-1, keepdims=True)
+            l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
+            return mctx.RecurrentFnOutput(
+                reward=ns.rewards[jnp.arange(ns.rewards.shape[0]), prev_p], 
+                discount=jnp.where(ns.terminated, 0.0, -1.0), 
+                prior_logits=l, value=v
+            ), ns
+        
+        return recurrent_fn
 
     def _build_replay_snapshots(self) -> List[dict]:
         """构建回放快照列表（每一步的局面）"""
@@ -370,29 +406,36 @@ class ChessGame:
         obs = self.env.observe(self.state.jax_state)[None, ...]
         logits, value = self.model_mgr.net.apply({'params': self.model_mgr.params}, obs, train=False)
         
-        _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
-        
+        # 使用模块级预计算的 _ROTATED_IDX，避免重复计算
         if self.state.current_player == 1: logits = logits[:, _ROTATED_IDX]
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(self.state.jax_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
-        
-        def recurrent_fn(model, rng_key, action, state):
-            prev_p = state.current_player
-            ns = jax.vmap(self.env.step)(state, action)
-            obs = jax.vmap(self.env.observe)(ns)
-            l, v = self.model_mgr.net.apply({'params': self.model_mgr.params}, obs, train=False)
-            l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
-            l = l - jnp.max(l, axis=-1, keepdims=True)
-            l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
-            return mctx.RecurrentFnOutput(reward=ns.rewards[jnp.arange(ns.rewards.shape[0]), prev_p], 
-                                          discount=jnp.where(ns.terminated, 0.0, -1.0), prior_logits=l, value=v), ns
 
         self._rng_key, sk = jax.random.split(self._rng_key)
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), self.state.jax_state))
-        policy_output = mctx.gumbel_muzero_policy(params=None, rng_key=sk, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=256, max_num_considered_actions=32, invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
-        self.state.ai_value = float(value[0])
-        return int(jnp.argmax(policy_output.action_weights[0]))
+        
+        # 使用类级别的 recurrent_fn，避免每次调用重新编译
+        policy_output = mctx.gumbel_muzero_policy(
+            params=self.model_mgr.params, rng_key=sk, root=root, 
+            recurrent_fn=self._mcts_recurrent_fn,
+            num_simulations=256, max_num_considered_actions=32, 
+            invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
+        
+        # 搜索后的根节点价值更准确
+        search_value = float(policy_output.search_tree.node_values[0, 0])
+        self.state.ai_value = search_value
+        
+        # 输出 top-3 候选动作及其权重，方便调试臭棋
+        weights = np.array(policy_output.action_weights[0])
+        top_indices = np.argsort(weights)[-3:][::-1]
+        print(f"[AI] step={self.state.step_count}, value={search_value:.3f}, top3: ", end="")
+        for idx in top_indices:
+            fs, ts = action_to_move(idx)
+            uci = move_to_uci(int(fs), int(ts))
+            print(f"{uci}({weights[idx]:.2f}) ", end="")
+        print()
+        
+        return int(jnp.argmax(weights))
 
     def get_uci_action(self) -> Optional[int]:
         if not self.uci_engine: return None

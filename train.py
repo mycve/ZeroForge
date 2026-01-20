@@ -57,22 +57,22 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 512
-    td_steps: int = 10  # n-step TD 目标 (MuZero 风格，减少方差)
+    training_batch_size: int = 256
+    td_steps: int = 5   # 缩短 TD 步数，减少价值估计方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 128
-    num_simulations: int = 144
+    selfplay_batch_size: int = 256
+    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
     top_k: int = 32
     
     # 经验回放配置
     replay_buffer_size: int = 800000
     sample_reuse_times: int = 3
     
-    # 探索策略
-    temperature_steps: int = 12
+    # 探索策略 (更保守的温度衰减，减少臭棋)
+    temperature_steps: int = 20
     temperature_initial: float = 1.0
-    temperature_final: float = 0.1
+    temperature_final: float = 0.0
     
     # 环境规则
     max_steps: int = 150
@@ -364,8 +364,8 @@ def evaluate(params_red, params_black, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
-        # 评估多样性：前 30 步高温度采样
-        temp = jnp.where(state.step_count < 30, 1.0, 0.1)
+        # 评估多样性：前 20 步高温度采样，后续几乎贪婪（减少臭棋）
+        temp = jnp.where(state.step_count < 20, 0.5, 0.02)
         
         def _sample_action(w, t, k, legal_mask):
             """温度采样 (log 空间避免数值下溢)"""
@@ -584,11 +584,6 @@ def save_checkpoint(
         np.savez_compressed(os.path.join(meta_dir, f"history_{k}.npz"), 
                            **{f"arr_{i}": arr for i, arr in enumerate(jax.tree.leaves(v))})
     
-    # 保存回放缓冲区
-    if replay_buffer.size > 0:
-        buf_state = replay_buffer.state_dict()
-        np.savez_compressed(os.path.join(meta_dir, "replay_buffer.npz"), **buf_state)
-    
     print(f"[Checkpoint] 已保存 step={step}")
 
 
@@ -651,13 +646,6 @@ def restore_checkpoint(
                 leaves = [data[f"arr_{i}"] for i in range(len(data.files))]
                 history_models[k] = jax.tree.unflatten(tree_struct, leaves)
         
-        # 恢复回放缓冲区
-        buf_path = os.path.join(meta_dir, "replay_buffer.npz")
-        if os.path.exists(buf_path):
-            buf_data = dict(np.load(buf_path))
-            replay_buffer.load_state_dict(buf_data)
-            print(f"[Checkpoint] 回放缓冲区恢复: {replay_buffer.size} 样本")
-    
     # 获取最近的 ELO（可能不是当前 iteration）
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
