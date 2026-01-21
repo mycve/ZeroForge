@@ -78,7 +78,7 @@ class Config:
     max_steps: int = 200
     max_no_capture_steps: int = 60
     repetition_threshold: int = 3
-    perpetual_check_threshold: int = 6
+    # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
     
     # ELO 评估
     eval_interval: int = 20
@@ -112,7 +112,6 @@ env = XiangqiEnv(
     max_steps=config.max_steps,
     max_no_capture_steps=config.max_no_capture_steps,
     repetition_threshold=config.repetition_threshold,
-    perpetual_check_threshold=config.perpetual_check_threshold
 )
 
 net = AlphaZeroNetwork(

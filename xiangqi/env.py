@@ -187,7 +187,7 @@ class XiangqiEnv:
         max_steps: int = 400,
         max_no_capture_steps: int = 60,
         repetition_threshold: int = 4,
-        perpetual_check_threshold: int = 6
+        perpetual_check_threshold: int = 6  # 已废弃，保留向后兼容
     ):
         self.num_players = 2
         self.action_space_size = ACTION_SPACE_SIZE
@@ -197,7 +197,8 @@ class XiangqiEnv:
         self.max_steps = max_steps
         self.max_no_capture_steps = max_no_capture_steps
         self.repetition_threshold = repetition_threshold
-        self.perpetual_check_threshold = perpetual_check_threshold
+        # 注：perpetual_check_threshold 已废弃，现在使用"重复局面+将军=长将判负"规则
+        # 允许连将杀：连续将军只要不重复局面，最终将死对方即可
     
     @partial(jax.jit, static_argnums=(0,))
     def init(self, key: jax.random.PRNGKey) -> XiangqiState:
@@ -299,9 +300,7 @@ class XiangqiEnv:
             # 4. 检测将军状态 (对方是否被将军)
             is_check = is_in_check(new_board, new_player)
             
-            # 5. 更新连续将军计数
-            # 如果红方走棋后黑方被将军，红方连续将军+1
-            # 如果红方走棋后黑方没被将军，红方连续将军清零
+            # 5. 更新连续将军计数（用于统计，不用于判负）
             new_red_checks = jnp.where(
                 state.current_player == 0,  # 红方刚走
                 jnp.where(is_check, state.red_consecutive_checks + 1, jnp.int32(0)),
@@ -313,50 +312,51 @@ class XiangqiEnv:
                 state.black_consecutive_checks
             )
             
-            # 6. 检测长将 (连续将军超过阈值)
-            red_perpetual_check = new_red_checks >= self.perpetual_check_threshold
-            black_perpetual_check = new_black_checks >= self.perpetual_check_threshold
-            
             # ========== 游戏结束判断 ==========
             
             # 检查基本游戏结束条件 (将死/困毙)
             game_over, winner = is_game_over(new_board, new_player)
             
-            # 检查和棋条件: 步数限制、无吃子限制、三次重复
+            # 检查和棋条件: 步数限制、无吃子限制
             is_max_steps = new_step_count >= self.max_steps
             is_no_capture = new_no_capture >= self.max_no_capture_steps
             
-            is_draw = is_max_steps | is_no_capture | is_threefold_repetition
+            # 6. 长将判负规则（符合正式比赛规则）
+            # 只有当【局面重复】且【当前处于将军状态】时，将军方（刚走的一方）判负
+            # 这样"连将杀"是合法的：连续将军只要不重复局面，最终将死对方即可
+            is_perpetual_check = is_threefold_repetition & is_check
+            # 刚走的一方（state.current_player）是将军方，判负
+            perpetual_check_winner = jnp.where(state.current_player == 0, 1, 0)  # 红方长将则黑胜
             
-            # 记录和棋原因
+            # 普通三次重复（非将军状态）算和棋
+            is_normal_repetition = is_threefold_repetition & ~is_check
+            
+            is_draw = is_max_steps | is_no_capture | is_normal_repetition
+            
+            # 记录结束原因
+            # 1=步数到限, 2=无吃子到限, 3=三次重复(和棋), 4=长将判负
             new_draw_reason = jnp.where(
-                is_max_steps, 1,
+                is_perpetual_check, 4,  # 长将判负
                 jnp.where(
-                    is_no_capture, 2,
-                    jnp.where(is_threefold_repetition, 3, 0)
+                    is_normal_repetition, 3,  # 普通重复和棋
+                    jnp.where(
+                        is_no_capture, 2,
+                        jnp.where(is_max_steps, 1, 0)
+                    )
                 )
             )
             
-            # 检查长将判负
-            # 红方长将 -> 红方负 (黑方胜)
-            # 黑方长将 -> 黑方负 (红方胜)
-            perpetual_check_loss = red_perpetual_check | black_perpetual_check
-            perpetual_winner = jnp.where(red_perpetual_check, 1, jnp.where(black_perpetual_check, 0, -1))
-            
-            # 长将也算一种和棋形式的终结（虽然有胜负）
-            new_draw_reason = jnp.where(perpetual_check_loss, 4, new_draw_reason)
-            
             # 综合判断
-            game_over = game_over | is_draw | perpetual_check_loss
+            game_over = game_over | is_draw | is_perpetual_check
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 其他和棋（三次重复/步数到限/无吃子到限）
+            # 优先级: 将死 > 长将判负 > 其他和棋
             winner = jnp.where(
                 winner != -1,
                 winner,  # 已有胜者 (将死)
                 jnp.where(
-                    perpetual_check_loss,
-                    perpetual_winner,  # 长将判负 (违规方判负)
+                    is_perpetual_check,
+                    perpetual_check_winner,  # 长将判负 (将军方判负)
                     -1  # 其他和棋情况统一返回 -1 (平局)
                 )
             )
