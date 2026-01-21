@@ -69,7 +69,6 @@ class Config:
     # 经验回放配置
     replay_buffer_size: int = 500000
     sample_reuse_times: int = 5
-    new_data_ratio: float = 0.8  # 混合训练：80% 新数据（显存）+ 20% 旧数据（CPU）
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 40
@@ -293,7 +292,7 @@ def loss_fn(params, samples: Sample, rng_key):
     - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
     - 价值损失：拟合 n-step TD 目标
     """
-    # 确保 obs 为 float32（兼容 uint8 旧数据和 float32 新数据）
+    # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
     
@@ -761,56 +760,18 @@ def main():
         new_frames = samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
         frames += new_frames
         
-        # --- 混合训练：新数据（显存）+ 旧数据（CPU）---
-        # 将新数据从多设备聚合到主设备（设备 0）并展平
-        # 使用 NumPy 中转来正确处理多设备分片
-        samples_np = jax.device_get(samples)
-        samples_flat = Sample(
-            obs=jnp.array(samples_np.obs.reshape(-1, *samples_np.obs.shape[3:])),
-            policy_tgt=jnp.array(samples_np.policy_tgt.reshape(-1, samples_np.policy_tgt.shape[-1])),
-            value_tgt=jnp.array(samples_np.value_tgt.reshape(-1)),
-            mask=jnp.array(samples_np.mask.reshape(-1)),
-        )
-        num_new_samples = samples_flat.obs.shape[0]
-        
+        # --- 从缓冲区采样训练 ---
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
-        # 计算新旧数据比例
-        new_batch_size = int(config.training_batch_size * config.new_data_ratio)
-        old_batch_size = config.training_batch_size - new_batch_size
-        
         policy_losses, value_losses = [], []
-        rng_key, sk_loop = jax.random.split(rng_key)
+        # 预生成所有采样 key，减少 Python 循环开销
+        sample_keys = jax.random.split(rng_key, num_updates + 1)
+        rng_key = sample_keys[0]
         
         for i in range(num_updates):
-            sk_loop, sk_new, sk_old, sk_train = jax.random.split(sk_loop, 4)
-            
-            # 从显存中的新数据随机采样（零传输）
-            new_idx = jax.random.randint(sk_new, (new_batch_size,), 0, num_new_samples)
-            new_batch = Sample(
-                obs=samples_flat.obs[new_idx],
-                policy_tgt=samples_flat.policy_tgt[new_idx],
-                value_tgt=samples_flat.value_tgt[new_idx],
-                mask=samples_flat.mask[new_idx],
-            )
-            
-            # 从 CPU 经验池采样旧数据（少量传输，uint8 格式）
-            old_batch = replay_buffer.sample(old_batch_size, sk_old) if old_batch_size > 0 and replay_buffer.size > 0 else None
-            
-            # 合并新旧数据
-            if old_batch is not None and old_batch_size > 0:
-                # 旧数据 obs 是 uint8，需要转为 float32 以匹配新数据
-                old_obs_f32 = old_batch.obs.astype(jnp.float32)
-                batch_flat = Sample(
-                    obs=jnp.concatenate([new_batch.obs, old_obs_f32], axis=0),
-                    policy_tgt=jnp.concatenate([new_batch.policy_tgt, old_batch.policy_tgt], axis=0),
-                    value_tgt=jnp.concatenate([new_batch.value_tgt, old_batch.value_tgt], axis=0),
-                    mask=jnp.concatenate([new_batch.mask, old_batch.mask], axis=0),
-                )
-            else:
-                batch_flat = new_batch
-            
+            sk_sample, sk_train = jax.random.split(sample_keys[i+1])
+            batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
             # 分发训练 Key 到各设备
