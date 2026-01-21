@@ -57,25 +57,25 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 256
-    td_steps: int = 5   # 缩短 TD 步数，减少价值估计方差
+    training_batch_size: int = 1024
+    td_steps: int = 20   # 缩短 TD 步数，减少价值估计方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 256
-    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 32
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 32           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 4
     
     # 经验回放配置
-    replay_buffer_size: int = 800000
-    sample_reuse_times: int = 3
+    replay_buffer_size: int = 500000
+    sample_reuse_times: int = 5
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
-    temperature_steps: int = 20
+    temperature_steps: int = 40
     temperature_initial: float = 1.0
-    temperature_final: float = 0.0
+    temperature_final: float = 0.01
     
     # 环境规则
-    max_steps: int = 150
+    max_steps: int = 200
     max_no_capture_steps: int = 60
     repetition_threshold: int = 3
     perpetual_check_threshold: int = 6
