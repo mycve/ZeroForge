@@ -290,7 +290,9 @@ def loss_fn(params, samples: Sample, rng_key):
     - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
     - 价值损失：拟合 n-step TD 目标
     """
-    obs, policy_tgt = samples.obs, samples.policy_tgt
+    # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
+    obs = samples.obs.astype(jnp.float32)
+    policy_tgt = samples.policy_tgt
     
     # 随机镜像增强
     do_mirror = jax.random.bernoulli(rng_key, 0.5)
@@ -439,13 +441,17 @@ class ReplayBuffer:
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """采样后转回 JAX 数组"""
+        """采样后转回 JAX 数组
+        
+        优化：obs 保持 uint8 传输，减少 4x CPU→GPU 带宽
+        在 GPU 上的 loss_fn 中再转为 float32
+        """
         # NumPy 随机采样
         idx = np.random.randint(0, self.size, size=batch_size)
         
-        # 返回时转回 JAX（会自动放到主设备）
+        # obs 保持 uint8 传输（节省 4x 带宽），在 GPU 上转换
         return Sample(
-            obs=jnp.array(self.obs[idx], dtype=jnp.float32),
+            obs=jnp.array(self.obs[idx], dtype=jnp.uint8),
             policy_tgt=jnp.array(self.policy_tgt[idx]),
             value_tgt=jnp.array(self.value_tgt[idx]),
             mask=jnp.array(self.mask[idx])
