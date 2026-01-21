@@ -161,13 +161,14 @@ def count_repetitions(position_hash: jnp.int32,
     Args:
         position_hash: 当前局面哈希
         position_hashes: 历史哈希数组
-        hash_count: 有效哈希数量
+        hash_count: 有效哈希数量（可能大于 POSITION_HISTORY_SIZE）
         
     Returns:
         重复次数 (包括当前局面)
     """
-    # 只比较有效的历史哈希
-    valid_mask = jnp.arange(POSITION_HISTORY_SIZE) < hash_count
+    # 只比较有效的历史哈希，数量上限为缓冲区大小
+    valid_count = jnp.minimum(hash_count, POSITION_HISTORY_SIZE)
+    valid_mask = jnp.arange(POSITION_HISTORY_SIZE) < valid_count
     matches = (position_hashes == position_hash) & valid_mask
     return jnp.sum(matches) + 1  # +1 包括当前局面
 
@@ -286,9 +287,10 @@ class XiangqiEnv:
             new_hash = compute_position_hash(new_board, new_player)
             
             # 2. 更新哈希历史 (循环缓冲区)
+            # hash_count 持续增长用于统计，索引时取模实现环形覆盖
             hash_idx = state.hash_count % POSITION_HISTORY_SIZE
             new_position_hashes = state.position_hashes.at[hash_idx].set(new_hash)
-            new_hash_count = jnp.minimum(state.hash_count + 1, POSITION_HISTORY_SIZE)
+            new_hash_count = state.hash_count + 1
             
             # 3. 检测重复局面
             repetitions = count_repetitions(new_hash, state.position_hashes, state.hash_count)
@@ -348,18 +350,14 @@ class XiangqiEnv:
             game_over = game_over | is_draw | perpetual_check_loss
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 其他和棋
+            # 优先级: 将死 > 长将判负 > 其他和棋（三次重复/步数到限/无吃子到限）
             winner = jnp.where(
                 winner != -1,
                 winner,  # 已有胜者 (将死)
                 jnp.where(
                     perpetual_check_loss,
-                    perpetual_winner,  # 长将判负 (保留作为违规判负)
-                    jnp.where(
-                        is_threefold_repetition,
-                        -1,  # --- 修改：三次重复务必算和 ---
-                        jnp.where(is_draw, -1, -1)  # 步数到限的和棋
-                    )
+                    perpetual_winner,  # 长将判负 (违规方判负)
+                    -1  # 其他和棋情况统一返回 -1 (平局)
                 )
             )
             

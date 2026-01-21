@@ -454,8 +454,13 @@ class ChessGame:
         except Exception as e:
             print(f"[UCI] bestmove 解析失败: {bm}, err={e}")
             return None
-        return int(move_to_action(f, t))
-        return None
+        
+        # 验证动作有效性，move_to_action 返回 -1 表示无效
+        action = int(move_to_action(f, t))
+        if action < 0:
+            print(f"[UCI] bestmove 对应的动作无效: {bm}, from={f}, to={t}")
+            return None
+        return action
 
 # ============================================================================
 # GUI 绘制

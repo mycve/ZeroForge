@@ -104,11 +104,9 @@ _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def replicate_to_devices(pytree):
     """将 pytree 复制到所有设备"""
-    # 使用 device_put_replicated（虽然废弃但仍可用且最可靠）
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return jax.device_put_replicated(pytree, devices)
+    # 使用 jax.device_put 配合 NamedSharding 或直接复制到各设备
+    # 兼容新旧版本 JAX 的写法
+    return jax.tree.map(lambda x: jnp.stack([x] * num_devices), pytree)
 
 env = XiangqiEnv(
     max_steps=config.max_steps,
@@ -268,16 +266,15 @@ def compute_targets(data: SelfplayOutput):
         next_v = curr_r + curr_d * carry_v
         return next_v, next_v
 
-    # 预计算所有可能的 n 步之后位置的 bootstrap 价值
-    bootstrap_values = padded_root_v[n : max_steps + n]
-    
-    # 对于每一个 t，我们需要计算从 t 到 t+n-1 的累加
-    # 这里的优化方案是：直接利用 scan 计算全序列的折现奖励，然后做差分（类似前缀和优化）
-    # 但为了逻辑严谨且 n 通常较小，我们使用更加稳健的递归展开
+    # 使用 jax.lax.fori_loop 替代 Python 循环，避免编译图随 n 变化而膨胀
+    # 从后往前递归计算 n-step TD: G_t = r_t + γ_t * G_{t+1}
+    def td_step(i, res_val):
+        # i 从 0 到 n-1，对应原始的 reversed(range(n)) 即 n-1, n-2, ..., 0
+        idx = n - 1 - i
+        return padded_reward[idx : max_steps + idx] + padded_discount[idx : max_steps + idx] * res_val
     
     res_val = padded_root_v[n : max_steps + n]
-    for i in reversed(range(n)):
-        res_val = padded_reward[i : max_steps + i] + padded_discount[i : max_steps + i] * res_val
+    res_val = jax.lax.fori_loop(0, n, td_step, res_val)
         
     return Sample(
         obs=data.obs, 
@@ -721,12 +718,9 @@ def main():
         iteration += 1
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
-        # 使用最兼容的 device_put_sharded 方式分发 Key
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            # 必须传入 list 确保每个设备拿到一个 (2,) 的 key
-            data = selfplay(params, jax.device_put_sharded(list(jax.random.split(sk1, num_devices)), devices))
+        # 分发随机数 key 到各设备，每个设备拿到一个独立的 (2,) key
+        selfplay_keys = jnp.stack(list(jax.random.split(sk1, num_devices)))
+        data = selfplay(params, selfplay_keys)
         samples = compute_targets(data)
         
         data_np = jax.device_get(data)
@@ -773,10 +767,8 @@ def main():
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
-            # 使用兼容的 device_put_sharded 分发训练 Key
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                train_keys = jax.device_put_sharded(list(jax.random.split(sk_train, num_devices)), devices)
+            # 分发训练 Key 到各设备
+            train_keys = jnp.stack(list(jax.random.split(sk_train, num_devices)))
             params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
@@ -838,11 +830,9 @@ def main():
             if past_iter in history_models:
                 past_params = replicate_to_devices(history_models[past_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-                # 使用兼容的 device_put_sharded 分发评估 Key
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
-                    eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
+                # 分发评估 Key 到各设备
+                eval_keys_r = jnp.stack(list(jax.random.split(sk5, num_devices)))
+                eval_keys_b = jnp.stack(list(jax.random.split(sk6, num_devices)))
                 
                 # 双边评估
                 winners_r = evaluate(params, past_params, eval_keys_r)
