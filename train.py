@@ -63,13 +63,13 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 1024
-    num_simulations: int = 64           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 8
+    num_simulations: int = 32           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 4
     
     # 经验回放配置
     replay_buffer_size: int = 500000
     sample_reuse_times: int = 5
-    use_gpu_buffer: bool = True  # 使用 GPU 经验池（零传输），需要足够显存
+    new_data_ratio: float = 0.8  # 混合训练：80% 新数据（显存）+ 20% 旧数据（CPU）
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 40
@@ -293,7 +293,7 @@ def loss_fn(params, samples: Sample, rng_key):
     - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
     - 价值损失：拟合 n-step TD 目标
     """
-    # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
+    # 确保 obs 为 float32（兼容 uint8 旧数据和 float32 新数据）
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
     
@@ -404,119 +404,8 @@ def evaluate(params_red, params_black, rng_key):
 # 经验回放缓冲区
 # ============================================================================
 
-class GPUReplayBuffer:
-    """GPU 经验池 - 零 CPU-GPU 传输，极致性能
-    
-    数据直接存储在 GPU 显存中，采样和训练都在 GPU 上进行，
-    避免 CPU-GPU 数据传输瓶颈。
-    
-    显存占用（uint8 obs）：
-    - 50 万样本 ≈ 15 GB
-    - 建议用于显存充足的 GPU（≥24GB）
-    """
-    
-    def __init__(self, max_size: int, obs_shape: tuple, action_size: int, num_devices: int):
-        self.max_size = max_size
-        self.obs_shape = obs_shape
-        self.action_size = action_size
-        self.num_devices = num_devices
-        
-        # 在 GPU 上分配存储空间（使用 uint8 节省显存）
-        # 所有数据存储在一个扁平数组中
-        self.obs = jnp.zeros((max_size, *obs_shape), dtype=jnp.uint8)
-        self.policy_tgt = jnp.zeros((max_size, action_size), dtype=jnp.float32)
-        self.value_tgt = jnp.zeros((max_size,), dtype=jnp.float32)
-        self.mask = jnp.zeros((max_size,), dtype=jnp.bool_)
-        
-        # 指针和大小
-        self.ptr = 0
-        self.size = 0
-        self.total_added = 0
-    
-    def add(self, samples: Sample):
-        """存入样本（samples 已在 GPU 上，形状为 (num_devices, max_steps, batch, ...)）"""
-        # 展平所有维度：(num_devices, max_steps, batch, ...) → (total_samples, ...)
-        obs_flat = samples.obs.reshape(-1, *self.obs_shape)
-        policy_flat = samples.policy_tgt.reshape(-1, self.action_size)
-        value_flat = samples.value_tgt.reshape(-1)
-        mask_flat = samples.mask.reshape(-1)
-        
-        n_new = int(obs_flat.shape[0])
-        
-        # 环形缓冲区写入
-        if self.ptr + n_new <= self.max_size:
-            # 不需要环绕
-            indices = jnp.arange(self.ptr, self.ptr + n_new)
-            self.obs = self.obs.at[indices].set(obs_flat.astype(jnp.uint8))
-            self.policy_tgt = self.policy_tgt.at[indices].set(policy_flat)
-            self.value_tgt = self.value_tgt.at[indices].set(value_flat)
-            self.mask = self.mask.at[indices].set(mask_flat)
-        else:
-            # 需要环绕写入
-            first_part = self.max_size - self.ptr
-            # 第一部分
-            idx1 = jnp.arange(self.ptr, self.max_size)
-            self.obs = self.obs.at[idx1].set(obs_flat[:first_part].astype(jnp.uint8))
-            self.policy_tgt = self.policy_tgt.at[idx1].set(policy_flat[:first_part])
-            self.value_tgt = self.value_tgt.at[idx1].set(value_flat[:first_part])
-            self.mask = self.mask.at[idx1].set(mask_flat[:first_part])
-            # 第二部分
-            second_part = n_new - first_part
-            idx2 = jnp.arange(0, second_part)
-            self.obs = self.obs.at[idx2].set(obs_flat[first_part:].astype(jnp.uint8))
-            self.policy_tgt = self.policy_tgt.at[idx2].set(policy_flat[first_part:])
-            self.value_tgt = self.value_tgt.at[idx2].set(value_flat[first_part:])
-            self.mask = self.mask.at[idx2].set(mask_flat[first_part:])
-        
-        self.ptr = (self.ptr + n_new) % self.max_size
-        self.size = min(self.size + n_new, self.max_size)
-        self.total_added += n_new
-    
-    def sample(self, batch_size: int, rng_key) -> Sample:
-        """在 GPU 上随机采样
-        
-        返回形状为 (batch_size, ...) 的数据，已在 GPU 上
-        """
-        # 安全检查
-        sample_size = max(1, self.size)
-        
-        # 在 GPU 上生成随机索引并采样（零传输）
-        idx = jax.random.randint(rng_key, (batch_size,), 0, sample_size)
-        
-        return Sample(
-            obs=self.obs[idx],  # uint8，在 loss_fn 中转 float32
-            policy_tgt=self.policy_tgt[idx],
-            value_tgt=self.value_tgt[idx],
-            mask=self.mask[idx]
-        )
-    
-    def cleanup(self):
-        pass
-    
-    def stats(self):
-        return {"size": self.size, "total_added": self.total_added, "ptr": self.ptr}
-    
-    def state_dict(self):
-        """导出为 NumPy（用于 checkpoint）"""
-        return {
-            "obs": np.array(self.obs), "policy_tgt": np.array(self.policy_tgt),
-            "value_tgt": np.array(self.value_tgt), "mask": np.array(self.mask),
-            "ptr": self.ptr, "size": self.size, "total_added": self.total_added
-        }
-    
-    def load_state_dict(self, state):
-        """从 checkpoint 加载"""
-        self.obs = jnp.array(state["obs"])
-        self.policy_tgt = jnp.array(state["policy_tgt"])
-        self.value_tgt = jnp.array(state["value_tgt"])
-        self.mask = jnp.array(state["mask"])
-        self.ptr = int(state["ptr"])
-        self.size = int(state["size"])
-        self.total_added = int(state["total_added"])
-
-
 class ReplayBuffer:
-    """纯 NumPy 环形缓冲区 - 备用方案，适合显存不足的情况"""
+    """纯 NumPy 环形缓冲区 - 零设备冲突，极简稳定"""
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
@@ -782,24 +671,12 @@ def main():
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
     
-    # 初始化经验回放缓冲区
-    # 每样本大小: obs(240*10*9*1) + policy(2086*4) + value(4) + mask(1) ≈ 30KB
-    buffer_mem_gb = config.replay_buffer_size * 30 / 1024 / 1024 / 1024
-    if config.use_gpu_buffer:
-        print(f"[经验池] 使用 GPU 经验池 (零传输)，约 {buffer_mem_gb:.1f} GB 显存")
-        replay_buffer = GPUReplayBuffer(
-            max_size=config.replay_buffer_size,
-            obs_shape=(240, 10, 9),
-            action_size=ACTION_SPACE_SIZE,
-            num_devices=num_devices
-        )
-    else:
-        print(f"[经验池] 使用 CPU 经验池，约 {buffer_mem_gb:.1f} GB 内存")
-        replay_buffer = ReplayBuffer(
-            max_size=config.replay_buffer_size,
-            obs_shape=(240, 10, 9),
-            action_size=ACTION_SPACE_SIZE
-        )
+    # 初始化经验回放缓冲区 (JAX 环形缓冲区)
+    replay_buffer = ReplayBuffer(
+        max_size=config.replay_buffer_size,
+        obs_shape=(240, 10, 9),
+        action_size=ACTION_SPACE_SIZE
+    )
     
     # 初始化模型模板 (用于恢复时的结构参考)
     rng_key = jax.random.PRNGKey(config.seed)
@@ -884,18 +761,54 @@ def main():
         new_frames = samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
         frames += new_frames
         
-        # --- 从缓冲区采样训练 ---
+        # --- 混合训练：新数据（显存）+ 旧数据（CPU）---
+        # 将新数据展平为可采样形式，保持在显存中
+        samples_flat = Sample(
+            obs=samples.obs.reshape(-1, *samples.obs.shape[3:]),
+            policy_tgt=samples.policy_tgt.reshape(-1, samples.policy_tgt.shape[-1]),
+            value_tgt=samples.value_tgt.reshape(-1),
+            mask=samples.mask.reshape(-1),
+        )
+        num_new_samples = samples_flat.obs.shape[0]
+        
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
+        # 计算新旧数据比例
+        new_batch_size = int(config.training_batch_size * config.new_data_ratio)
+        old_batch_size = config.training_batch_size - new_batch_size
+        
         policy_losses, value_losses = [], []
-        # 预生成所有采样 key，减少 Python 循环开销
-        sample_keys = jax.random.split(rng_key, num_updates + 1)
-        rng_key = sample_keys[0]
+        rng_key, sk_loop = jax.random.split(rng_key)
         
         for i in range(num_updates):
-            sk_sample, sk_train = jax.random.split(sample_keys[i+1])
-            batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
+            sk_loop, sk_new, sk_old, sk_train = jax.random.split(sk_loop, 4)
+            
+            # 从显存中的新数据随机采样（零传输）
+            new_idx = jax.random.randint(sk_new, (new_batch_size,), 0, num_new_samples)
+            new_batch = Sample(
+                obs=samples_flat.obs[new_idx],
+                policy_tgt=samples_flat.policy_tgt[new_idx],
+                value_tgt=samples_flat.value_tgt[new_idx],
+                mask=samples_flat.mask[new_idx],
+            )
+            
+            # 从 CPU 经验池采样旧数据（少量传输，uint8 格式）
+            old_batch = replay_buffer.sample(old_batch_size, sk_old) if old_batch_size > 0 and replay_buffer.size > 0 else None
+            
+            # 合并新旧数据
+            if old_batch is not None and old_batch_size > 0:
+                # 旧数据 obs 是 uint8，需要转为 float32 以匹配新数据
+                old_obs_f32 = old_batch.obs.astype(jnp.float32)
+                batch_flat = Sample(
+                    obs=jnp.concatenate([new_batch.obs, old_obs_f32], axis=0),
+                    policy_tgt=jnp.concatenate([new_batch.policy_tgt, old_batch.policy_tgt], axis=0),
+                    value_tgt=jnp.concatenate([new_batch.value_tgt, old_batch.value_tgt], axis=0),
+                    mask=jnp.concatenate([new_batch.mask, old_batch.mask], axis=0),
+                )
+            else:
+                batch_flat = new_batch
+            
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
             # 分发训练 Key 到各设备
