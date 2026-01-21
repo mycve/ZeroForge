@@ -266,15 +266,13 @@ def compute_targets(data: SelfplayOutput):
         next_v = curr_r + curr_d * carry_v
         return next_v, next_v
 
-    # 使用 jax.lax.fori_loop 替代 Python 循环，避免编译图随 n 变化而膨胀
-    # 从后往前递归计算 n-step TD: G_t = r_t + γ_t * G_{t+1}
-    def td_step(i, res_val):
-        # i 从 0 到 n-1，对应原始的 reversed(range(n)) 即 n-1, n-2, ..., 0
-        idx = n - 1 - i
-        return padded_reward[idx : max_steps + idx] + padded_discount[idx : max_steps + idx] * res_val
-    
+    # n-step TD 递归计算: G_t = r_t + γ_t * G_{t+1}
+    # 注：这里使用 Python 循环展开，因为：
+    # 1. td_steps 通常较小 (10-20)，展开开销可接受
+    # 2. JAX 切片要求静态索引，fori_loop 内的动态索引无法用于切片
     res_val = padded_root_v[n : max_steps + n]
-    res_val = jax.lax.fori_loop(0, n, td_step, res_val)
+    for i in reversed(range(n)):
+        res_val = padded_reward[i : max_steps + i] + padded_discount[i : max_steps + i] * res_val
         
     return Sample(
         obs=data.obs, 
