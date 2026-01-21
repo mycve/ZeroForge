@@ -762,12 +762,14 @@ def main():
         frames += new_frames
         
         # --- 混合训练：新数据（显存）+ 旧数据（CPU）---
-        # 将新数据展平为可采样形式，保持在显存中
+        # 将新数据从多设备聚合到主设备（设备 0）并展平
+        # 使用 NumPy 中转来正确处理多设备分片
+        samples_np = jax.device_get(samples)
         samples_flat = Sample(
-            obs=samples.obs.reshape(-1, *samples.obs.shape[3:]),
-            policy_tgt=samples.policy_tgt.reshape(-1, samples.policy_tgt.shape[-1]),
-            value_tgt=samples.value_tgt.reshape(-1),
-            mask=samples.mask.reshape(-1),
+            obs=jnp.array(samples_np.obs.reshape(-1, *samples_np.obs.shape[3:])),
+            policy_tgt=jnp.array(samples_np.policy_tgt.reshape(-1, samples_np.policy_tgt.shape[-1])),
+            value_tgt=jnp.array(samples_np.value_tgt.reshape(-1)),
+            mask=jnp.array(samples_np.mask.reshape(-1)),
         )
         num_new_samples = samples_flat.obs.shape[0]
         
