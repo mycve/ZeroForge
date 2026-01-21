@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import warnings
 from functools import partial
 from typing import NamedTuple, Optional
 
@@ -104,9 +105,10 @@ _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def replicate_to_devices(pytree):
     """将 pytree 复制到所有设备"""
-    # 使用 jax.device_put 配合 NamedSharding 或直接复制到各设备
-    # 兼容新旧版本 JAX 的写法
-    return jax.tree.map(lambda x: jnp.stack([x] * num_devices), pytree)
+    # 使用 jax.device_put_replicated（虽然有 deprecation warning，但最可靠）
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return jax.device_put_replicated(pytree, devices)
 
 env = XiangqiEnv(
     max_steps=config.max_steps,
@@ -722,7 +724,9 @@ def main():
         st = time.time()
         rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
         # 分发随机数 key 到各设备，每个设备拿到一个独立的 (2,) key
-        selfplay_keys = jnp.stack(list(jax.random.split(sk1, num_devices)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            selfplay_keys = jax.device_put_sharded(list(jax.random.split(sk1, num_devices)), devices)
         data = selfplay(params, selfplay_keys)
         samples = compute_targets(data)
         
@@ -771,7 +775,9 @@ def main():
             # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
             # 分发训练 Key 到各设备
-            train_keys = jnp.stack(list(jax.random.split(sk_train, num_devices)))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                train_keys = jax.device_put_sharded(list(jax.random.split(sk_train, num_devices)), devices)
             params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
         
@@ -834,8 +840,10 @@ def main():
                 past_params = replicate_to_devices(history_models[past_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
                 # 分发评估 Key 到各设备
-                eval_keys_r = jnp.stack(list(jax.random.split(sk5, num_devices)))
-                eval_keys_b = jnp.stack(list(jax.random.split(sk6, num_devices)))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
+                    eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
                 
                 # 双边评估
                 winners_r = evaluate(params, past_params, eval_keys_r)
