@@ -141,7 +141,11 @@ class UCIEngine:
             self.process.stdin.write(f"{cmd}\n")
             self.process.stdin.flush()
 
-    def get_best_move(self, fen: str, movetime: int = 1000, depth: Optional[int] = None) -> Optional[str]:
+    def get_best_move(self, fen: str, movetime: int = 1000, depth: Optional[int] = None) -> Tuple[Optional[str], Optional[int]]:
+        """
+        获取最佳着法和评估分数
+        返回: (bestmove, score_cp) - score_cp 为厘兵分数，正值对当前走棋方有利
+        """
         with self.lock:
             while not self.output_queue.empty(): self.output_queue.get()
             self.send(f"position fen {fen}")
@@ -151,12 +155,33 @@ class UCIEngine:
                 self.send(f"go movetime {movetime}")
             start_time = time.time()
             wait_seconds = (movetime / 1000.0 + 2.0) if depth is None else max(2.0, depth * 0.5)
+            last_score = None  # 记录最后一次的评估分数
             while time.time() - start_time < wait_seconds:
                 try:
                     line = self.output_queue.get(timeout=0.1)
-                    if line.startswith("bestmove"): return line.split()[1]
-                except queue.Empty: continue
-        return None
+                    # 解析 info 行中的分数: "info depth X ... score cp YYY ..." 或 "score mate X"
+                    if "score cp" in line:
+                        try:
+                            parts = line.split("score cp")
+                            if len(parts) > 1:
+                                score_part = parts[1].strip().split()[0]
+                                last_score = int(score_part)
+                        except (ValueError, IndexError):
+                            pass
+                    elif "score mate" in line:
+                        try:
+                            parts = line.split("score mate")
+                            if len(parts) > 1:
+                                mate_in = int(parts[1].strip().split()[0])
+                                # 将杀转换为大分数，正值表示己方能杀，负值表示被杀
+                                last_score = 30000 - abs(mate_in) * 100 if mate_in > 0 else -30000 + abs(mate_in) * 100
+                        except (ValueError, IndexError):
+                            pass
+                    if line.startswith("bestmove"):
+                        return line.split()[1], last_score
+                except queue.Empty: 
+                    continue
+        return None, None
 
     def stop(self):
         self._stop_event.set()
@@ -252,7 +277,9 @@ class GameState:
     step_count: int = 0
     history: List = None
     jax_state: Optional[XiangqiState] = None
-    ai_value: float = 0.0
+    ai_value: float = 0.0           # ZeroForge AI 评估值 [-1, 1]，正值对红方有利
+    uci_score: Optional[int] = None # UCI 引擎评估（厘兵），正值对当前走棋方有利
+    last_move_player: int = 0       # 上一步是哪方走的（用于正确显示评估）
     last_move_uci: str = ""
     notice: str = ""
     replay_index: Optional[int] = None
@@ -273,6 +300,9 @@ class ChessGame:
         self.uci_movetime = 1000
         self.uci_depth = 3
         self.ai_delay = 1.0
+        
+        # 暂停状态
+        self.paused = False
         
         # 缓存编译后的 MCTS recurrent_fn，避免每次推理重新编译
         self._mcts_recurrent_fn = self._create_mcts_recurrent_fn()
@@ -326,6 +356,8 @@ class ChessGame:
                 "game_over": bool(js.terminated),
                 "winner": int(js.winner),
                 "ai_value": float(h.get("ai_value", 0.0)),
+                "uci_score": h.get("uci_score"),
+                "last_move_player": h.get("last_move_player", 0),
             })
 
         js = self.state.jax_state
@@ -338,6 +370,8 @@ class ChessGame:
             "game_over": bool(js.terminated),
             "winner": int(js.winner),
             "ai_value": float(self.state.ai_value),
+            "uci_score": self.state.uci_score,
+            "last_move_player": self.state.last_move_player,
         })
         return snapshots
 
@@ -366,12 +400,16 @@ class ChessGame:
     def make_move(self, action: int):
         if self.state.game_over: return
         self.state.replay_index = None
+        # 记录走这一步之前的状态
         self.state.history.append({
             'jax_state': self.state.jax_state, 'last_move': self.state.last_move,
-            'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value
+            'last_move_uci': self.state.last_move_uci, 'ai_value': self.state.ai_value,
+            'uci_score': self.state.uci_score, 'last_move_player': self.state.last_move_player
         })
         fs, ts = action_to_move(action)
         fr, fc, tr, tc = int(fs)//9, int(fs)%9, int(ts)//9, int(ts)%9
+        # 记录是谁走的这一步
+        self.state.last_move_player = self.state.current_player
         new_jax_state = self.env.step(self.state.jax_state, action)
         self.state.jax_state = new_jax_state
         self.state.board = np.array(new_jax_state.board)
@@ -394,12 +432,56 @@ class ChessGame:
             self.state.last_move = h['last_move']
             self.state.last_move_uci = h['last_move_uci']
             self.state.ai_value = h['ai_value']
+            self.state.uci_score = h.get('uci_score')
+            self.state.last_move_player = h.get('last_move_player', 0)
             self.state.step_count -= 1
             self.state.game_over = False
             self.state.selected = None
             self.state.legal_moves = []
             self.state.replay_index = None
             self._update_status()
+
+    def fork_from_replay(self):
+        """从回放位置分叉，截断后续历史，从该局面继续走棋"""
+        replay_idx = self.state.replay_index
+        if replay_idx is None:
+            return
+        
+        history_len = len(self.state.history)
+        
+        if replay_idx == 0:
+            # 回到初始局面
+            fen = board_to_fen(np.array(self.state.history[0]['jax_state'].board) if self.state.history else self.state.board, 0)
+            self.new_game(fen)
+            print(f"[分叉] 从初始局面重新开始")
+            self.state.notice = "从初始局面重新开始"
+        elif replay_idx <= history_len:
+            # history[i] 存的是执行第 i+1 步之前的状态
+            # 要恢复到 replay_idx 对应的局面（即第 replay_idx 步走完后的状态）
+            # 需要使用 history[replay_idx] 的 jax_state（如果存在）
+            if replay_idx < history_len:
+                # replay_idx 不是最后一步，需要恢复并截断
+                h = self.state.history[replay_idx]
+                self.state.jax_state = h['jax_state']
+                self.state.board = np.array(h['jax_state'].board)
+                self.state.current_player = int(h['jax_state'].current_player)
+                self.state.last_move = h.get('last_move')
+                self.state.last_move_uci = h.get('last_move_uci', '')
+                self.state.ai_value = h.get('ai_value', 0.0)
+                self.state.uci_score = h.get('uci_score')
+                self.state.last_move_player = h.get('last_move_player', 0)
+                self.state.step_count = replay_idx
+                self.state.game_over = False
+                # 截断历史
+                self.state.history = self.state.history[:replay_idx]
+                print(f"[分叉] 从第 {replay_idx} 步继续，截断 {history_len - replay_idx} 步历史")
+                self.state.notice = f"从第 {replay_idx} 步分叉继续"
+            # 如果 replay_idx == history_len，说明就是当前局面，不需要恢复
+        
+        self.state.replay_index = None
+        self.state.selected = None
+        self.state.legal_moves = []
+        self._update_status()
 
     def get_ai_action(self) -> Optional[int]:
         if not self.model_mgr.params: return None
@@ -439,7 +521,7 @@ class ChessGame:
 
     def get_uci_action(self) -> Optional[int]:
         if not self.uci_engine: return None
-        bm = self.uci_engine.get_best_move(
+        bm, score_cp = self.uci_engine.get_best_move(
             board_to_fen(self.state.board, self.state.current_player),
             self.uci_movetime,
             self.uci_depth
@@ -454,6 +536,12 @@ class ChessGame:
         except Exception as e:
             print(f"[UCI] bestmove 解析失败: {bm}, err={e}")
             return None
+        
+        # 保存 UCI 评估分数（转换为红方视角）
+        if score_cp is not None:
+            # UCI 分数是当前走棋方视角，转换为红方视角存储
+            self.state.uci_score = score_cp if self.state.current_player == 0 else -score_cp
+            print(f"[UCI] score={score_cp}cp (红方视角: {self.state.uci_score}cp)")
         
         # 验证动作有效性，move_to_action 返回 -1 表示无效
         action = int(move_to_action(f, t))
@@ -529,12 +617,22 @@ def create_ui():
                         red_p = gr.Dropdown(["Human", "ZeroForge AI", "UCI Engine"], value="Human", label="红方")
                         black_p = gr.Dropdown(["Human", "ZeroForge AI", "UCI Engine"], value="ZeroForge AI", label="黑方")
                         new_btn = gr.Button("开始新局", variant="primary")
-                        undo_btn = gr.Button("悔棋")
                         with gr.Row():
-                            replay_prev = gr.Button("回放上一步")
-                            replay_next = gr.Button("回放下一步")
+                            undo_btn = gr.Button("悔棋")
+                            pause_btn = gr.Button("暂停", variant="secondary", visible=True)
+                            continue_btn = gr.Button("继续", variant="primary", visible=False)
+                        with gr.Row():
+                            replay_prev = gr.Button("◀ 上一步")
+                            replay_next = gr.Button("下一步 ▶")
                         replay_current = gr.Button("回到当前")
-                        replay_list = gr.Markdown()
+                        # 可点击的历史走法列表
+                        replay_dropdown = gr.Dropdown(
+                            choices=[], 
+                            value=None, 
+                            label="历史走法 (点击跳转)", 
+                            interactive=True,
+                            allow_custom_value=False
+                        )
                     with gr.Tab("设置"):
                         ckpt_dir = gr.Textbox("checkpoints", label="AI 路径")
                         with gr.Row():
@@ -556,16 +654,27 @@ def create_ui():
             click_c = gr.Textbox(elem_id="click_c")
             click_btn = gr.Button("Click", elem_id="click_btn")
 
-        def build_replay_markdown(snapshots, replay_idx):
+        def build_replay_choices(snapshots, replay_idx):
+            """构建历史走法的下拉选项"""
             if not snapshots:
-                return "暂无回放记录"
-            lines = []
+                return [], None
+            choices = []
             total = len(snapshots) - 1
             for i, snap in enumerate(snapshots):
-                move_uci = snap.get("last_move_uci") or "初始局面"
-                tag = ">>" if replay_idx == i else "  "
-                lines.append(f"{tag} 第{i}步/{total}: {move_uci}")
-            return "\n".join(lines)
+                move_uci = snap.get("last_move_uci") or ""
+                if not move_uci or i == 0:
+                    label = f"第{i}步: 初始局面"
+                else:
+                    # last_move_player 是走这一步的玩家
+                    last_player = snap.get("last_move_player", 0)
+                    player_name = "红" if last_player == 0 else "黑"
+                    label = f"第{i}步: {move_uci} ({player_name})"
+                choices.append(label)
+            
+            # 当前选中值
+            current_idx = replay_idx if replay_idx is not None else (len(snapshots) - 1)
+            current_value = choices[current_idx] if current_idx < len(choices) else None
+            return choices, current_value
 
         def update():
             snapshots = game._build_replay_snapshots()
@@ -578,6 +687,7 @@ def create_ui():
                 last_move = snap["last_move"]
                 last_move_uci = snap["last_move_uci"]
                 ai_value = snap["ai_value"]
+                uci_score = snap.get("uci_score")
                 game_over = snap["game_over"]
                 winner = snap["winner"]
                 step_count = snap["step_count"]
@@ -587,6 +697,7 @@ def create_ui():
                 last_move = game.state.last_move
                 last_move_uci = game.state.last_move_uci
                 ai_value = game.state.ai_value
+                uci_score = game.state.uci_score
                 game_over = game.state.game_over
                 winner = game.state.winner
                 step_count = game.state.step_count
@@ -608,9 +719,29 @@ def create_ui():
                 status += f"\n\n**提示**: {game.state.notice}"
                 game.state.notice = ""
             
-            # 胜率评估
-            winrate = (ai_value + 1) / 2 * 100
-            eval_str = f"红方胜率: {winrate:.1f}% | 上一着: {last_move_uci or '无'}"
+            # 评估信息构建
+            eval_parts = []
+            
+            # ZeroForge AI 评估（ai_value 范围 [-1, 1]，正值对红方有利）
+            if game.model_mgr.params is not None:
+                winrate = (ai_value + 1) / 2 * 100
+                eval_parts.append(f"ZeroForge: 红{winrate:.1f}%")
+            
+            # UCI 引擎评估（uci_score 已转换为红方视角的厘兵分数）
+            if uci_score is not None:
+                if abs(uci_score) >= 29000:
+                    # 将杀局面
+                    mate_in = (30000 - abs(uci_score)) // 100
+                    uci_eval = f"M{mate_in}" if uci_score > 0 else f"-M{mate_in}"
+                else:
+                    # 转换为更直观的分数（厘兵/100 = 兵）
+                    uci_eval = f"{uci_score/100:+.2f}"
+                eval_parts.append(f"UCI: {uci_eval}")
+            
+            # 上一着信息
+            eval_parts.append(f"着法: {last_move_uci or '无'}")
+            
+            eval_str = " | ".join(eval_parts) if eval_parts else f"着法: {last_move_uci or '无'}"
 
             # 为回放渲染临时视图
             if replay_idx is not None:
@@ -620,8 +751,23 @@ def create_ui():
                 svg = render_svg(temp_game)
             else:
                 svg = render_svg(game)
-            move_list_md = build_replay_markdown(snapshots, replay_idx)
-            return svg, status, board_to_fen(board, current_player), eval_str, move_list_md
+            
+            # 构建历史走法下拉选项
+            choices, current_choice = build_replay_choices(snapshots, replay_idx)
+            
+            # 暂停/继续按钮的可见性
+            pause_visible = not game.paused
+            continue_visible = game.paused
+            
+            return (
+                svg, 
+                status, 
+                board_to_fen(board, current_player), 
+                eval_str, 
+                gr.update(choices=choices, value=current_choice),
+                gr.update(visible=pause_visible),
+                gr.update(visible=continue_visible)
+            )
 
         def ai_step():
             if game.state.game_over:
@@ -632,6 +778,12 @@ def create_ui():
             max_auto_plies = 200
             plies = 0
             while not game.state.game_over:
+                # 检查暂停状态
+                if game.paused:
+                    print(f"[AI] 已暂停 (step={game.state.step_count})")
+                    yield update()
+                    return
+                
                 t = game.red_type if game.state.current_player == 0 else game.black_type
                 if t == "Human":
                     break
@@ -682,8 +834,12 @@ def create_ui():
 
         def on_click(r, c):
             try:
-                game.state.replay_index = None
                 r, c = int(r), int(c)
+                
+                # 如果在回放模式，先恢复到该历史局面（分叉走棋）
+                if game.state.replay_index is not None:
+                    game.fork_from_replay()
+                
                 s = game.state
                 p = s.board[r, c]
                 own = (s.current_player == 0 and p > 0) or (s.current_player == 1 and p < 0)
@@ -712,6 +868,8 @@ def create_ui():
                             if mask[move_to_action(r*9+c, tr*9+tc)]: s.legal_moves.append((tr, tc))
             except Exception as e:
                 print(f"Click logic error: {e}")
+                import traceback
+                traceback.print_exc()
             yield update()
 
         def handle_load_ai(d, s):
@@ -789,12 +947,23 @@ def create_ui():
             print(f"[AI] 延迟已设置为 {game.ai_delay} 秒")
             return update()
 
+        def handle_red_type_change(t):
+            """红方类型变化时实时更新"""
+            game.red_type = t
+            print(f"[设置] 红方类型: {t}")
+
+        def handle_black_type_change(t):
+            """黑方类型变化时实时更新"""
+            game.black_type = t
+            print(f"[设置] 黑方类型: {t}")
+
         def handle_init():
             # 初始化时自动刷新一次检查点列表
             steps = list_checkpoints("checkpoints")
             game.new_game()
             u = update()
-            return u[0], u[1], u[2], u[3], u[4], gr.update(
+            # u 包含 7 个元素: svg, status, fen, eval, replay_dropdown, pause_btn, continue_btn
+            return u[0], u[1], u[2], u[3], u[4], u[5], u[6], gr.update(
                 choices=[str(s) for s in steps],
                 value=str(steps[0]) if steps else None
             )
@@ -803,6 +972,7 @@ def create_ui():
             game.red_type = r
             game.black_type = b
             game.state.replay_index = None
+            game.paused = False  # 新局重置暂停状态
             fen = f.strip() if isinstance(f, str) else ""
             try:
                 game.new_game(fen if fen else STARTING_FEN)
@@ -845,16 +1015,59 @@ def create_ui():
             game.state.replay_index = None
             return update()
 
+        def handle_pause():
+            """暂停：设置暂停状态（此事件会取消正在执行的 AI 走棋）"""
+            game.paused = True
+            print(f"[AI] 已暂停 (step={game.state.step_count})")
+            return update()
+        
+        def handle_continue():
+            """继续：取消暂停并继续 AI 走棋"""
+            game.paused = False
+            print(f"[AI] 继续走棋 (step={game.state.step_count})")
+            yield from ai_step()
+
+        def handle_replay_select(choice):
+            """通过下拉列表选择跳转到某一步"""
+            if not choice:
+                return update()
+            # 解析选中的步数，格式: "第N步: ..."
+            try:
+                step_str = choice.split(":")[0]  # "第N步"
+                step_num = int(step_str.replace("第", "").replace("步", ""))
+                game.state.replay_index = step_num
+                print(f"[回放] 跳转到第 {step_num} 步")
+            except Exception as e:
+                print(f"[回放] 解析失败: {choice}, err={e}")
+            return update()
+
         # --- 事件绑定 ---
-        ui_outputs = [board_svg, status_box, fen_current, eval_box, replay_list]
+        ui_outputs = [board_svg, status_box, fen_current, eval_box, replay_dropdown, pause_btn, continue_btn]
         
-        click_btn.click(on_click, [click_r, click_c], ui_outputs)
+        # 包含 AI 走棋的事件（需要能被暂停按钮取消）
+        click_event = click_btn.click(on_click, [click_r, click_c], ui_outputs)
         
-        new_btn.click(handle_new_game, [red_p, black_p, fen_box], ui_outputs)
+        # 红黑方类型变化时实时更新
+        red_p.change(handle_red_type_change, [red_p])
+        black_p.change(handle_black_type_change, [black_p])
+        
+        new_game_event = new_btn.click(handle_new_game, [red_p, black_p, fen_box], ui_outputs)
         undo_btn.click(handle_undo, outputs=ui_outputs)
+        
+        # 继续按钮：继续 AI 走棋（也需要能被暂停取消）
+        continue_event = continue_btn.click(handle_continue, outputs=ui_outputs)
+        
+        # 暂停按钮：取消正在执行的 AI 走棋事件
+        pause_btn.click(
+            handle_pause, 
+            outputs=ui_outputs,
+            cancels=[click_event, new_game_event, continue_event]
+        )
+        
         replay_prev.click(handle_replay_prev, outputs=ui_outputs)
         replay_next.click(handle_replay_next, outputs=ui_outputs)
         replay_current.click(handle_replay_current, outputs=ui_outputs)
+        replay_dropdown.change(handle_replay_select, [replay_dropdown], ui_outputs)
         
         refresh_ckpt.click(handle_refresh_ckpt, [ckpt_dir], [ckpt_dropdown])
         
