@@ -537,11 +537,11 @@ class ChessGame:
             print(f"[UCI] bestmove 解析失败: {bm}, err={e}")
             return None
         
-        # 保存 UCI 评估分数（转换为红方视角）
+        # 保存 UCI 评估分数（原始值，当前走棋方视角，正值对走棋方有利）
         if score_cp is not None:
-            # UCI 分数是当前走棋方视角，转换为红方视角存储
-            self.state.uci_score = score_cp if self.state.current_player == 0 else -score_cp
-            print(f"[UCI] score={score_cp}cp (红方视角: {self.state.uci_score}cp)")
+            self.state.uci_score = score_cp
+            player_name = "红方" if self.state.current_player == 0 else "黑方"
+            print(f"[UCI] score={score_cp}cp ({player_name}视角)")
         
         # 验证动作有效性，move_to_action 返回 -1 表示无效
         action = int(move_to_action(f, t))
@@ -723,20 +723,36 @@ def create_ui():
             eval_parts = []
             
             # ZeroForge AI 评估（ai_value 范围 [-1, 1]，正值对红方有利）
+            # 根据 AI 所属方显示对应胜率
             if game.model_mgr.params is not None:
-                winrate = (ai_value + 1) / 2 * 100
-                eval_parts.append(f"ZeroForge: 红{winrate:.1f}%")
+                red_winrate = (ai_value + 1) / 2 * 100
+                black_winrate = 100 - red_winrate
+                # 判断 ZeroForge AI 是哪一方
+                if game.red_type == "ZeroForge AI" and game.black_type != "ZeroForge AI":
+                    eval_parts.append(f"ZeroForge(红): {red_winrate:.1f}%")
+                elif game.black_type == "ZeroForge AI" and game.red_type != "ZeroForge AI":
+                    eval_parts.append(f"ZeroForge(黑): {black_winrate:.1f}%")
+                else:
+                    # 双方都是 AI 或都不是，显示红方胜率
+                    eval_parts.append(f"AI评估: 红{red_winrate:.1f}%")
             
-            # UCI 引擎评估（uci_score 已转换为红方视角的厘兵分数）
+            # UCI 引擎评估（原始厘兵分数，正值对当前走棋方有利）
             if uci_score is not None:
+                # 判断 UCI 引擎是哪一方
+                if game.red_type == "UCI Engine" and game.black_type != "UCI Engine":
+                    uci_side = "红"
+                elif game.black_type == "UCI Engine" and game.red_type != "UCI Engine":
+                    uci_side = "黑"
+                else:
+                    uci_side = ""
+                
                 if abs(uci_score) >= 29000:
                     # 将杀局面
                     mate_in = (30000 - abs(uci_score)) // 100
                     uci_eval = f"M{mate_in}" if uci_score > 0 else f"-M{mate_in}"
                 else:
-                    # 转换为更直观的分数（厘兵/100 = 兵）
-                    uci_eval = f"{uci_score/100:+.2f}"
-                eval_parts.append(f"UCI: {uci_eval}")
+                    uci_eval = f"{uci_score:+d}cp"
+                eval_parts.append(f"UCI({uci_side}): {uci_eval}")
             
             # 上一着信息
             eval_parts.append(f"着法: {last_move_uci or '无'}")
