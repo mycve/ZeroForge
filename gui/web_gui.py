@@ -1035,6 +1035,9 @@ def create_ui():
             try:
                 step_str = choice.split(":")[0]  # "第N步"
                 step_num = int(step_str.replace("第", "").replace("步", ""))
+                # 避免重复设置相同的步数
+                if game.state.replay_index == step_num:
+                    return update()
                 game.state.replay_index = step_num
                 print(f"[回放] 跳转到第 {step_num} 步")
             except Exception as e:
@@ -1044,18 +1047,24 @@ def create_ui():
         # --- 事件绑定 ---
         ui_outputs = [board_svg, status_box, fen_current, eval_box, replay_dropdown, pause_btn, continue_btn]
         
-        # 包含 AI 走棋的事件（需要能被暂停按钮取消）
+        # 包含 AI 走棋的事件（需要能被取消）
         click_event = click_btn.click(on_click, [click_r, click_c], ui_outputs)
         
         # 红黑方类型变化时实时更新
         red_p.change(handle_red_type_change, [red_p])
         black_p.change(handle_black_type_change, [black_p])
         
-        new_game_event = new_btn.click(handle_new_game, [red_p, black_p, fen_box], ui_outputs)
-        undo_btn.click(handle_undo, outputs=ui_outputs)
-        
-        # 继续按钮：继续 AI 走棋（也需要能被暂停取消）
+        # 继续按钮：继续 AI 走棋
         continue_event = continue_btn.click(handle_continue, outputs=ui_outputs)
+        
+        # 新开局：取消所有正在执行的 AI 走棋事件，避免多个游戏同时运行
+        new_game_event = new_btn.click(
+            handle_new_game, 
+            [red_p, black_p, fen_box], 
+            ui_outputs,
+            cancels=[click_event, continue_event]  # 取消旧游戏的事件
+        )
+        undo_btn.click(handle_undo, outputs=ui_outputs)
         
         # 暂停按钮：取消正在执行的 AI 走棋事件
         pause_btn.click(
