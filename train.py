@@ -53,22 +53,22 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构
-    num_channels: int = 128
-    num_blocks: int = 8
+    num_channels: int = 96
+    num_blocks: int = 6
     
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 1024
-    td_steps: int = 10   # 缩短 TD 步数，减少价值估计方差
+    td_steps: int = 5   # 缩短 TD 步数，减少价值估计方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 2048
-    num_simulations: int = 64           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 32
+    selfplay_batch_size: int = 512
+    num_simulations: int = 48           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 16
     
     # 经验回放配置
     replay_buffer_size: int = 3000000
-    sample_reuse_times: int = 8
+    sample_reuse_times: int = 2
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
@@ -76,7 +76,7 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则
-    max_steps: int = 200
+    max_steps: int = 150
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
