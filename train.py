@@ -76,7 +76,7 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则
-    max_steps: int = 150
+    max_steps: int = 200
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
