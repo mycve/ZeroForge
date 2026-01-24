@@ -28,13 +28,13 @@ from xiangqi.rules import (
 # ============================================================================
 
 # 历史步数
-NUM_HISTORY_STEPS = 16
+NUM_HISTORY_STEPS = 8
 
 # 每步的通道数: 7种棋子 × 2方 = 14
 CHANNELS_PER_STEP = 14
 
-# 总观察通道数: (16历史 + 1当前) × 14棋子 + 1当前玩家 + 1步数 = 240
-NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP + 2
+# 总观察通道数: (8历史 + 1当前) × 14棋子 = 126
+NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP
 
 # 重复局面检测: 保存最近 N 步的局面哈希
 POSITION_HISTORY_SIZE = 256
@@ -74,7 +74,7 @@ class XiangqiState:
     # 胜者: -1=未结束/平局, 0=红胜, 1=黑胜
     winner: jnp.int32
     
-    # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=三次重复, 4=长将
+    # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=重复局面, 4=长将判负, 5=无进攻子力
     draw_reason: jnp.int32
     
     # === 违规检测相关 ===
@@ -171,6 +171,58 @@ def count_repetitions(position_hash: jnp.int32,
     valid_mask = jnp.arange(POSITION_HISTORY_SIZE) < valid_count
     matches = (position_hashes == position_hash) & valid_mask
     return jnp.sum(matches) + 1  # +1 包括当前局面
+
+
+@jax.jit
+def has_attacking_pieces(board: jnp.ndarray, player: jnp.int32) -> jnp.bool_:
+    """
+    检查指定玩家是否有进攻子力（车、马、炮、兵/卒）
+    
+    进攻子力定义：车(5)、马(4)、炮(6)、兵/卒(7)
+    帅/将(1)、仕/士(2)、相/象(3) 不算进攻子力
+    
+    Args:
+        board: 棋盘状态 (10, 9)
+        player: 玩家 (0=红方, 1=黑方)
+        
+    Returns:
+        是否有进攻子力
+    """
+    # 红方棋子为正，黑方棋子为负
+    # 进攻子力：车(±5)、马(±4)、炮(±6)、兵/卒(±7)
+    if_red = player == 0
+    
+    # 红方进攻子力
+    red_rook = jnp.sum(board == R_ROOK)      # 车 (5)
+    red_knight = jnp.sum(board == R_KNIGHT)  # 马 (4)
+    red_cannon = jnp.sum(board == R_CANNON)  # 炮 (6)
+    red_pawn = jnp.sum(board == R_PAWN)      # 兵 (7)
+    red_attacking = red_rook + red_knight + red_cannon + red_pawn
+    
+    # 黑方进攻子力
+    black_rook = jnp.sum(board == B_ROOK)      # 车 (-5)
+    black_knight = jnp.sum(board == B_KNIGHT)  # 马 (-4)
+    black_cannon = jnp.sum(board == B_CANNON)  # 炮 (-6)
+    black_pawn = jnp.sum(board == B_PAWN)      # 卒 (-7)
+    black_attacking = black_rook + black_knight + black_cannon + black_pawn
+    
+    return jnp.where(if_red, red_attacking > 0, black_attacking > 0)
+
+
+@jax.jit
+def no_attacking_pieces(board: jnp.ndarray) -> jnp.bool_:
+    """
+    检查双方是否都没有进攻子力（自动判和条件）
+    
+    Args:
+        board: 棋盘状态 (10, 9)
+        
+    Returns:
+        True 如果双方都没有进攻子力
+    """
+    red_has = has_attacking_pieces(board, jnp.int32(0))
+    black_has = has_attacking_pieces(board, jnp.int32(1))
+    return ~red_has & ~black_has
 
 
 # ============================================================================
@@ -317,9 +369,10 @@ class XiangqiEnv:
             # 检查基本游戏结束条件 (将死/困毙)
             game_over, winner = is_game_over(new_board, new_player)
             
-            # 检查和棋条件: 步数限制、无吃子限制
-            is_max_steps = new_step_count >= self.max_steps
-            is_no_capture = new_no_capture >= self.max_no_capture_steps
+            # 检查和棋条件
+            is_max_steps = new_step_count >= self.max_steps           # 总步数限制
+            is_no_capture = new_no_capture >= self.max_no_capture_steps  # 无吃子限制
+            is_no_attackers = no_attacking_pieces(new_board)          # 双方无进攻子力
             
             # 6. 长将判负规则（符合正式比赛规则）
             # 只有当【局面重复】且【当前处于将军状态】时，将军方（刚走的一方）判负
@@ -328,20 +381,23 @@ class XiangqiEnv:
             # 刚走的一方（state.current_player）是将军方，判负
             perpetual_check_winner = jnp.where(state.current_player == 0, 1, 0)  # 红方长将则黑胜
             
-            # 普通三次重复（非将军状态）算和棋
+            # 普通重复（非将军状态）算和棋
             is_normal_repetition = is_threefold_repetition & ~is_check
             
-            is_draw = is_max_steps | is_no_capture | is_normal_repetition
+            is_draw = is_max_steps | is_no_capture | is_normal_repetition | is_no_attackers
             
             # 记录结束原因
-            # 1=步数到限, 2=无吃子到限, 3=三次重复(和棋), 4=长将判负
+            # 1=步数到限, 2=无吃子到限, 3=重复局面(和棋), 4=长将判负, 5=无进攻子力
             new_draw_reason = jnp.where(
                 is_perpetual_check, 4,  # 长将判负
                 jnp.where(
-                    is_normal_repetition, 3,  # 普通重复和棋
+                    is_no_attackers, 5,  # 双方无进攻子力
                     jnp.where(
-                        is_no_capture, 2,
-                        jnp.where(is_max_steps, 1, 0)
+                        is_normal_repetition, 3,  # 重复局面和棋
+                        jnp.where(
+                            is_no_capture, 2,
+                            jnp.where(is_max_steps, 1, 0)
+                        )
                     )
                 )
             )
@@ -457,27 +513,8 @@ class XiangqiEnv:
         history_encoded = jax.vmap(encode_board)(history)
         history_flat = history_encoded.reshape(-1, BOARD_HEIGHT, BOARD_WIDTH)
         
-        # 合并 (240, 10, 9)
-        board_planes = jnp.concatenate([current_encoded, history_flat], axis=0)
-        
-        # 添加元信息平面
-        # 注意：视角归一化后，当前玩家“视角上”永远是 0 号玩家（红方位置）
-        # 但我们仍然保留一个平面，或者用它标记原始身份
-        player_plane = jnp.full(
-            (1, BOARD_HEIGHT, BOARD_WIDTH),
-            state.current_player,
-            dtype=jnp.float32
-        )
-        
-        # 步数 (归一化到 0-1)
-        step_plane = jnp.full(
-            (1, BOARD_HEIGHT, BOARD_WIDTH),
-            state.step_count / self.max_steps,
-            dtype=jnp.float32
-        )
-        
-        # 最终观察
-        observation = jnp.concatenate([board_planes, player_plane, step_plane], axis=0)
+        # 最终观察: 仅包含棋盘和历史平面 (126, 10, 9)
+        observation = jnp.concatenate([current_encoded, history_flat], axis=0)
         
         return observation
     

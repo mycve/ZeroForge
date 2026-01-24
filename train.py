@@ -36,8 +36,8 @@ os.environ["XLA_FLAGS"] = (
 # 3. 避免不需要的 64 位运算
 jax.config.update("jax_enable_x64", False)
 
-from xiangqi.env import XiangqiEnv
-from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE
+from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
+from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
 from xiangqi.mirror import mirror_observation, mirror_policy
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
@@ -63,22 +63,26 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 1024
-    num_simulations: int = 96           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 16
+    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 32
     
     # 经验回放配置
     replay_buffer_size: int = 3000000
-    sample_reuse_times: int = 2
+    sample_reuse_times: int = 4
+    
+    # 损失权重
+    value_loss_weight: float = 1.5
+    weight_decay: float = 1e-4
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
     temperature_initial: float = 1.0
     temperature_final: float = 0.01
     
-    # 环境规则
-    max_steps: int = 180
-    max_no_capture_steps: int = 60
-    repetition_threshold: int = 4
+    # 环境规则（符合象棋竞赛规则）
+    max_steps: int = 400              # 总步数 400 步（200回合）判和
+    max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和
+    repetition_threshold: int = 5     # 重复局面 5 次判和
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
     
     # ELO 评估
@@ -120,6 +124,7 @@ net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
+    dtype=jnp.bfloat16,
 )
 
 def forward(params, obs, is_training=False):
@@ -321,7 +326,7 @@ def loss_fn(params, samples: Sample, rng_key):
     # 价值损失 (n-step TD 目标)
     value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    total_loss = policy_loss + 1.0 * value_loss
+    total_loss = policy_loss + config.value_loss_weight * value_loss
     
     return total_loss, (policy_loss, value_loss)
 
@@ -678,18 +683,18 @@ def main():
     # 初始化经验回放缓冲区 (JAX 环形缓冲区)
     replay_buffer = ReplayBuffer(
         max_size=config.replay_buffer_size,
-        obs_shape=(240, 10, 9),
+        obs_shape=(NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH),
         action_size=ACTION_SPACE_SIZE
     )
     
     # 初始化模型模板 (用于恢复时的结构参考)
     rng_key = jax.random.PRNGKey(config.seed)
     rng_key, subkey = jax.random.split(rng_key)
-    dummy_obs = jnp.zeros((config.selfplay_batch_size // num_devices, 240, 10, 9))
+    dummy_obs = jnp.zeros((config.selfplay_batch_size // num_devices, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH))
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
     
-    optimizer = optax.adam(config.learning_rate)
+    optimizer = optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -749,11 +754,12 @@ def main():
         b_wins = int((first_term & (winner == 1)).sum())
         draws = int((first_term & (winner == -1)).sum())
         
-        # 2. 和棋原因 (1=步数, 2=无吃子, 3=重复, 4=长将)
+        # 2. 和棋原因 (1=步数, 2=无吃子, 3=重复, 4=长将, 5=无进攻子力)
         d_max_steps = int((first_term & (reasons == 1)).sum())
         d_no_capture = int((first_term & (reasons == 2)).sum())
         d_repetition = int((first_term & (reasons == 3)).sum())
         d_perpetual = int((first_term & (reasons == 4)).sum())
+        d_no_attackers = int((first_term & (reasons == 5)).sum())
         
         # 3. 对局长度
         game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
@@ -816,6 +822,7 @@ def main():
         writer.add_scalar("draw_reasons/no_capture", d_no_capture, iteration)
         writer.add_scalar("draw_reasons/repetition", d_repetition, iteration)
         writer.add_scalar("draw_reasons/perpetual_check", d_perpetual, iteration)
+        writer.add_scalar("draw_reasons/no_attackers", d_no_attackers, iteration)
         
         # === Checkpoint 保存 (使用 orbax 官方方案) ===
         if iteration % config.ckpt_interval == 0:
