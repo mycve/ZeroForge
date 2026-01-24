@@ -58,16 +58,16 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 1024
+    training_batch_size: int = 512
     # 使用 Monte Carlo 目标 (AlphaZero 原版方案)，不再需要 td_steps
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 1024
-    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 32
+    selfplay_batch_size: int = 512
+    num_simulations: int = 96           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 16
     
     # 经验回放配置
-    replay_buffer_size: int = 3000000
+    replay_buffer_size: int = 500000
     sample_reuse_times: int = 4
     
     # 损失权重
