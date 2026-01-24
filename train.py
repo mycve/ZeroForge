@@ -30,15 +30,11 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # 不管编�
 # --- XLA 编译加速建议 (无损方案) ---
 # 1. 允许 XLA 融合更多算子
 os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_enable_highest_priority_async_stream=true "
-    "--xla_gpu_enable_async_all_gather=true "
-    "--xla_gpu_enable_async_all_reduce=true "
+    "--xla_gpu_enable_highest_priority_async_stream=true"
 )
 # 2. 强制使用 32 位哈希 (已在 env.py 实现)
 # 3. 避免不需要的 64 位运算
 jax.config.update("jax_enable_x64", False)
-# 4. 启用异步调度，减少 Python → XLA 的同步开销
-jax.config.update("jax_threefry_partitionable", True)
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
