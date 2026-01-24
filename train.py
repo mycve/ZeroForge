@@ -53,18 +53,18 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构
-    num_channels: int = 96
-    num_blocks: int = 6
+    num_channels: int = 128
+    num_blocks: int = 8
     
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 1024
-    td_steps: int = 30   # 缩短 TD 步数，减少价值估计方差
+    # 使用 Monte Carlo 目标 (AlphaZero 原版方案)，不再需要 td_steps
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 512
-    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 32
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 96           # 增加模拟次数，提升关键局面搜索质量
+    top_k: int = 16
     
     # 经验回放配置
     replay_buffer_size: int = 3000000
@@ -72,11 +72,11 @@ class Config:
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
-    temperature_initial: float = 1.2
+    temperature_initial: float = 1.0
     temperature_final: float = 0.01
     
     # 环境规则
-    max_steps: int = 200
+    max_steps: int = 180
     max_no_capture_steps: int = 60
     repetition_threshold: int = 4
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
@@ -157,12 +157,12 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    root_value: jnp.ndarray  # MCTS 搜索后的根节点价值 (用于 TD bootstrap)
+    # 移除 root_value：MC 目标直接用游戏结果，不需要 bootstrap
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
-    value_tgt: jnp.ndarray  # n-step TD 目标
+    value_tgt: jnp.ndarray  # Monte Carlo 目标：游戏最终结果
     mask: jnp.ndarray
 
 # ============================================================================
@@ -198,7 +198,7 @@ def selfplay(params, rng_key):
         )
         
         action_weights = policy_output.action_weights
-        root_value = policy_output.search_tree.node_values[:, 0]
+        # MC 目标不需要 root_value，直接用游戏最终结果
         
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, config.temperature_final)
@@ -231,7 +231,6 @@ def selfplay(params, rng_key):
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
-            root_value=root_value,
         )
         
         next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(
@@ -245,40 +244,46 @@ def selfplay(params, rng_key):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """向量化 n-step TD 目标计算 (消除 Python 循环)"""
-    max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
-    n = config.td_steps
+    """Monte Carlo 目标计算 (AlphaZero 原版方案)
     
-    # 1. 严格对齐原始掩码逻辑
+    价值目标直接使用游戏最终结果，不做 bootstrap。
+    相比 TD，MC 目标：
+    - 无偏：直接使用真实游戏结果
+    - 避免早期价值网络不准导致的误差传播
+    - 更适合棋类等结果确定、奖励稀疏的游戏
+    """
+    max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
+    
+    # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # 2. 准备数据
-    padded_reward = jnp.concatenate([data.reward, jnp.zeros((n, batch_size))], axis=0)
-    padded_discount = jnp.concatenate([data.discount, jnp.zeros((n, batch_size))], axis=0)
-    padded_root_v = jnp.concatenate([data.root_value, jnp.zeros((n, batch_size))], axis=0)
+    # Monte Carlo 目标：从后向前传播游戏最终结果
+    # reward[t] = 第 t 步走完后的即时奖励（只有游戏结束时非零）
+    # discount[t] = -1 (继续，对手视角翻转) 或 0 (结束，切断传播)
+    #
+    # 递推公式：value[t] = reward[t] + discount[t] * value[t+1]
+    # - 游戏结束时 (discount=0): value[t] = reward[t]
+    # - 游戏继续时 (discount=-1): value[t] = reward[t] - value[t+1]
+    #   (对手的价值是我的负值，符号翻转)
     
-    # 使用 jax.lax.scan 向量化 TD 累加 (G_t = r_t + gamma_t * G_{t+1})
-    # 我们从末尾向前扫描
-    def scan_body(carry_v, t):
-        # 当前步的奖励和折扣
-        curr_r = padded_reward[t]
-        curr_d = padded_discount[t]
-        # 下一步的 G 值
-        next_v = curr_r + curr_d * carry_v
-        return next_v, next_v
-
-    # n-step TD 递归计算: G_t = r_t + γ_t * G_{t+1}
-    # 注：这里使用 Python 循环展开，因为：
-    # 1. td_steps 通常较小 (10-20)，展开开销可接受
-    # 2. JAX 切片要求静态索引，fori_loop 内的动态索引无法用于切片
-    res_val = padded_root_v[n : max_steps + n]
-    for i in reversed(range(n)):
-        res_val = padded_reward[i : max_steps + i] + padded_discount[i : max_steps + i] * res_val
-        
+    def scan_fn(carry, inputs):
+        reward_t, discount_t = inputs
+        # carry 是从后面传来的累积价值
+        value_t = reward_t + discount_t * carry
+        return value_t, value_t
+    
+    # 从最后一步向前扫描（反转时间顺序）
+    _, value_tgt_rev = jax.lax.scan(
+        scan_fn,
+        jnp.zeros(batch_size),  # 初始 carry = 0
+        (data.reward[::-1], data.discount[::-1])  # 反转输入
+    )
+    value_tgt = value_tgt_rev[::-1]  # 翻转回正序
+    
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
-        value_tgt=res_val,
+        value_tgt=value_tgt,
         mask=value_mask,
     )
 
@@ -290,7 +295,7 @@ def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
     - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
-    - 价值损失：拟合 n-step TD 目标
+    - 价值损失：拟合 Monte Carlo 目标（游戏最终结果）
     """
     # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
     obs = samples.obs.astype(jnp.float32)
