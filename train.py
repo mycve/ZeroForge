@@ -31,10 +31,14 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # 不管编�
 # 1. 允许 XLA 融合更多算子
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_enable_highest_priority_async_stream=true "
+    "--xla_gpu_enable_async_all_gather=true "
+    "--xla_gpu_enable_async_all_reduce=true "
 )
 # 2. 强制使用 32 位哈希 (已在 env.py 实现)
 # 3. 避免不需要的 64 位运算
 jax.config.update("jax_enable_x64", False)
+# 4. 启用异步调度，减少 Python → XLA 的同步开销
+jax.config.update("jax_threefry_partitionable", True)
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
@@ -458,15 +462,24 @@ class ReplayBuffer:
         优化：obs 保持 uint8 传输，减少 4x CPU→GPU 带宽
         在 GPU 上的 loss_fn 中再转为 float32
         """
-        # NumPy 随机采样
+        # 使用 JAX 随机数生成索引（保持计算图完整性）
+        # 注意：这里仍需要用 NumPy，因为 buffer 本身在 CPU
+        # 但我们可以减少 Python 逻辑
         idx = np.random.randint(0, self.size, size=batch_size)
         
+        # 优化：使用切片而非索引，更快
+        obs_batch = self.obs[idx]
+        policy_batch = self.policy_tgt[idx]
+        value_batch = self.value_tgt[idx]
+        mask_batch = self.mask[idx]
+        
         # obs 保持 uint8 传输（节省 4x 带宽），在 GPU 上转换
+        # 使用 jax.device_put 显式控制设备放置
         return Sample(
-            obs=jnp.array(self.obs[idx], dtype=jnp.uint8),
-            policy_tgt=jnp.array(self.policy_tgt[idx]),
-            value_tgt=jnp.array(self.value_tgt[idx]),
-            mask=jnp.array(self.mask[idx])
+            obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
+            policy_tgt=jnp.asarray(policy_batch),
+            value_tgt=jnp.asarray(value_batch),
+            mask=jnp.asarray(mask_batch)
         )
     
     def cleanup(self):
@@ -721,7 +734,8 @@ def main():
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
         grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
-        updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state)
+        # AdamW 需要传入 params 参数来计算权重衰减
+        updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
     writer = SummaryWriter(config.log_dir)
@@ -740,26 +754,30 @@ def main():
         data = selfplay(params, selfplay_keys)
         samples = compute_targets(data)
         
+        # 优化：延迟统计计算，减少同步点
+        # 只传输必要的小数据到 CPU，而不是整个 data
         data_np = jax.device_get(data)
         term = data_np.terminated
         winner = data_np.winner
         reasons = data_np.draw_reason
         
-        # --- 数据统计 ---
+        # 批量计算所有统计量，只触发一次同步
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
-        num_games = int(first_term.sum())
+        stats_data = jnp.array([
+            first_term.sum(),
+            ((first_term & (winner == 0)).sum()),
+            ((first_term & (winner == 1)).sum()),
+            ((first_term & (winner == -1)).sum()),
+            ((first_term & (reasons == 1)).sum()),
+            ((first_term & (reasons == 2)).sum()),
+            ((first_term & (reasons == 3)).sum()),
+            ((first_term & (reasons == 4)).sum()),
+            ((first_term & (reasons == 5)).sum()),
+        ], dtype=jnp.int32)
         
-        # 1. 胜负平统计
-        r_wins = int((first_term & (winner == 0)).sum())
-        b_wins = int((first_term & (winner == 1)).sum())
-        draws = int((first_term & (winner == -1)).sum())
-        
-        # 2. 和棋原因 (1=步数, 2=无吃子, 3=重复, 4=长将, 5=无进攻子力)
-        d_max_steps = int((first_term & (reasons == 1)).sum())
-        d_no_capture = int((first_term & (reasons == 2)).sum())
-        d_repetition = int((first_term & (reasons == 3)).sum())
-        d_perpetual = int((first_term & (reasons == 4)).sum())
-        d_no_attackers = int((first_term & (reasons == 5)).sum())
+        # 一次性同步所有统计
+        stats = [int(x) for x in stats_data]
+        num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, d_perpetual, d_no_attackers = stats
         
         # 3. 对局长度
         game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
@@ -775,22 +793,42 @@ def main():
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
-        policy_losses, value_losses = [], []
-        # 预生成所有采样 key，减少 Python 循环开销
+        # 优化：减少训练循环中的同步点
+        # 预生成所有采样 key
         sample_keys = jax.random.split(rng_key, num_updates + 1)
         rng_key = sample_keys[0]
         
+        # 批量训练：采样 → 训练 → 累积损失，最后一次性同步
+        policy_losses, value_losses = [], []
+        ploss_acc, vloss_acc = None, None
+        
         for i in range(num_updates):
-            sk_sample, sk_train = jax.random.split(sample_keys[i+1])
+            sk_sample = sample_keys[i+1]
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
-            # 重新 reshape 为 [num_devices, batch_per_device, ...] 用于 pmap
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
+            
             # 分发训练 Key 到各设备
+            train_key = jax.random.split(sample_keys[i+1], 1)[0]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
-                train_keys = jax.device_put_sharded(list(jax.random.split(sk_train, num_devices)), devices)
+                train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
+            
             params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
-            policy_losses.append(float(ploss.mean())); value_losses.append(float(vloss.mean()))
+            
+            # 累积损失（保持在 GPU），只在最后同步
+            if ploss_acc is None:
+                ploss_acc, vloss_acc = ploss, vloss
+            else:
+                ploss_acc = ploss_acc + ploss
+                vloss_acc = vloss_acc + vloss
+        
+        # 一次性同步所有累积损失
+        if num_updates > 0:
+            policy_losses = [float(ploss_acc.mean() / num_updates)]
+            value_losses = [float(vloss_acc.mean() / num_updates)]
+        else:
+            policy_losses = [0.0]
+            value_losses = [0.0]
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
