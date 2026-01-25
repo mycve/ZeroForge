@@ -59,7 +59,7 @@ class Config:
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    # 使用 Monte Carlo 目标 (AlphaZero 原版方案)，不再需要 td_steps
+    td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
@@ -80,7 +80,7 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 120              # 总步数 400 步（200回合）判和
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和
     repetition_threshold: int = 5     # 重复局面 5 次判和
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
@@ -162,12 +162,12 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    # 移除 root_value：MC 目标直接用游戏结果，不需要 bootstrap
+    root_value: jnp.ndarray  # MCTS 搜索后的价值估计，用于 n-step TD bootstrap
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
-    value_tgt: jnp.ndarray  # Monte Carlo 目标：游戏最终结果
+    value_tgt: jnp.ndarray  # TD(λ) 目标：加权平均的 λ-return
     mask: jnp.ndarray
 
 # ============================================================================
@@ -203,7 +203,9 @@ def selfplay(params, rng_key):
         )
         
         action_weights = policy_output.action_weights
-        # MC 目标不需要 root_value，直接用游戏最终结果
+        # MCTS 搜索完成后根节点的价值估计，作为 n-step TD 的 bootstrap 目标
+        # node_values 形状: (batch, num_nodes)，索引 0 是根节点
+        root_value = policy_output.search_tree.node_values[:, 0]
         
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, config.temperature_final)
@@ -236,6 +238,7 @@ def selfplay(params, rng_key):
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
+            root_value=root_value,  # MCTS 搜索后的价值估计
         )
         
         next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(
@@ -249,39 +252,42 @@ def selfplay(params, rng_key):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """Monte Carlo 目标计算 (AlphaZero 原版方案)
+    """TD(λ) 目标计算 - 加权平均所有 n-step 回报
     
-    价值目标直接使用游戏最终结果，不做 bootstrap。
-    相比 TD，MC 目标：
-    - 无偏：直接使用真实游戏结果
-    - 避免早期价值网络不准导致的误差传播
-    - 更适合棋类等结果确定、奖励稀疏的游戏
+    TD(λ) 结合了 TD 和 MC 的优点：
+    - λ=0: 纯 TD(0)，只用一步 bootstrap，收敛快但偏差大
+    - λ=1: 纯 MC，用整局结果，无偏但方差大
+    - λ=0.95: 加权平均，兼顾两者，是最常用的选择
+    
+    递推公式（从后向前）：
+    G_t^λ = r_t + d_t * ((1-λ) * V(s_{t+1}) + λ * G_{t+1}^λ)
+    
+    当游戏结束时 d_t=0，自动截断为 G_t = r_t
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
+    lam = config.td_lambda
     
     # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # Monte Carlo 目标：从后向前传播游戏最终结果
-    # reward[t] = 第 t 步走完后的即时奖励（只有游戏结束时非零）
-    # discount[t] = -1 (继续，对手视角翻转) 或 0 (结束，切断传播)
-    #
-    # 递推公式：value[t] = reward[t] + discount[t] * value[t+1]
-    # - 游戏结束时 (discount=0): value[t] = reward[t]
-    # - 游戏继续时 (discount=-1): value[t] = reward[t] - value[t+1]
-    #   (对手的价值是我的负值，符号翻转)
-    
     def scan_fn(carry, inputs):
-        reward_t, discount_t = inputs
-        # carry 是从后面传来的累积价值
-        value_t = reward_t + discount_t * carry
-        return value_t, value_t
+        """从后向前计算 λ-return"""
+        reward_t, discount_t, value_next = inputs
+        # G_t^λ = r_t + d_t * ((1-λ) * V(s_{t+1}) + λ * G_{t+1}^λ)
+        # carry 是 G_{t+1}^λ，value_next 是 V(s_{t+1})
+        g_lambda = reward_t + discount_t * ((1.0 - lam) * value_next + lam * carry)
+        return g_lambda, g_lambda
     
-    # 从最后一步向前扫描（反转时间顺序）
+    # 从最后一步向前扫描
+    # 初始 carry = 0（游戏结束后的价值为 0）
+    # 注意：root_value[t] 是 s_t 的价值估计，我们需要 s_{t+1} 的价值估计来 bootstrap
+    # 所以用 root_value[1:] 作为 value_next，最后一步用 0
+    value_next = jnp.concatenate([data.root_value[1:], jnp.zeros((1, batch_size))], axis=0)
+    
     _, value_tgt_rev = jax.lax.scan(
         scan_fn,
         jnp.zeros(batch_size),  # 初始 carry = 0
-        (data.reward[::-1], data.discount[::-1])  # 反转输入
+        (data.reward[::-1], data.discount[::-1], value_next[::-1])  # 反转输入
     )
     value_tgt = value_tgt_rev[::-1]  # 翻转回正序
     
@@ -323,7 +329,7 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失 (n-step TD 目标)
+    # 价值损失 (TD(λ) 目标，λ加权平均兼顾收敛速度和稳定性)
     value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
@@ -684,7 +690,7 @@ def restore_checkpoint(
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: Pre-LN ResNet + SE + Global Pooling + Gumbel + 经验回放 + 断点续训")
+    print("特性: Pre-LN ResNet + SE + Global Pooling + Gumbel + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
