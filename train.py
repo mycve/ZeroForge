@@ -80,10 +80,10 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 总步数 400 步（200回合）判和
-    max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和
-    repetition_threshold: int = 3     # 重复局面 3 次判和
-    # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
+    max_steps: int = 400              # 总步数 400 步（200回合）判和
+    max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
+    repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
+    # 长将/长捉规则已在 violation_rules.py 中实现
     
     # ELO 评估
     eval_interval: int = 20
@@ -764,22 +764,29 @@ def main():
         reasons = data_np.draw_reason
         
         # 批量计算所有统计量，只触发一次同步
+        # 结束原因编码：
+        # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
+        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         stats_data = jnp.array([
-            first_term.sum(),
-            ((first_term & (winner == 0)).sum()),
-            ((first_term & (winner == 1)).sum()),
-            ((first_term & (winner == -1)).sum()),
-            ((first_term & (reasons == 1)).sum()),
-            ((first_term & (reasons == 2)).sum()),
-            ((first_term & (reasons == 3)).sum()),
-            ((first_term & (reasons == 4)).sum()),
-            ((first_term & (reasons == 5)).sum()),
+            first_term.sum(),                              # 总对局数
+            ((first_term & (winner == 0)).sum()),          # 红胜
+            ((first_term & (winner == 1)).sum()),          # 黑胜
+            ((first_term & (winner == -1)).sum()),         # 和棋
+            ((first_term & (reasons == 1)).sum()),         # 步数到限
+            ((first_term & (reasons == 2)).sum()),         # 无吃子到限
+            ((first_term & (reasons == 3)).sum()),         # 重复局面和棋
+            ((first_term & (reasons == 4)).sum()),         # 长将判负
+            ((first_term & (reasons == 5)).sum()),         # 无进攻子力
+            ((first_term & (reasons == 6)).sum()),         # 长捉判负
+            ((first_term & (reasons == 7)).sum()),         # 将捉交替判负
+            ((first_term & (reasons == 8)).sum()),         # 将死/困毙
         ], dtype=jnp.int32)
         
         # 一次性同步所有统计
         stats = [int(x) for x in stats_data]
-        num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, d_perpetual, d_no_attackers = stats
+        (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, 
+         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = stats
         
         # 3. 对局长度
         game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
@@ -857,12 +864,15 @@ def main():
         writer.add_scalar("games/draws", draws, iteration)
         writer.add_scalar("games/total", num_games, iteration)
         
-        # 和棋原因 (数量)
-        writer.add_scalar("draw_reasons/max_steps", d_max_steps, iteration)
-        writer.add_scalar("draw_reasons/no_capture", d_no_capture, iteration)
-        writer.add_scalar("draw_reasons/repetition", d_repetition, iteration)
-        writer.add_scalar("draw_reasons/perpetual_check", d_perpetual, iteration)
-        writer.add_scalar("draw_reasons/no_attackers", d_no_attackers, iteration)
+        # 结束原因统计 (数量)
+        writer.add_scalar("end_reasons/max_steps", d_max_steps, iteration)
+        writer.add_scalar("end_reasons/no_capture", d_no_capture, iteration)
+        writer.add_scalar("end_reasons/repetition_draw", d_repetition, iteration)
+        writer.add_scalar("end_reasons/perpetual_check", d_perpetual, iteration)
+        writer.add_scalar("end_reasons/no_attackers", d_no_attackers, iteration)
+        writer.add_scalar("end_reasons/perpetual_chase", d_perpetual_chase, iteration)
+        writer.add_scalar("end_reasons/check_chase_alt", d_check_chase_alt, iteration)
+        writer.add_scalar("end_reasons/checkmate", d_checkmate, iteration)
         
         # === Checkpoint 保存 (使用 orbax 官方方案) ===
         if iteration % config.ckpt_interval == 0:

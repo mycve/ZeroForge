@@ -22,6 +22,10 @@ from xiangqi.rules import (
     get_initial_board, apply_move, is_legal_move, is_game_over,
     get_legal_moves_mask, is_in_check, get_piece_type,
 )
+from xiangqi.violation_rules import (
+    is_chase_move, count_checking_pieces, check_violation,
+    update_no_capture_check_count, MAX_CHECK_IN_NO_CAPTURE,
+)
 
 # ============================================================================
 # 配置常量
@@ -74,22 +78,34 @@ class XiangqiState:
     # 胜者: -1=未结束/平局, 0=红胜, 1=黑胜
     winner: jnp.int32
     
-    # 和棋原因: 0=未结束/非和棋, 1=步数到限, 2=无吃子到限, 3=重复局面, 4=长将判负, 5=无进攻子力
+    # 结束原因: 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
+    #          4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
     draw_reason: jnp.int32
     
-    # === 违规检测相关 ===
+    # === 重复局面检测 ===
     
-    # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32 - 用于重复局面检测
+    # 局面哈希历史 (POSITION_HISTORY_SIZE,) int32
     position_hashes: jnp.ndarray
     
     # 当前有效哈希数量
     hash_count: jnp.int32
     
-    # 红方连续将军次数
-    red_consecutive_checks: jnp.int32
+    # === 违规检测相关（长将/长捉/将捉交替）===
     
-    # 黑方连续将军次数
-    black_consecutive_checks: jnp.int32
+    # 红方违规计数
+    red_check_count: jnp.int32       # 红方连续将军回合数
+    red_chase_count: jnp.int32       # 红方连续捉子回合数
+    red_alt_count: jnp.int32         # 红方将捉交替回合数
+    red_max_check_pieces: jnp.int32  # 红方长将中参与将军的最大子数
+    
+    # 黑方违规计数
+    black_check_count: jnp.int32
+    black_chase_count: jnp.int32
+    black_alt_count: jnp.int32
+    black_max_check_pieces: jnp.int32
+    
+    # 无吃子期间的将军步数（用于60回合判和中将军最多20回合的规则）
+    check_in_no_capture: jnp.int32
     
     # === 搜索辅助 (不影响环境逻辑) ===
     # 标记当前搜索归属于哪个模型 (0=model_red/当前模型, 1=model_black/历史模型)
@@ -237,9 +253,8 @@ class XiangqiEnv:
     def __init__(
         self, 
         max_steps: int = 400,
-        max_no_capture_steps: int = 60,
-        repetition_threshold: int = 4,
-        perpetual_check_threshold: int = 6  # 已废弃，保留向后兼容
+        max_no_capture_steps: int = 120,
+        repetition_threshold: int = 5,  # 非将非捉重复局面5次判和
     ):
         self.num_players = 2
         self.action_space_size = ACTION_SPACE_SIZE
@@ -249,8 +264,10 @@ class XiangqiEnv:
         self.max_steps = max_steps
         self.max_no_capture_steps = max_no_capture_steps
         self.repetition_threshold = repetition_threshold
-        # 注：perpetual_check_threshold 已废弃，现在使用"重复局面+将军=长将判负"规则
-        # 允许连将杀：连续将军只要不重复局面，最终将死对方即可
+        # 长将/长捉规则参数（符合正式比赛规则）
+        # 长将：1子6回合、2子12回合、3子+18回合
+        # 长捉：6回合
+        # 将捉交替：1子12回合、多子18回合
     
     @partial(jax.jit, static_argnums=(0,))
     def init(self, key: jax.random.PRNGKey) -> XiangqiState:
@@ -284,11 +301,22 @@ class XiangqiEnv:
             no_capture_count=jnp.int32(0),
             winner=jnp.int32(-1),
             draw_reason=jnp.int32(0),
-            # 违规检测
+            # 重复局面检测
             position_hashes=position_hashes,
             hash_count=jnp.int32(1),
-            red_consecutive_checks=jnp.int32(0),
-            black_consecutive_checks=jnp.int32(0),
+            # 红方违规计数
+            red_check_count=jnp.int32(0),
+            red_chase_count=jnp.int32(0),
+            red_alt_count=jnp.int32(0),
+            red_max_check_pieces=jnp.int32(0),
+            # 黑方违规计数
+            black_check_count=jnp.int32(0),
+            black_chase_count=jnp.int32(0),
+            black_alt_count=jnp.int32(0),
+            black_max_check_pieces=jnp.int32(0),
+            # 无吃子期间将军计数
+            check_in_no_capture=jnp.int32(0),
+            # 搜索辅助
             search_model_index=jnp.int32(0),
         )
     
@@ -318,7 +346,6 @@ class XiangqiEnv:
             is_capture = captured_piece != EMPTY
             
             # 更新历史
-            # 将当前棋盘推入历史，移除最老的一步
             new_history = jnp.concatenate([
                 state.board[jnp.newaxis, :, :],
                 state.history[:-1, :, :]
@@ -332,101 +359,137 @@ class XiangqiEnv:
             
             # 更新步数
             new_step_count = state.step_count + 1
-            new_no_capture = jnp.where(is_capture, 0, state.no_capture_count + 1)
             
-            # ========== 违规检测 ==========
+            # ========== 重复局面检测 ==========
             
-            # 1. 计算新局面哈希
             new_hash = compute_position_hash(new_board, new_player)
-            
-            # 2. 更新哈希历史 (循环缓冲区)
-            # hash_count 持续增长用于统计，索引时取模实现环形覆盖
             hash_idx = state.hash_count % POSITION_HISTORY_SIZE
             new_position_hashes = state.position_hashes.at[hash_idx].set(new_hash)
             new_hash_count = state.hash_count + 1
             
-            # 3. 检测重复局面
             repetitions = count_repetitions(new_hash, state.position_hashes, state.hash_count)
-            is_threefold_repetition = repetitions >= self.repetition_threshold
+            is_fivefold_repetition = repetitions >= self.repetition_threshold
             
-            # 4. 检测将军状态 (对方是否被将军)
+            # ========== 将军检测 ==========
+            
             is_check = is_in_check(new_board, new_player)
+            checking_pieces = jnp.where(is_check, count_checking_pieces(new_board, state.current_player), jnp.int32(0))
             
-            # 5. 更新连续将军计数（用于统计，不用于判负）
-            new_red_checks = jnp.where(
-                state.current_player == 0,  # 红方刚走
-                jnp.where(is_check, state.red_consecutive_checks + 1, jnp.int32(0)),
-                state.red_consecutive_checks
+            # ========== 捉子检测 ==========
+            
+            is_chase, chased_sq, chased_type = is_chase_move(
+                state.board, new_board, from_sq, to_sq, state.current_player
             )
-            new_black_checks = jnp.where(
-                state.current_player == 1,  # 黑方刚走
-                jnp.where(is_check, state.black_consecutive_checks + 1, jnp.int32(0)),
-                state.black_consecutive_checks
+            # 将军时不算捉（将优先于捉）
+            is_chase = is_chase & ~is_check
+            
+            # ========== 违规检测（长将/长捉/将捉交替）==========
+            
+            (
+                violation_type, violator,
+                new_red_check, new_red_chase, new_red_alt, new_red_max_pieces,
+                new_black_check, new_black_chase, new_black_alt, new_black_max_pieces,
+            ) = check_violation(
+                is_check=is_check,
+                is_chase=is_chase,
+                checking_pieces=checking_pieces,
+                is_capture=is_capture,
+                red_check_count=state.red_check_count,
+                red_chase_count=state.red_chase_count,
+                red_alt_count=state.red_alt_count,
+                red_max_check_pieces=state.red_max_check_pieces,
+                black_check_count=state.black_check_count,
+                black_chase_count=state.black_chase_count,
+                black_alt_count=state.black_alt_count,
+                black_max_check_pieces=state.black_max_check_pieces,
+                current_player=state.current_player,
+            )
+            
+            # ========== 无吃子和棋（含将军特殊处理）==========
+            
+            new_no_capture, new_check_in_no_capture, is_no_capture_draw = update_no_capture_check_count(
+                state.no_capture_count, state.check_in_no_capture, is_capture, is_check
             )
             
             # ========== 游戏结束判断 ==========
             
-            # 检查基本游戏结束条件 (将死/困毙)
-            game_over, winner = is_game_over(new_board, new_player)
+            # 基本结束条件 (将死/困毙)
+            basic_game_over, basic_winner = is_game_over(new_board, new_player)
             
-            # 检查和棋条件
-            is_max_steps = new_step_count >= self.max_steps           # 总步数限制
-            is_no_capture = new_no_capture >= self.max_no_capture_steps  # 无吃子限制
-            is_no_attackers = no_attacking_pieces(new_board)          # 双方无进攻子力
+            # 和棋条件
+            is_max_steps = new_step_count >= self.max_steps
+            is_no_attackers = no_attacking_pieces(new_board)
             
-            # 6. 长将判负规则（符合正式比赛规则）
-            # 只有当【局面重复】且【当前处于将军状态】时，将军方（刚走的一方）判负
-            # 这样"连将杀"是合法的：连续将军只要不重复局面，最终将死对方即可
-            is_perpetual_check = is_threefold_repetition & is_check
-            # 刚走的一方（state.current_player）是将军方，判负
-            perpetual_check_winner = jnp.where(state.current_player == 0, 1, 0)  # 红方长将则黑胜
+            # 重复局面处理
+            # 重复+将军 = 长将（但现在用更精细的计数规则）
+            is_repetition_check = is_fivefold_repetition & is_check
+            # 重复+捉 = 长捉
+            is_repetition_chase = is_fivefold_repetition & is_chase & ~is_check
+            # 普通重复（非将非捉）= 和棋
+            is_normal_repetition = is_fivefold_repetition & ~is_check & ~is_chase
             
-            # 普通重复（非将军状态）算和棋
-            is_normal_repetition = is_threefold_repetition & ~is_check
+            # 违规判负
+            has_violation = violation_type > 0
+            violation_winner = jnp.where(violator == 0, 1, jnp.where(violator == 1, 0, -1))  # 违规方判负
             
-            is_draw = is_max_steps | is_no_capture | is_normal_repetition | is_no_attackers
+            # 综合和棋判断
+            is_draw = is_max_steps | is_no_capture_draw | is_normal_repetition | is_no_attackers
             
             # 记录结束原因
-            # 1=步数到限, 2=无吃子到限, 3=重复局面(和棋), 4=长将判负, 5=无进攻子力
+            # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
+            # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
             new_draw_reason = jnp.where(
-                is_perpetual_check, 4,  # 长将判负
+                basic_winner != -1, 8,  # 将死/困毙
                 jnp.where(
-                    is_no_attackers, 5,  # 双方无进攻子力
+                    has_violation, 
+                    jnp.where(violation_type == 1, 4,  # 长将
+                              jnp.where(violation_type == 2, 6,  # 长捉
+                                        7)),  # 将捉交替
                     jnp.where(
-                        is_normal_repetition, 3,  # 重复局面和棋
+                        is_repetition_check, 4,  # 重复局面+将军（备用规则）
                         jnp.where(
-                            is_no_capture, 2,
-                            jnp.where(is_max_steps, 1, 0)
+                            is_repetition_chase, 6,  # 重复局面+捉（备用规则）
+                            jnp.where(
+                                is_no_attackers, 5,
+                                jnp.where(
+                                    is_normal_repetition, 3,
+                                    jnp.where(
+                                        is_no_capture_draw, 2,
+                                        jnp.where(is_max_steps, 1, 0)
+                                    )
+                                )
+                            )
                         )
                     )
                 )
             )
             
-            # 综合判断
-            game_over = game_over | is_draw | is_perpetual_check
+            # 综合游戏结束
+            game_over = (basic_game_over | is_draw | has_violation | 
+                        is_repetition_check | is_repetition_chase)
             
             # 确定最终胜者
-            # 优先级: 将死 > 长将判负 > 其他和棋
+            # 优先级: 将死/困毙 > 违规判负 > 重复局面判负 > 和棋
+            repetition_winner = jnp.where(state.current_player == 0, 1, 0)  # 重复时走子方判负
+            
             winner = jnp.where(
-                winner != -1,
-                winner,  # 已有胜者 (将死)
+                basic_winner != -1, basic_winner,  # 将死/困毙
                 jnp.where(
-                    is_perpetual_check,
-                    perpetual_check_winner,  # 长将判负 (将军方判负)
-                    -1  # 其他和棋情况统一返回 -1 (平局)
+                    has_violation, violation_winner,  # 违规判负
+                    jnp.where(
+                        is_repetition_check | is_repetition_chase, repetition_winner,  # 重复+将/捉
+                        -1  # 和棋
+                    )
                 )
             )
             
             # ========== 计算奖励 ==========
             
-            # 2. 终局奖励
-            # 现代化价值映射：胜: +1, 负: -1, 和棋: 0.0
-            # 微小的平局惩罚强迫模型在僵局中寻求突破
             terminal_reward = jnp.where(
                 game_over,
                 jnp.where(
                     winner == -1,
-                    jnp.zeros(2),  # 平局必须为严格 0，否则会破坏 V = -V' 的零和逻辑
+                    jnp.zeros(2),  # 和棋
                     jnp.where(
                         winner == 0,
                         jnp.array([1.0, -1.0]),  # 红胜
@@ -435,10 +498,6 @@ class XiangqiEnv:
                 ),
                 jnp.zeros(2)
             )
-            
-            # 3. 总奖励 = 终局奖励
-            # 3. 总奖励 = 终局奖励
-            # 纯血 AlphaZero 逻辑：奖励只在对局结束时产生 (1, -1, 0)
             rewards = terminal_reward
             
             # 获取新的合法动作
@@ -459,11 +518,22 @@ class XiangqiEnv:
                 no_capture_count=new_no_capture,
                 winner=winner,
                 draw_reason=jnp.where(game_over, new_draw_reason, jnp.int32(0)),
-                # 违规检测状态
+                # 重复局面检测
                 position_hashes=new_position_hashes,
                 hash_count=new_hash_count,
-                red_consecutive_checks=new_red_checks,
-                black_consecutive_checks=new_black_checks,
+                # 红方违规计数
+                red_check_count=new_red_check,
+                red_chase_count=new_red_chase,
+                red_alt_count=new_red_alt,
+                red_max_check_pieces=new_red_max_pieces,
+                # 黑方违规计数
+                black_check_count=new_black_check,
+                black_chase_count=new_black_chase,
+                black_alt_count=new_black_alt,
+                black_max_check_pieces=new_black_max_pieces,
+                # 无吃子期间将军计数
+                check_in_no_capture=new_check_in_no_capture,
+                # 搜索辅助
                 search_model_index=state.search_model_index,
             )
         
