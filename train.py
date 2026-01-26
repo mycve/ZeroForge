@@ -789,7 +789,9 @@ def main():
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = stats
         
         # 3. 对局长度（估算：总步数 / 总游戏数）
-        total_steps = config.max_steps * config.selfplay_batch_size * num_devices
+        # 总 slot 数 × 每 slot 步数 / 游戏数
+        total_slots = config.selfplay_batch_size * num_devices
+        total_steps = total_slots * config.max_steps
         avg_length = total_steps / max(num_games, 1)
         
         # --- 将新样本添加到经验回放缓冲区 ---
