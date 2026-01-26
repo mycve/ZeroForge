@@ -80,7 +80,7 @@ class Config:
     temperature_final: float = 0.01
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 每次自对弈 200 步（单局最大仍由 env 控制）
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
@@ -767,20 +767,20 @@ def main():
         # 结束原因编码：
         # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
         # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
-        # 统计所有完成的游戏（包括 reset 后的新局）
+        first_term = (jnp.cumsum(term, axis=1) == 1) & term
         stats_data = jnp.array([
-            term.sum(),                              # 总对局数（所有 terminated）
-            ((term & (winner == 0)).sum()),          # 红胜
-            ((term & (winner == 1)).sum()),          # 黑胜
-            ((term & (winner == -1)).sum()),         # 和棋
-            ((term & (reasons == 1)).sum()),         # 步数到限
-            ((term & (reasons == 2)).sum()),         # 无吃子到限
-            ((term & (reasons == 3)).sum()),         # 重复局面和棋
-            ((term & (reasons == 4)).sum()),         # 长将判负
-            ((term & (reasons == 5)).sum()),         # 无进攻子力
-            ((term & (reasons == 6)).sum()),         # 长捉判负
-            ((term & (reasons == 7)).sum()),         # 将捉交替判负
-            ((term & (reasons == 8)).sum()),         # 将死/困毙
+            first_term.sum(),                              # 总对局数
+            ((first_term & (winner == 0)).sum()),          # 红胜
+            ((first_term & (winner == 1)).sum()),          # 黑胜
+            ((first_term & (winner == -1)).sum()),         # 和棋
+            ((first_term & (reasons == 1)).sum()),         # 步数到限
+            ((first_term & (reasons == 2)).sum()),         # 无吃子到限
+            ((first_term & (reasons == 3)).sum()),         # 重复局面和棋
+            ((first_term & (reasons == 4)).sum()),         # 长将判负
+            ((first_term & (reasons == 5)).sum()),         # 无进攻子力
+            ((first_term & (reasons == 6)).sum()),         # 长捉判负
+            ((first_term & (reasons == 7)).sum()),         # 将捉交替判负
+            ((first_term & (reasons == 8)).sum()),         # 将死/困毙
         ], dtype=jnp.int32)
         
         # 一次性同步所有统计
@@ -788,11 +788,10 @@ def main():
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, 
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = stats
         
-        # 3. 对局长度（估算：总步数 / 总游戏数）
-        # 总 slot 数 × 每 slot 步数 / 游戏数
-        total_slots = config.selfplay_batch_size * num_devices
-        total_steps = total_slots * config.max_steps
-        avg_length = total_steps / max(num_games, 1)
+        # 3. 对局长度
+        game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
+        final_lengths = jnp.min(game_lengths, axis=1)
+        avg_length = float(jnp.mean(final_lengths))
         
         # --- 将新样本添加到经验回放缓冲区 ---
         replay_buffer.add(samples)
