@@ -720,6 +720,9 @@ async def uci_think(req: UCIThinkRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse UCI move: {bestmove}")
     
+    # 统一为红方视角（UCI 返回的是当前行棋方视角）
+    if game_state.current_player == 1 and score is not None:
+        score = -score  # 黑方走时取反，变为红方视角
     game_state.uci_score = score
     
     return {
