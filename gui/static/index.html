@@ -17,18 +17,19 @@
 </head>
 <body class="bg-gray-100 min-h-screen">
     <div id="app" v-cloak>
-        <div class="container mx-auto px-2 sm:px-4 py-2 sm:py-4 max-w-6xl">
+        <div class="container mx-auto px-1 sm:px-4 py-1 sm:py-4 max-w-6xl">
             <!-- 标题 -->
             <h1 class="text-lg sm:text-2xl font-bold text-center text-gray-800 mb-2 sm:mb-4">ZeroForge 象棋</h1>
             
             <div class="flex flex-col lg:flex-row gap-3 sm:gap-6">
                 <!-- 棋盘区域 -->
-                <div class="flex-shrink-0 board-container">
-                    <div class="bg-white rounded-lg shadow-lg p-2 sm:p-4">
+                <div class="flex-shrink-0 board-container w-full lg:w-auto">
+                    <div class="bg-white rounded-lg shadow-lg p-1 sm:p-4">
                         <!-- 响应式 SVG 棋盘 -->
-                        <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
-                             class="mx-auto block"
-                             :style="boardStyle">
+                        <div :style="boardContainerStyle" class="overflow-hidden">
+                            <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
+                                 class="block"
+                                 :style="boardStyle">
                             <!-- 背景 -->
                             <rect width="100%" height="100%" fill="#F5DEB3"/>
                             
@@ -100,7 +101,7 @@
                                                 :stroke="piece > 0 ? '#D32F2F' : '#212121'" stroke-width="1.5"/>
                                         <text :x="baseMargin + c*baseCellSize" 
                                               :y="baseMargin + (9-r)*baseCellSize + 7"
-                                              font-size="22" :fill="piece > 0 ? '#D32F2F' : '#212121'" 
+                                              font-size="21" :fill="piece > 0 ? '#D32F2F' : '#212121'" 
                                               text-anchor="middle" font-weight="bold" class="piece">
                                             {{ getPieceName(piece) }}
                                         </text>
@@ -118,7 +119,8 @@
                                       @click="handleClick(r-1, c-1)"
                                       @touchend.prevent="handleClick(r-1, c-1)"/>
                             </template>
-                        </svg>
+                            </svg>
+                        </div>
                         
                         <!-- 状态栏 -->
                         <div class="mt-2 sm:mt-3 text-center">
@@ -343,32 +345,42 @@
     
     createApp({
         setup() {
-            // 基础棋盘尺寸（viewBox 坐标系）
-            const baseCellSize = 50;
-            const baseMargin = 30;
-            const basePieceRadius = 22;
-            const baseSvgWidth = baseMargin * 2 + baseCellSize * 8;
-            const baseSvgHeight = baseMargin * 2 + baseCellSize * 9;
+            // 基础棋盘尺寸（viewBox 坐标系）- PC端标准尺寸
+            const baseCellSize = 50;    // 格子大小
+            const baseMargin = 30;      // 边距
+            const basePieceRadius = 21; // 棋子半径
+            const baseSvgWidth = baseMargin * 2 + baseCellSize * 8;   // 30*2 + 50*8 = 460
+            const baseSvgHeight = baseMargin * 2 + baseCellSize * 9;  // 30*2 + 50*9 = 510
             
-            // 响应式棋盘尺寸
+            // 响应式：通过缩放整个 SVG 来适应屏幕
             const windowWidth = ref(window.innerWidth);
-            const windowHeight = ref(window.innerHeight);
             const boardStyle = computed(() => {
                 const vw = windowWidth.value;
-                const vh = windowHeight.value;
                 if (vw < 640) {
-                    // 移动端：宽度自适应，高度按比例
-                    const maxW = Math.min(vw - 32, 400);  // 留边距
-                    const h = maxW * (baseSvgHeight / baseSvgWidth);
-                    return { width: maxW + 'px', height: h + 'px' };
+                    // 移动端：缩放到屏幕宽度
+                    const scale = (vw - 16) / baseSvgWidth;
+                    return { 
+                        width: baseSvgWidth + 'px',
+                        height: baseSvgHeight + 'px',
+                        transform: `scale(${scale})`,
+                        transformOrigin: 'top left'
+                    };
                 } else {
-                    // PC端：固定尺寸
-                    return { width: '460px', height: '510px' };
+                    // PC端：原始尺寸
+                    return { width: baseSvgWidth + 'px', height: baseSvgHeight + 'px' };
                 }
+            });
+            // 容器高度（移动端需要缩放后的高度）
+            const boardContainerStyle = computed(() => {
+                const vw = windowWidth.value;
+                if (vw < 640) {
+                    const scale = (vw - 16) / baseSvgWidth;
+                    return { height: (baseSvgHeight * scale) + 'px' };
+                }
+                return {};
             });
             const updateLayout = () => {
                 windowWidth.value = window.innerWidth;
-                windowHeight.value = window.innerHeight;
             };
             
             // 棋子名称
@@ -725,7 +737,7 @@
             
             return {
                 // 棋盘常量
-                baseCellSize, baseMargin, basePieceRadius, baseSvgWidth, baseSvgHeight, boardStyle,
+                baseCellSize, baseMargin, basePieceRadius, baseSvgWidth, baseSvgHeight, boardStyle, boardContainerStyle,
                 // 状态
                 board, currentPlayer, lastMove, lastMoveUci, gameOver, winner,
                 stepCount, isCheck, kingPos, legalMoves, historyLength,
