@@ -67,7 +67,7 @@ class Config:
     top_k: int = 32
     
     # 经验回放配置
-    replay_buffer_size: int = 500000
+    replay_buffer_size: int = 2000000
     sample_reuse_times: int = 4
     
     # 损失权重
@@ -82,7 +82,7 @@ class Config:
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和
-    repetition_threshold: int = 5     # 重复局面 5 次判和
+    repetition_threshold: int = 3     # 重复局面 3 次判和
     # perpetual_check_threshold 已废弃，现使用"重复局面+将军=长将判负"规则
     
     # ELO 评估

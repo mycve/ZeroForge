@@ -19,9 +19,9 @@ import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import mctx
 
-from xiangqi.env import XiangqiEnv, XiangqiState
+from xiangqi.env import XiangqiEnv, XiangqiState, compute_position_hash, count_repetitions, POSITION_HISTORY_SIZE
 from xiangqi.rules import (
-    get_legal_moves_mask, is_in_check, find_king,
+    get_legal_moves_mask, is_in_check, find_king, apply_move,
     BOARD_WIDTH, BOARD_HEIGHT
 )
 from xiangqi.actions import (
@@ -300,6 +300,7 @@ class ChessGame:
         self.uci_movetime = 1000
         self.uci_depth = 3
         self.ai_delay = 1.0
+        self.ai_strict_mode = True  # 严格模式：避免长将等棋品差的动作
         
         # 暂停状态
         self.paused = False
@@ -483,6 +484,51 @@ class ChessGame:
         self.state.legal_moves = []
         self._update_status()
 
+    def _get_bad_actions_mask(self) -> np.ndarray:
+        """
+        检测"棋品差"的动作：会导致长将（重复局面+将军）的动作
+        
+        Returns:
+            bad_mask: bool 数组，True 表示该动作是"坏"动作，应该被屏蔽
+        """
+        js = self.state.jax_state
+        board = np.array(js.board)
+        player = int(js.current_player)
+        legal_mask = np.array(js.legal_action_mask)
+        position_hashes = js.position_hashes
+        hash_count = int(js.hash_count)
+        
+        bad_mask = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        
+        # 只检查合法动作
+        legal_actions = np.where(legal_mask)[0]
+        
+        for action in legal_actions:
+            from_sq, to_sq = action_to_move(action)
+            from_sq, to_sq = int(from_sq), int(to_sq)
+            
+            # 模拟执行动作
+            new_board = apply_move(jnp.array(board, dtype=jnp.int8), from_sq, to_sq)
+            new_player = 1 - player
+            
+            # 计算新局面哈希
+            new_hash = compute_position_hash(new_board, jnp.int32(new_player))
+            
+            # 检查是否将军
+            is_check_after = bool(is_in_check(new_board, jnp.int32(new_player)))
+            
+            # 检查重复次数（使用较低阈值，提前避免）
+            repetitions = int(count_repetitions(new_hash, position_hashes, jnp.int32(hash_count)))
+            
+            # 如果会导致重复局面+将军，标记为坏动作
+            # 使用阈值 2 而不是 5，更早地避免进入长将循环
+            if is_check_after and repetitions >= 2:
+                bad_mask[action] = True
+                fs_uci = move_to_uci(from_sq, to_sq)
+                print(f"[AI严格模式] 屏蔽长将动作: {fs_uci} (重复{repetitions}次+将军)")
+        
+        return bad_mask
+
     def get_ai_action(self) -> Optional[int]:
         if not self.model_mgr.params: return None
         obs = self.env.observe(self.state.jax_state)[None, ...]
@@ -493,6 +539,16 @@ class ChessGame:
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(self.state.jax_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
+        # 严格模式：过滤掉会导致长将的动作
+        invalid_mask = ~self.state.jax_state.legal_action_mask
+        if self.ai_strict_mode:
+            bad_actions = self._get_bad_actions_mask()
+            invalid_mask = invalid_mask | jnp.array(bad_actions)
+            # 如果过滤后没有合法动作了，回退到原始合法动作（避免无棋可走）
+            if jnp.all(invalid_mask):
+                print("[AI严格模式] 所有动作都被屏蔽，回退到原始合法动作")
+                invalid_mask = ~self.state.jax_state.legal_action_mask
+
         self._rng_key, sk = jax.random.split(self._rng_key)
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), self.state.jax_state))
         
@@ -501,7 +557,7 @@ class ChessGame:
             params=self.model_mgr.params, rng_key=sk, root=root, 
             recurrent_fn=self._mcts_recurrent_fn,
             num_simulations=256, max_num_considered_actions=32, 
-            invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
+            invalid_actions=invalid_mask[None, ...])
         
         # 搜索后的根节点价值更准确
         # search_value 是当前走棋方视角的胜率，需要统一转换为红方视角
@@ -647,6 +703,7 @@ def create_ui():
                         uci_load = gr.Button("启动 UCI")
                         uci_depth = gr.Slider(1, 20, value=3, step=1, label="UCI 深度")
                         ai_delay = gr.Slider(0, 5, value=1, step=0.1, label="AI 延迟(秒)")
+                        ai_strict = gr.Checkbox(value=True, label="AI 严格模式 (避免长将等棋品差的动作)")
                     with gr.Tab("高级"):
                         fen_box = gr.Textbox(label="起始 FEN")
                         fen_current = gr.Textbox(label="当前 FEN", interactive=False)
@@ -967,6 +1024,12 @@ def create_ui():
             print(f"[AI] 延迟已设置为 {game.ai_delay} 秒")
             return update()
 
+        def handle_ai_strict(v):
+            game.ai_strict_mode = bool(v)
+            status = "开启" if v else "关闭"
+            print(f"[AI] 严格模式已{status}")
+            return update()
+
         def handle_red_type_change(t):
             """红方类型变化时实时更新"""
             game.red_type = t
@@ -1108,6 +1171,7 @@ def create_ui():
         uci_load.click(handle_load_uci, [uci_path], ui_outputs)
         uci_depth.change(handle_uci_depth, [uci_depth], ui_outputs)
         ai_delay.change(handle_ai_delay, [ai_delay], ui_outputs)
+        ai_strict.change(handle_ai_strict, [ai_strict], ui_outputs)
         apply_fen.click(handle_apply_fen, [fen_box], ui_outputs)
         
         # 初始化
