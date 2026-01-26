@@ -379,8 +379,14 @@ def create_mcts_recurrent_fn():
 mcts_recurrent_fn = None
 
 
-def get_ai_action(state: GameState) -> Tuple[Optional[int], float]:
-    """获取 AI 最佳着法"""
+def get_ai_action(state: GameState, num_simulations: int = 256, top_k: int = 32) -> Tuple[Optional[int], float]:
+    """获取 AI 最佳着法
+    
+    Args:
+        state: 当前游戏状态
+        num_simulations: MCTS 模拟次数（越大越准，越慢）
+        top_k: 每步考虑的最大着法数（越大越全面，越慢）
+    """
     global rng_key, mcts_recurrent_fn
     
     if not model_mgr.params:
@@ -408,7 +414,8 @@ def get_ai_action(state: GameState) -> Tuple[Optional[int], float]:
     policy_output = mctx.gumbel_muzero_policy(
         params=model_mgr.params, rng_key=sk, root=root,
         recurrent_fn=mcts_recurrent_fn,
-        num_simulations=256, max_num_considered_actions=32,
+        num_simulations=num_simulations, 
+        max_num_considered_actions=top_k,
         invalid_actions=invalid_mask[None, ...]
     )
     
@@ -440,7 +447,8 @@ class LoadModelRequest(BaseModel):
 
 
 class AIThinkRequest(BaseModel):
-    pass  # 无需额外参数，规则已完善
+    num_simulations: int = 256  # MCTS 模拟次数
+    top_k: int = 32             # 考虑的最大着法数  # 无需额外参数，规则已完善
 
 
 class UCIThinkRequest(BaseModel):
@@ -682,7 +690,7 @@ async def ai_think(req: AIThinkRequest):
     if game_state.game_over:
         raise HTTPException(status_code=400, detail="Game is over")
     
-    action, value = get_ai_action(game_state)
+    action, value = get_ai_action(game_state, req.num_simulations, req.top_k)
     if action is None:
         raise HTTPException(status_code=500, detail="AI failed to find a move")
     

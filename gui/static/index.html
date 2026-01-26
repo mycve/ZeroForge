@@ -201,14 +201,35 @@
                                 </button>
                             </div>
                             
-                            <!-- AI 思考间隔 -->
-                            <div class="pt-2">
-                                <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
-                                    AI 间隔: {{ aiDelay }}ms
-                                </label>
-                                <input type="range" v-model.number="aiDelay" min="0" max="3000" step="100"
-                                       class="w-full h-2">
-                            </div>
+                            <!-- AI 参数 -->
+                            <details class="pt-2">
+                                <summary class="text-xs sm:text-sm font-medium text-gray-700 cursor-pointer">
+                                    AI 参数
+                                </summary>
+                                <div class="mt-2 space-y-2 pl-2">
+                                    <div>
+                                        <label class="block text-xs text-gray-600 mb-1">
+                                            模拟次数: {{ aiSimulations }}
+                                        </label>
+                                        <input type="range" v-model.number="aiSimulations" min="32" max="512" step="32"
+                                               class="w-full h-2">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs text-gray-600 mb-1">
+                                            Top-K: {{ aiTopK }}
+                                        </label>
+                                        <input type="range" v-model.number="aiTopK" min="8" max="64" step="8"
+                                               class="w-full h-2">
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs text-gray-600 mb-1">
+                                            步间隔: {{ aiDelay }}ms
+                                        </label>
+                                        <input type="range" v-model.number="aiDelay" min="0" max="3000" step="100"
+                                               class="w-full h-2">
+                                    </div>
+                                </div>
+                            </details>
                             
                             <!-- UCI 深度（仅当 UCI 可用时显示）-->
                             <div v-if="uciReady" class="pt-2">
@@ -394,6 +415,8 @@
             const modelInfo = ref(null);
             const fenInput = ref('');
             const moveHistory = ref([]);  // 走棋历史
+            const aiSimulations = ref(256);  // MCTS 模拟次数
+            const aiTopK = ref(32);  // Top-K 着法
             
             // 计算属性
             const legalTargets = computed(() => {
@@ -578,7 +601,10 @@
                             const res = await fetch('/api/ai_think', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({})
+                                body: JSON.stringify({
+                                    num_simulations: aiSimulations.value,
+                                    top_k: aiTopK.value
+                                })
                             });
                             if (!res.ok) throw new Error('AI think failed');
                             const data = await res.json();
@@ -707,7 +733,7 @@
                 // UI
                 selected, thinking, paused, loading, activeTab, message, messageType,
                 // 设置
-                redType, blackType, uciDepth, aiDelay, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
+                redType, blackType, uciDepth, aiDelay, aiSimulations, aiTopK, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
                 // 历史
                 moveHistory,
                 // 计算属性
