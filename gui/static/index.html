@@ -137,13 +137,13 @@
                                 <span v-if="thinking" class="text-blue-500 ml-1 sm:ml-2 text-sm sm:text-base">思考中...</span>
                             </div>
                             
-                            <!-- 评估信息 -->
+                            <!-- 评估信息（当前行棋方视角）-->
                             <div class="mt-1 text-xs sm:text-sm text-gray-600">
                                 <span v-if="aiLoaded" class="mr-2 sm:mr-4">
-                                    AI: {{ aiValue >= 0 ? '+' : '' }}{{ (aiValue * 100).toFixed(0) }}%
+                                    AI: {{ displayAiValue >= 0 ? '+' : '' }}{{ (displayAiValue * 100).toFixed(0) }}%
                                 </span>
                                 <span v-if="uciScore !== null" class="mr-2 sm:mr-4">
-                                    UCI: {{ formatUciScore(uciScore) }}
+                                    UCI: {{ formatUciScore(displayUciScore) }}
                                 </span>
                                 <span v-if="lastMoveUci">{{ lastMoveUci }}</span>
                             </div>
@@ -442,6 +442,15 @@
             const isAITurn = computed(() => {
                 const type = currentPlayer.value === 0 ? redType.value : blackType.value;
                 return type !== 'Human' && !gameOver.value;
+            });
+            
+            // 当前行棋方视角的评估值（API 返回红方视角，黑方时取反）
+            const displayAiValue = computed(() => {
+                return currentPlayer.value === 0 ? aiValue.value : -aiValue.value;
+            });
+            const displayUciScore = computed(() => {
+                if (uciScore.value === null) return null;
+                return currentPlayer.value === 0 ? uciScore.value : -uciScore.value;
             });
             
             // 方法
@@ -749,7 +758,7 @@
                 // 历史
                 moveHistory,
                 // 计算属性
-                legalTargets, isAITurn,
+                legalTargets, isAITurn, displayAiValue, displayUciScore,
                 // 方法
                 getPieceName, formatUciScore, handleClick, newGame, undo, togglePause,
                 applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep
