@@ -47,7 +47,8 @@ dependencies = [
     "pillow",
     
     # Web GUI 人机对弈
-    "gradio>=4.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
 ]
 
 [project.optional-dependencies]

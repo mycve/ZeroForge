@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ZeroForge 象棋</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        [v-cloak] { display: none; }
+        * { -webkit-tap-highlight-color: transparent; }
+        .piece { cursor: pointer; user-select: none; }
+        .board-container { touch-action: manipulation; }
+        /* 防止 iOS 双击缩放 */
+        button, select, input { touch-action: manipulation; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div id="app" v-cloak>
+        <div class="container mx-auto px-2 sm:px-4 py-2 sm:py-4 max-w-6xl">
+            <!-- 标题 -->
+            <h1 class="text-lg sm:text-2xl font-bold text-center text-gray-800 mb-2 sm:mb-4">ZeroForge 象棋</h1>
+            
+            <div class="flex flex-col lg:flex-row gap-3 sm:gap-6">
+                <!-- 棋盘区域 -->
+                <div class="flex-shrink-0 board-container">
+                    <div class="bg-white rounded-lg shadow-lg p-2 sm:p-4">
+                        <!-- 响应式 SVG 棋盘 -->
+                        <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
+                             class="mx-auto block"
+                             :style="boardStyle">
+                            <!-- 背景 -->
+                            <rect width="100%" height="100%" fill="#F5DEB3"/>
+                            
+                            <!-- 竖线 -->
+                            <template v-for="i in 9">
+                                <line :x1="baseMargin + (i-1)*baseCellSize" :y1="baseMargin" 
+                                      :x2="baseMargin + (i-1)*baseCellSize" :y2="baseMargin + 4*baseCellSize" 
+                                      stroke="#5D4037" stroke-width="1"/>
+                                <line :x1="baseMargin + (i-1)*baseCellSize" :y1="baseMargin + 5*baseCellSize" 
+                                      :x2="baseMargin + (i-1)*baseCellSize" :y2="baseMargin + 9*baseCellSize" 
+                                      stroke="#5D4037" stroke-width="1"/>
+                            </template>
+                            
+                            <!-- 横线 -->
+                            <line v-for="i in 10" 
+                                  :x1="baseMargin" :y1="baseMargin + (i-1)*baseCellSize"
+                                  :x2="baseMargin + 8*baseCellSize" :y2="baseMargin + (i-1)*baseCellSize"
+                                  stroke="#5D4037" stroke-width="1"/>
+                            
+                            <!-- 九宫格斜线 -->
+                            <template v-for="yOff in [0, 7*baseCellSize]">
+                                <line :x1="baseMargin + 3*baseCellSize" :y1="baseMargin + yOff"
+                                      :x2="baseMargin + 5*baseCellSize" :y2="baseMargin + yOff + 2*baseCellSize"
+                                      stroke="#5D4037" stroke-width="1"/>
+                                <line :x1="baseMargin + 5*baseCellSize" :y1="baseMargin + yOff"
+                                      :x2="baseMargin + 3*baseCellSize" :y2="baseMargin + yOff + 2*baseCellSize"
+                                      stroke="#5D4037" stroke-width="1"/>
+                            </template>
+                            
+                            <!-- 楚河汉界 -->
+                            <text :x="baseMargin + 1.2*baseCellSize" :y="baseMargin + 4.65*baseCellSize" 
+                                  font-size="18" fill="#5D4037" font-weight="bold">楚 河</text>
+                            <text :x="baseMargin + 5.2*baseCellSize" :y="baseMargin + 4.65*baseCellSize" 
+                                  font-size="18" fill="#5D4037" font-weight="bold">汉 界</text>
+                            
+                            <!-- 上一步高亮 -->
+                            <template v-if="lastMove">
+                                <circle v-for="pos in [[lastMove[0], lastMove[1]], [lastMove[2], lastMove[3]]]"
+                                        :cx="baseMargin + pos[1]*baseCellSize" 
+                                        :cy="baseMargin + (9-pos[0])*baseCellSize"
+                                        :r="basePieceRadius + 3" fill="none" stroke="#03A9F4" stroke-width="2.5"/>
+                            </template>
+                            
+                            <!-- 选中高亮 -->
+                            <circle v-if="selected"
+                                    :cx="baseMargin + selected[1]*baseCellSize"
+                                    :cy="baseMargin + (9-selected[0])*baseCellSize"
+                                    :r="basePieceRadius + 3" fill="none" stroke="#FFD600" stroke-width="2.5"/>
+                            
+                            <!-- 将军高亮 -->
+                            <circle v-if="isCheck && kingPos"
+                                    :cx="baseMargin + kingPos[1]*baseCellSize"
+                                    :cy="baseMargin + (9-kingPos[0])*baseCellSize"
+                                    :r="basePieceRadius + 3" fill="none" stroke="#F44336" stroke-width="2.5"/>
+                            
+                            <!-- 合法落点 -->
+                            <circle v-for="move in legalTargets"
+                                    :cx="baseMargin + move[1]*baseCellSize"
+                                    :cy="baseMargin + (9-move[0])*baseCellSize"
+                                    r="7" fill="#4CAF50" opacity="0.7"/>
+                            
+                            <!-- 棋子 -->
+                            <g v-for="(row, r) in board" :key="r">
+                                <g v-for="(piece, c) in row" :key="`${r}-${c}`">
+                                    <template v-if="piece !== 0">
+                                        <circle :cx="baseMargin + c*baseCellSize" 
+                                                :cy="baseMargin + (9-r)*baseCellSize"
+                                                :r="basePieceRadius" fill="#FDF5E6" 
+                                                :stroke="piece > 0 ? '#D32F2F' : '#212121'" stroke-width="1.5"/>
+                                        <text :x="baseMargin + c*baseCellSize" 
+                                              :y="baseMargin + (9-r)*baseCellSize + 7"
+                                              font-size="22" :fill="piece > 0 ? '#D32F2F' : '#212121'" 
+                                              text-anchor="middle" font-weight="bold" class="piece">
+                                            {{ getPieceName(piece) }}
+                                        </text>
+                                    </template>
+                                </g>
+                            </g>
+                            
+                            <!-- 点击区域（扩大触摸范围）-->
+                            <template v-for="r in 10" :key="`row-${r}`">
+                                <rect v-for="c in 9" :key="`click-${r-1}-${c-1}`"
+                                      :x="baseMargin + (c-1)*baseCellSize - baseCellSize/2"
+                                      :y="baseMargin + (10-r)*baseCellSize - baseCellSize/2"
+                                      :width="baseCellSize" :height="baseCellSize"
+                                      fill="transparent" style="cursor:pointer"
+                                      @click="handleClick(r-1, c-1)"
+                                      @touchend.prevent="handleClick(r-1, c-1)"/>
+                            </template>
+                        </svg>
+                        
+                        <!-- 状态栏 -->
+                        <div class="mt-2 sm:mt-3 text-center">
+                            <div v-if="gameOver" class="text-lg sm:text-xl font-bold" 
+                                 :class="winner === 0 ? 'text-red-600' : winner === 1 ? 'text-gray-800' : 'text-gray-500'">
+                                🎉 {{ winner === 0 ? '红方胜' : winner === 1 ? '黑方胜' : '和棋' }}
+                            </div>
+                            <div v-else class="text-base sm:text-lg">
+                                <span :class="currentPlayer === 0 ? 'text-red-600 font-bold' : 'text-gray-800 font-bold'">
+                                    {{ currentPlayer === 0 ? '红方' : '黑方' }}
+                                </span>
+                                <span class="text-gray-500 ml-1 sm:ml-2 text-sm sm:text-base">第{{ stepCount }}步</span>
+                                <span v-if="isCheck" class="text-red-500 ml-1 sm:ml-2 font-bold text-sm sm:text-base">⚠️将军</span>
+                                <span v-if="thinking" class="text-blue-500 ml-1 sm:ml-2 text-sm sm:text-base">思考中...</span>
+                            </div>
+                            
+                            <!-- 评估信息 -->
+                            <div class="mt-1 text-xs sm:text-sm text-gray-600">
+                                <span v-if="aiLoaded" class="mr-2 sm:mr-4">
+                                    AI: {{ aiValue >= 0 ? '+' : '' }}{{ (aiValue * 100).toFixed(0) }}%
+                                </span>
+                                <span v-if="uciScore !== null" class="mr-2 sm:mr-4">
+                                    UCI: {{ formatUciScore(uciScore) }}
+                                </span>
+                                <span v-if="lastMoveUci">{{ lastMoveUci }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 控制面板 -->
+                <div class="flex-grow min-w-0">
+                    <div class="bg-white rounded-lg shadow-lg p-3 sm:p-4">
+                        <!-- 标签页 -->
+                        <div class="flex border-b mb-3">
+                            <button v-for="tab in ['对弈', '设置']" :key="tab"
+                                    @click="activeTab = tab"
+                                    :class="['flex-1 px-2 py-2 text-sm sm:text-base font-medium', 
+                                             activeTab === tab ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500']">
+                                {{ tab }}
+                            </button>
+                        </div>
+                        
+                        <!-- 对弈面板 -->
+                        <div v-show="activeTab === '对弈'" class="space-y-3">
+                            <!-- 玩家选择 -->
+                            <div class="grid grid-cols-2 gap-2 sm:gap-4">
+                                <div>
+                                    <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">红方</label>
+                                    <select v-model="redType" class="w-full border rounded px-2 py-2 text-sm">
+                                        <option>Human</option>
+                                        <option>ZeroForge AI</option>
+                                        <option v-if="uciReady">UCI Engine</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">黑方</label>
+                                    <select v-model="blackType" class="w-full border rounded px-2 py-2 text-sm">
+                                        <option>Human</option>
+                                        <option>ZeroForge AI</option>
+                                        <option v-if="uciReady">UCI Engine</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <!-- 主要操作按钮 -->
+                            <div class="grid grid-cols-3 gap-2">
+                                <button @click="newGame" :disabled="thinking"
+                                        class="bg-blue-600 text-white py-2.5 rounded font-medium text-sm hover:bg-blue-700 disabled:opacity-50 active:bg-blue-800">
+                                    新局
+                                </button>
+                                <button @click="undo" :disabled="thinking || historyLength === 0"
+                                        class="bg-gray-200 text-gray-800 py-2.5 rounded font-medium text-sm hover:bg-gray-300 disabled:opacity-50 active:bg-gray-400">
+                                    悔棋
+                                </button>
+                                <button @click="togglePause" :disabled="!isAITurn"
+                                        class="py-2.5 rounded font-medium text-sm disabled:opacity-50"
+                                        :class="paused ? 'bg-green-500 text-white hover:bg-green-600 active:bg-green-700' : 'bg-yellow-500 text-white hover:bg-yellow-600 active:bg-yellow-700'">
+                                    {{ paused ? '继续' : '暂停' }}
+                                </button>
+                            </div>
+                            
+                            <!-- AI 思考间隔 -->
+                            <div class="pt-2">
+                                <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                                    AI 间隔: {{ aiDelay }}ms
+                                </label>
+                                <input type="range" v-model.number="aiDelay" min="0" max="3000" step="100"
+                                       class="w-full h-2">
+                            </div>
+                            
+                            <!-- UCI 深度（仅当 UCI 可用时显示）-->
+                            <div v-if="uciReady" class="pt-2">
+                                <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
+                                    UCI 深度: {{ uciDepth }}
+                                </label>
+                                <input type="range" v-model.number="uciDepth" min="1" max="20" step="1"
+                                       class="w-full h-2">
+                            </div>
+                            
+                            <!-- 历史记录 -->
+                            <details class="border-t pt-2 mt-2">
+                                <summary class="text-xs sm:text-sm font-medium text-gray-700 cursor-pointer">
+                                    走棋历史 ({{ moveHistory.length }}步)
+                                </summary>
+                                <div class="mt-2 max-h-40 overflow-y-auto bg-gray-50 rounded p-2">
+                                    <div v-if="moveHistory.length === 0" class="text-xs text-gray-400 text-center py-2">
+                                        暂无记录
+                                    </div>
+                                    <div v-else class="flex flex-wrap gap-1">
+                                        <button v-for="h in moveHistory" :key="h.step"
+                                                @click="gotoStep(h.step - 1)"
+                                                :disabled="thinking"
+                                                class="px-2 py-1 text-xs rounded border hover:bg-blue-100 disabled:opacity-50"
+                                                :class="h.player === '红' ? 'text-red-600 border-red-200' : 'text-gray-800 border-gray-300'">
+                                            {{ h.step }}.{{ h.uci }}
+                                        </button>
+                                    </div>
+                                    <div class="mt-2 text-center">
+                                        <button @click="gotoStep(0)" :disabled="thinking || moveHistory.length === 0"
+                                                class="text-xs text-blue-600 hover:underline disabled:opacity-50">
+                                            回到开局
+                                        </button>
+                                    </div>
+                                </div>
+                            </details>
+                            
+                            <!-- FEN（可折叠）-->
+                            <details class="border-t pt-2 mt-2">
+                                <summary class="text-xs sm:text-sm font-medium text-gray-700 cursor-pointer">FEN 局面</summary>
+                                <div class="mt-2 space-y-2">
+                                    <input type="text" v-model="fenInput" 
+                                           class="w-full border rounded px-2 py-1.5 text-xs sm:text-sm font-mono"
+                                           placeholder="输入 FEN">
+                                    <div class="flex gap-2">
+                                        <button @click="applyFen" :disabled="thinking"
+                                                class="flex-1 bg-gray-200 text-gray-800 py-1.5 rounded text-xs sm:text-sm hover:bg-gray-300 active:bg-gray-400">
+                                            应用
+                                        </button>
+                                        <button @click="copyFen"
+                                                class="flex-1 bg-gray-200 text-gray-800 py-1.5 rounded text-xs sm:text-sm hover:bg-gray-300 active:bg-gray-400">
+                                            复制
+                                        </button>
+                                    </div>
+                                </div>
+                            </details>
+                        </div>
+                        
+                        <!-- 设置面板 -->
+                        <div v-show="activeTab === '设置'" class="space-y-3">
+                            <!-- AI 模型 -->
+                            <div>
+                                <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">AI 模型路径</label>
+                                <input type="text" v-model="ckptDir" 
+                                       class="w-full border rounded px-2 py-1.5 text-xs sm:text-sm">
+                            </div>
+                            
+                            <div class="flex gap-2">
+                                <button @click="refreshCheckpoints"
+                                        class="bg-gray-200 text-gray-800 px-3 py-2 rounded text-sm hover:bg-gray-300 active:bg-gray-400">
+                                    🔄
+                                </button>
+                                <select v-model="selectedStep" class="flex-1 border rounded px-2 py-2 text-sm">
+                                    <option v-for="step in checkpoints" :key="step" :value="step">
+                                        Step {{ step }}
+                                    </option>
+                                </select>
+                            </div>
+                            
+                            <button @click="loadModel" :disabled="loading"
+                                    class="w-full bg-green-600 text-white py-2.5 rounded font-medium text-sm hover:bg-green-700 disabled:opacity-50 active:bg-green-800">
+                                {{ loading ? '加载中...' : '加载 AI 模型' }}
+                            </button>
+                            
+                            <!-- 状态信息 -->
+                            <div class="text-xs sm:text-sm space-y-2 pt-2 border-t">
+                                <div v-if="modelInfo" class="text-gray-600 bg-gray-50 p-2 rounded">
+                                    <div>✓ Step {{ modelInfo.step }}</div>
+                                    <div class="text-xs">{{ modelInfo.channels }}ch × {{ modelInfo.num_blocks }}blocks</div>
+                                </div>
+                                <div :class="uciReady ? 'text-green-600' : 'text-gray-400'">
+                                    {{ uciReady ? '✓ Pikafish 就绪' : '✗ Pikafish 未启动' }}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 消息提示 -->
+                    <div v-if="message" 
+                         :class="['mt-2 p-2 rounded text-xs sm:text-sm', 
+                                  messageType === 'error' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700']">
+                        {{ message }}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    const { createApp, ref, computed, onMounted, onUnmounted } = Vue;
+    
+    createApp({
+        setup() {
+            // 基础棋盘尺寸（viewBox 坐标系）
+            const baseCellSize = 50;
+            const baseMargin = 30;
+            const basePieceRadius = 22;
+            const baseSvgWidth = baseMargin * 2 + baseCellSize * 8;
+            const baseSvgHeight = baseMargin * 2 + baseCellSize * 9;
+            
+            // 响应式棋盘尺寸
+            const windowWidth = ref(window.innerWidth);
+            const windowHeight = ref(window.innerHeight);
+            const boardStyle = computed(() => {
+                const vw = windowWidth.value;
+                const vh = windowHeight.value;
+                if (vw < 640) {
+                    // 移动端：宽度自适应，高度按比例
+                    const maxW = Math.min(vw - 32, 400);  // 留边距
+                    const h = maxW * (baseSvgHeight / baseSvgWidth);
+                    return { width: maxW + 'px', height: h + 'px' };
+                } else {
+                    // PC端：固定尺寸
+                    return { width: '460px', height: '510px' };
+                }
+            });
+            const updateLayout = () => {
+                windowWidth.value = window.innerWidth;
+                windowHeight.value = window.innerHeight;
+            };
+            
+            // 棋子名称
+            const pieceNames = {
+                1: '帅', 2: '仕', 3: '相', 4: '马', 5: '车', 6: '炮', 7: '兵',
+                '-1': '将', '-2': '士', '-3': '象', '-4': '马', '-5': '车', '-6': '炮', '-7': '卒'
+            };
+            
+            // 游戏状态
+            const board = ref(Array(10).fill(null).map(() => Array(9).fill(0)));
+            const currentPlayer = ref(0);
+            const lastMove = ref(null);
+            const lastMoveUci = ref('');
+            const gameOver = ref(false);
+            const winner = ref(-1);
+            const stepCount = ref(0);
+            const isCheck = ref(false);
+            const kingPos = ref(null);
+            const legalMoves = ref([]);
+            const historyLength = ref(0);
+            const aiValue = ref(0);
+            const uciScore = ref(null);
+            const aiLoaded = ref(false);
+            const uciReady = ref(false);
+            const fen = ref('');
+            
+            // UI 状态
+            const selected = ref(null);
+            const thinking = ref(false);
+            const paused = ref(false);
+            const loading = ref(false);
+            const activeTab = ref('对弈');
+            const message = ref('');
+            const messageType = ref('info');
+            
+            // 设置
+            const redType = ref('Human');
+            const blackType = ref('ZeroForge AI');
+            const uciDepth = ref(10);
+            const aiDelay = ref(500);  // AI 思考间隔(ms)
+            const ckptDir = ref('checkpoints');
+            const checkpoints = ref([]);
+            const selectedStep = ref(null);
+            const modelInfo = ref(null);
+            const fenInput = ref('');
+            const moveHistory = ref([]);  // 走棋历史
+            
+            // 计算属性
+            const legalTargets = computed(() => {
+                if (!selected.value) return [];
+                const [r, c] = selected.value;
+                return legalMoves.value
+                    .filter(m => m.from[0] === r && m.from[1] === c)
+                    .map(m => m.to);
+            });
+            
+            const isAITurn = computed(() => {
+                const type = currentPlayer.value === 0 ? redType.value : blackType.value;
+                return type !== 'Human' && !gameOver.value;
+            });
+            
+            // 方法
+            const getPieceName = (piece) => pieceNames[piece] || '';
+            
+            const formatUciScore = (score) => {
+                if (score === null) return '';
+                if (Math.abs(score) >= 29000) {
+                    const mateIn = Math.floor((30000 - Math.abs(score)) / 100);
+                    return score > 0 ? `M${mateIn}` : `-M${mateIn}`;
+                }
+                return `${score > 0 ? '+' : ''}${score}`;
+            };
+            
+            const showMessage = (msg, type = 'info') => {
+                message.value = msg;
+                messageType.value = type;
+                setTimeout(() => { message.value = ''; }, 3000);
+            };
+            
+            const fetchStatus = async () => {
+                try {
+                    const res = await fetch('/api/status');
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    
+                    board.value = data.board;
+                    currentPlayer.value = data.current_player;
+                    lastMove.value = data.last_move;
+                    lastMoveUci.value = data.last_move_uci || '';
+                    gameOver.value = data.game_over;
+                    winner.value = data.winner;
+                    stepCount.value = data.step_count;
+                    isCheck.value = data.is_check;
+                    kingPos.value = data.king_pos;
+                    legalMoves.value = data.legal_moves || [];
+                    historyLength.value = data.history_length;
+                    aiValue.value = data.ai_value;
+                    uciScore.value = data.uci_score;
+                    aiLoaded.value = data.ai_loaded;
+                    uciReady.value = data.uci_ready;
+                    fen.value = data.fen;
+                    
+                    // 获取历史记录
+                    await fetchHistory();
+                } catch (e) {
+                    console.error('Failed to fetch status:', e);
+                }
+            };
+            
+            const fetchHistory = async () => {
+                try {
+                    const res = await fetch('/api/history');
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    moveHistory.value = data.history || [];
+                } catch (e) {
+                    console.error('Failed to fetch history:', e);
+                }
+            };
+            
+            const gotoStep = async (step) => {
+                if (thinking.value) return;
+                thinking.value = true;
+                paused.value = true;  // 回溯后自动暂停
+                selected.value = null;
+                try {
+                    const res = await fetch('/api/goto_step', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ step })
+                    });
+                    if (!res.ok) {
+                        const err = await res.json();
+                        throw new Error(err.detail || 'Failed to go to step');
+                    }
+                    await fetchStatus();
+                    showMessage(`已回退到第 ${step} 步`);
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
+                }
+            };
+            
+            const newGame = async () => {
+                thinking.value = true;
+                paused.value = false;
+                selected.value = null;
+                moveHistory.value = [];  // 清空历史
+                try {
+                    const res = await fetch('/api/new_game', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ fen: fenInput.value || undefined })
+                    });
+                    if (!res.ok) throw new Error('Failed to start new game');
+                    await fetchStatus();
+                    showMessage('新局开始');
+                    await aiLoop();
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
+                }
+            };
+            
+            const handleClick = async (r, c) => {
+                if (thinking.value || gameOver.value) return;
+                
+                const type = currentPlayer.value === 0 ? redType.value : blackType.value;
+                if (type !== 'Human') return;
+                
+                const piece = board.value[r][c];
+                const isOwn = (currentPlayer.value === 0 && piece > 0) || 
+                             (currentPlayer.value === 1 && piece < 0);
+                
+                if (selected.value) {
+                    const [sr, sc] = selected.value;
+                    const move = legalMoves.value.find(
+                        m => m.from[0] === sr && m.from[1] === sc && m.to[0] === r && m.to[1] === c
+                    );
+                    
+                    if (move) {
+                        await makeMove(move.action);
+                        return;
+                    } else if (isOwn) {
+                        selected.value = [r, c];
+                    } else {
+                        selected.value = null;
+                    }
+                } else if (isOwn) {
+                    selected.value = [r, c];
+                }
+            };
+            
+            const makeMove = async (action) => {
+                thinking.value = true;
+                selected.value = null;
+                try {
+                    const res = await fetch('/api/move', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action })
+                    });
+                    if (!res.ok) throw new Error('Move failed');
+                    await fetchStatus();
+                    await aiLoop();
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
+                }
+            };
+            
+            const aiLoop = async () => {
+                while (!gameOver.value && !paused.value) {
+                    const type = currentPlayer.value === 0 ? redType.value : blackType.value;
+                    if (type === 'Human') break;
+                    
+                    thinking.value = true;
+                    try {
+                        let action;
+                        if (type === 'ZeroForge AI') {
+                            if (!aiLoaded.value) {
+                                showMessage('AI 模型未加载', 'error');
+                                break;
+                            }
+                            const res = await fetch('/api/ai_think', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({})
+                            });
+                            if (!res.ok) throw new Error('AI think failed');
+                            const data = await res.json();
+                            action = data.action;
+                        } else if (type === 'UCI Engine') {
+                            if (!uciReady.value) {
+                                showMessage('UCI 引擎未就绪', 'error');
+                                break;
+                            }
+                            const res = await fetch('/api/uci_think', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ depth: uciDepth.value })
+                            });
+                            if (!res.ok) throw new Error('UCI think failed');
+                            const data = await res.json();
+                            action = data.action;
+                        } else {
+                            break;
+                        }
+                        
+                        const moveRes = await fetch('/api/move', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action })
+                        });
+                        if (!moveRes.ok) throw new Error('Move failed');
+                        await fetchStatus();
+                        
+                        // 使用可调间隔
+                        if (aiDelay.value > 0) {
+                            await new Promise(r => setTimeout(r, aiDelay.value));
+                        }
+                    } catch (e) {
+                        showMessage(e.message, 'error');
+                        break;
+                    }
+                }
+                thinking.value = false;
+            };
+            
+            const undo = async () => {
+                if (historyLength.value === 0) return;
+                try {
+                    const res = await fetch('/api/undo', { method: 'POST' });
+                    if (!res.ok) throw new Error('Undo failed');
+                    await fetchStatus();
+                    selected.value = null;
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                }
+            };
+            
+            const togglePause = () => {
+                paused.value = !paused.value;
+                if (!paused.value) aiLoop();
+            };
+            
+            const applyFen = async () => {
+                if (!fenInput.value.trim()) return;
+                await newGame();
+            };
+            
+            const copyFen = () => {
+                navigator.clipboard.writeText(fen.value);
+                showMessage('FEN 已复制');
+            };
+            
+            const refreshCheckpoints = async () => {
+                try {
+                    const res = await fetch(`/api/checkpoints?ckpt_dir=${encodeURIComponent(ckptDir.value)}`);
+                    if (!res.ok) throw new Error('Failed to fetch checkpoints');
+                    const data = await res.json();
+                    checkpoints.value = data.steps;
+                    if (data.steps.length > 0) {
+                        selectedStep.value = data.current_step || data.steps[0];
+                    }
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                }
+            };
+            
+            const loadModel = async () => {
+                if (!selectedStep.value) {
+                    showMessage('请先选择 checkpoint', 'error');
+                    return;
+                }
+                loading.value = true;
+                try {
+                    const res = await fetch('/api/load_model', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ckpt_dir: ckptDir.value, step: selectedStep.value })
+                    });
+                    if (!res.ok) throw new Error('Failed to load model');
+                    const data = await res.json();
+                    modelInfo.value = data;
+                    aiLoaded.value = true;
+                    showMessage(`模型加载成功`);
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    loading.value = false;
+                }
+            };
+            
+            // 初始化
+            onMounted(async () => {
+                updateLayout();
+                window.addEventListener('resize', updateLayout);
+                await refreshCheckpoints();
+                await newGame();
+            });
+            
+            onUnmounted(() => {
+                window.removeEventListener('resize', updateLayout);
+            });
+            
+            return {
+                // 棋盘常量
+                baseCellSize, baseMargin, basePieceRadius, baseSvgWidth, baseSvgHeight, boardStyle,
+                // 状态
+                board, currentPlayer, lastMove, lastMoveUci, gameOver, winner,
+                stepCount, isCheck, kingPos, legalMoves, historyLength,
+                aiValue, uciScore, aiLoaded, uciReady, fen,
+                // UI
+                selected, thinking, paused, loading, activeTab, message, messageType,
+                // 设置
+                redType, blackType, uciDepth, aiDelay, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
+                // 历史
+                moveHistory,
+                // 计算属性
+                legalTargets, isAITurn,
+                // 方法
+                getPieceName, formatUciScore, handleClick, newGame, undo, togglePause,
+                applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep
+            };
+        }
+    }).mount('#app');
+    </script>
+</body>
+</html>
