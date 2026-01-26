@@ -504,7 +504,11 @@ class ChessGame:
             invalid_actions=(~self.state.jax_state.legal_action_mask)[None, ...])
         
         # 搜索后的根节点价值更准确
+        # search_value 是当前走棋方视角的胜率，需要统一转换为红方视角
         search_value = float(policy_output.search_tree.node_values[0, 0])
+        # 如果当前是黑方走棋，取负转换为红方视角
+        if self.state.current_player == 1:
+            search_value = -search_value
         self.state.ai_value = search_value
         
         # 输出 top-3 候选动作及其权重，方便调试臭棋
@@ -722,7 +726,7 @@ def create_ui():
             # 评估信息构建
             eval_parts = []
             
-            # ZeroForge AI 评估（ai_value 范围 [-1, 1]，正值对红方有利）
+            # ZeroForge AI 评估（ai_value 范围 [-1, 1]，已统一为红方视角，正值对红方有利）
             # 根据 AI 所属方显示对应胜率
             if game.model_mgr.params is not None:
                 red_winrate = (ai_value + 1) / 2 * 100
@@ -733,8 +737,8 @@ def create_ui():
                 elif game.black_type == "ZeroForge AI" and game.red_type != "ZeroForge AI":
                     eval_parts.append(f"ZeroForge(黑): {black_winrate:.1f}%")
                 else:
-                    # 双方都是 AI 或都不是，显示红方胜率
-                    eval_parts.append(f"AI评估: 红{red_winrate:.1f}%")
+                    # 双方都是 AI，同时显示红黑双方胜率
+                    eval_parts.append(f"AI评估: 红{red_winrate:.1f}% / 黑{black_winrate:.1f}%")
             
             # UCI 引擎评估（原始厘兵分数，正值对当前走棋方有利）
             if uci_score is not None:
