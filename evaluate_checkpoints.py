@@ -111,7 +111,10 @@ def create_network_and_env(config: EvalConfig):
 
 
 def load_checkpoint(ckpt_dir: str, step: int, params_template: dict) -> dict:
-    """加载指定步数的检查点参数"""
+    """加载指定步数的检查点参数
+    
+    只恢复模型参数 params，跳过优化器状态等其他字段
+    """
     ckpt_dir = os.path.abspath(ckpt_dir)
     
     # 创建临时 CheckpointManager 用于加载
@@ -123,16 +126,13 @@ def load_checkpoint(ckpt_dir: str, step: int, params_template: dict) -> dict:
     if step not in all_steps:
         raise ValueError(f"检查点 step={step} 不存在，可用: {sorted(all_steps)}")
     
-    # 恢复参数
-    restore_target = {
-        "params": params_template,
-        "opt_state": {},  # 不需要优化器状态
-        "iteration": np.array(0),
-        "frames": np.array(0),
-        "rng_key": jax.random.PRNGKey(0),
-    }
+    # 只恢复 params，跳过 opt_state 等其他字段
+    # 使用 ocp.args.Composite 选择性恢复特定字段
+    restore_args = ocp.args.Composite(
+        params=ocp.args.StandardRestore(params_template),
+    )
     
-    restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
+    restored = ckpt_manager.restore(step, args=restore_args)
     return restored["params"]
 
 
