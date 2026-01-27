@@ -126,13 +126,14 @@ def load_checkpoint(ckpt_dir: str, step: int, params_template: dict) -> dict:
     if step not in all_steps:
         raise ValueError(f"检查点 step={step} 不存在，可用: {sorted(all_steps)}")
     
-    # 只恢复 params，跳过 opt_state 等其他字段
-    # 使用 ocp.args.Composite 选择性恢复特定字段
-    restore_args = ocp.args.Composite(
-        params=ocp.args.StandardRestore(params_template),
-    )
+    # 方法1: 直接用 PyTreeCheckpointer 读取，不需要提供模板
+    # 获取检查点目录路径
+    ckpt_path = os.path.join(ckpt_dir, str(step), "default")
     
-    restored = ckpt_manager.restore(step, args=restore_args)
+    # 使用 PyTreeCheckpointer 直接恢复整个状态（无需模板）
+    checkpointer = ocp.PyTreeCheckpointer()
+    restored = checkpointer.restore(ckpt_path)
+    
     return restored["params"]
 
 
