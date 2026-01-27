@@ -379,13 +379,19 @@ def create_mcts_recurrent_fn():
 mcts_recurrent_fn = None
 
 
-def get_ai_action(state: GameState, num_simulations: int = 256, top_k: int = 32) -> Tuple[Optional[int], float]:
+def get_ai_action(
+    state: GameState, 
+    num_simulations: int = 256, 
+    top_k: int = 32,
+    temperature: float = 0.0,  # 0 = 贪婪选择，>0 = 温度采样增加多样性
+) -> Tuple[Optional[int], float]:
     """获取 AI 最佳着法
     
     Args:
         state: 当前游戏状态
         num_simulations: MCTS 模拟次数（越大越准，越慢）
         top_k: 每步考虑的最大着法数（越大越全面，越慢）
+        temperature: 采样温度，0=贪婪选择，>0=增加多样性（开局推荐0.3-0.5）
     """
     global rng_key, mcts_recurrent_fn
     
@@ -405,14 +411,14 @@ def get_ai_action(state: GameState, num_simulations: int = 256, top_k: int = 32)
 
     invalid_mask = ~state.jax_state.legal_action_mask
 
-    rng_key, sk = jax.random.split(rng_key)
+    rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
     root = mctx.RootFnOutput(
         prior_logits=logits, value=value,
         embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), state.jax_state)
     )
     
     policy_output = mctx.gumbel_muzero_policy(
-        params=model_mgr.params, rng_key=sk, root=root,
+        params=model_mgr.params, rng_key=sk1, root=root,
         recurrent_fn=mcts_recurrent_fn,
         num_simulations=num_simulations, 
         max_num_considered_actions=top_k,
@@ -424,7 +430,21 @@ def get_ai_action(state: GameState, num_simulations: int = 256, top_k: int = 32)
         search_value = -search_value
     
     weights = np.array(policy_output.action_weights[0])
-    action = int(jnp.argmax(weights))
+    
+    # 温度采样增加开局多样性
+    if temperature > 0:
+        legal_mask = np.array(state.jax_state.legal_action_mask)
+        # 对权重进行温度变换
+        log_weights = np.log(weights + 1e-10) / max(temperature, 1e-3)
+        log_weights = np.where(legal_mask, log_weights, -np.inf)
+        log_weights = log_weights - np.max(log_weights)
+        probs = np.exp(log_weights)
+        probs = np.where(legal_mask, probs, 0.0)
+        probs = probs / np.sum(probs)
+        # 随机采样
+        action = int(jax.random.choice(sk2, ACTION_SPACE_SIZE, p=jnp.array(probs)))
+    else:
+        action = int(np.argmax(weights))
     
     return action, search_value
 
@@ -448,7 +468,8 @@ class LoadModelRequest(BaseModel):
 
 class AIThinkRequest(BaseModel):
     num_simulations: int = 256  # MCTS 模拟次数
-    top_k: int = 32             # 考虑的最大着法数  # 无需额外参数，规则已完善
+    top_k: int = 32             # 考虑的最大着法数
+    temperature: float = 0.0    # 采样温度（0=贪婪，>0增加多样性，开局推荐0.3-0.5）
 
 
 class UCIThinkRequest(BaseModel):
@@ -690,7 +711,14 @@ async def ai_think(req: AIThinkRequest):
     if game_state.game_over:
         raise HTTPException(status_code=400, detail="Game is over")
     
-    action, value = get_ai_action(game_state, req.num_simulations, req.top_k)
+    # 自动开局多样性：前10步使用温度采样
+    auto_temp = req.temperature
+    if req.temperature == 0.0 and game_state.step_count < 10:
+        auto_temp = 0.4  # 开局自动增加多样性
+    
+    action, value = get_ai_action(
+        game_state, req.num_simulations, req.top_k, auto_temp
+    )
     if action is None:
         raise HTTPException(status_code=500, detail="AI failed to find a move")
     
@@ -701,6 +729,7 @@ async def ai_think(req: AIThinkRequest):
         "action": action,
         "uci": move_to_uci(int(fs), int(ts)),
         "value": value,
+        "temperature": auto_temp,  # 返回实际使用的温度
     }
 
 

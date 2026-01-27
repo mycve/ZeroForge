@@ -338,7 +338,13 @@ def loss_fn(params, samples: Sample, rng_key):
 
 @jax.pmap
 def evaluate(params_red, params_black, rng_key):
-    """高性能评估算子：双模型对战"""
+    """高性能评估算子：双模型对战
+    
+    开局多样性策略：
+    - 前 6 步（3回合）：高温度 0.8，产生多样化开局
+    - 6-20 步：中等温度 0.4，保持一定探索
+    - 20 步后：低温度 0.05，几乎贪婪（减少臭棋）
+    """
     batch_size = config.eval_games // num_devices
     
     def evaluate_recurrent_fn(params_pair, rng_key, action, state):
@@ -378,8 +384,14 @@ def evaluate(params_red, params_black, rng_key):
             invalid_actions=~state.legal_action_mask,
         )
         
-        # 评估多样性：前 20 步高温度采样，后续几乎贪婪（减少臭棋）
-        temp = jnp.where(state.step_count < 20, 0.5, 0.02)
+        # 分阶段温度策略，增加开局多样性
+        # 前 6 步（3回合）: 高温度产生多样化开局
+        # 6-20 步: 中等温度保持探索
+        # 20 步后: 低温度减少臭棋
+        temp = jnp.where(
+            state.step_count < 6, 0.8,
+            jnp.where(state.step_count < 20, 0.4, 0.05)
+        )
         
         def _sample_action(w, t, k, legal_mask):
             """温度采样 (log 空间避免数值下溢)"""
