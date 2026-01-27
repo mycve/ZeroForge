@@ -711,13 +711,8 @@ async def ai_think(req: AIThinkRequest):
     if game_state.game_over:
         raise HTTPException(status_code=400, detail="Game is over")
     
-    # 自动开局多样性：前10步使用温度采样
-    auto_temp = req.temperature
-    if req.temperature == 0.0 and game_state.step_count < 10:
-        auto_temp = 0.4  # 开局自动增加多样性
-    
     action, value = get_ai_action(
-        game_state, req.num_simulations, req.top_k, auto_temp
+        game_state, req.num_simulations, req.top_k, req.temperature
     )
     if action is None:
         raise HTTPException(status_code=500, detail="AI failed to find a move")
@@ -729,7 +724,7 @@ async def ai_think(req: AIThinkRequest):
         "action": action,
         "uci": move_to_uci(int(fs), int(ts)),
         "value": value,
-        "temperature": auto_temp,  # 返回实际使用的温度
+        "temperature": req.temperature,
     }
 
 

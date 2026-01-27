@@ -12,6 +12,15 @@ ZeroForge Web GUI - 启动入口
 """
 
 import argparse
+import signal
+import sys
+import os
+
+
+def _force_exit(signum, frame):
+    """强制退出，避免 JAX 清理线程阻塞"""
+    print("\n[服务器] 正在退出...")
+    os._exit(0)
 
 
 def run_web_gui(host: str = "0.0.0.0", port: int = 7860, share: bool = False):
@@ -23,6 +32,10 @@ def run_web_gui(host: str = "0.0.0.0", port: int = 7860, share: bool = False):
         port: 服务器端口，默认 7860
         share: 是否创建公共链接（暂不支持，保留兼容性）
     """
+    # 注册信号处理，确保 Ctrl+C 能快速退出
+    signal.signal(signal.SIGINT, _force_exit)
+    signal.signal(signal.SIGTERM, _force_exit)
+    
     import uvicorn
     from gui.api import app
     
