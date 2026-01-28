@@ -80,8 +80,8 @@ class Config:
     temperature_final: float = 0.01
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
-    random_opening_steps: int = 4     # 开局随机走 N 步（0=禁用）
-    random_opening_prob: float = 0.5  # 每局随机开局的概率
+    random_opening_steps: tuple = (2, 4, 6, 8, 12)  # 可选的开局随机步数（随机选择一个）
+    random_opening_prob: float = 0.7  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
@@ -190,15 +190,20 @@ def _random_opening_step(state, key):
 
 
 def _random_opening(state, key, num_steps):
-    """执行 N 步随机开局"""
-    def body_fn(carry, key):
-        s = carry
-        s = _random_opening_step(s, key)
-        return s, None
+    """执行 N 步随机开局（支持动态步数）"""
+    def cond_fn(carry):
+        _, step, target_steps, _ = carry
+        return step < target_steps
     
-    keys = jax.random.split(key, num_steps)
-    state, _ = jax.lax.scan(body_fn, state, keys)
-    return state
+    def body_fn(carry):
+        s, step, target_steps, k = carry
+        k, subkey = jax.random.split(k)
+        s = _random_opening_step(s, subkey)
+        return (s, step + 1, target_steps, k)
+    
+    init_carry = (state, 0, num_steps, key)
+    final_state, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
+    return final_state
 
 
 @jax.pmap
@@ -270,14 +275,20 @@ def selfplay(params, rng_key):
         )
         
         # 重置已结束的游戏，并有一定概率使用随机开局
+        # 将可选步数转为 JAX 数组
+        opening_steps_arr = jnp.array(config.random_opening_steps, dtype=jnp.int32)
+        num_options = len(config.random_opening_steps)
+        
         def _reset_with_random_opening(s, k):
-            k1, k2, k3 = jax.random.split(k, 3)
+            k1, k2, k3, k4 = jax.random.split(k, 4)
             new_state = env.init(k1)
             # 以一定概率执行随机开局
             do_random = jax.random.uniform(k2) < config.random_opening_prob
+            # 从可选步数中随机选择一个
+            selected_steps = opening_steps_arr[jax.random.randint(k3, (), 0, num_options)]
             new_state = jax.lax.cond(
-                do_random & (config.random_opening_steps > 0),
-                lambda: _random_opening(new_state, k3, config.random_opening_steps),
+                do_random & (selected_steps > 0),
+                lambda: _random_opening(new_state, k4, selected_steps),
                 lambda: new_state
             )
             return new_state
@@ -288,13 +299,19 @@ def selfplay(params, rng_key):
         return next_state_reset, data
 
     # 初始状态也有一定概率使用随机开局
+    # 将可选步数转为 JAX 数组（用于初始化）
+    init_opening_steps_arr = jnp.array(config.random_opening_steps, dtype=jnp.int32)
+    init_num_options = len(config.random_opening_steps)
+    
     def _init_with_random_opening(k):
-        k1, k2, k3 = jax.random.split(k, 3)
+        k1, k2, k3, k4 = jax.random.split(k, 4)
         state = env.init(k1)
         do_random = jax.random.uniform(k2) < config.random_opening_prob
+        # 从可选步数中随机选择一个
+        selected_steps = init_opening_steps_arr[jax.random.randint(k3, (), 0, init_num_options)]
         return jax.lax.cond(
-            do_random & (config.random_opening_steps > 0),
-            lambda: _random_opening(state, k3, config.random_opening_steps),
+            do_random & (selected_steps > 0),
+            lambda: _random_opening(state, k4, selected_steps),
             lambda: state
         )
     

@@ -420,19 +420,47 @@ class XiangqiEnv:
             is_max_steps = new_step_count >= self.max_steps
             is_no_attackers = no_attacking_pieces(new_board)
             
-            # 重复局面处理
-            # 重复+将军 = 长将（但现在用更精细的计数规则）
-            is_repetition_check = is_fivefold_repetition & is_check
-            # 重复+捉 = 长捉
-            is_repetition_chase = is_fivefold_repetition & is_chase & ~is_check
-            # 普通重复（非将非捉）= 和棋
-            is_normal_repetition = is_fivefold_repetition & ~is_check & ~is_chase
+            # ========== 重复局面处理（关键修复：考虑长将循环）==========
+            # 
+            # 问题场景：车炮连环将军
+            # 1. 红方走车将军 → is_check=True, red_check_count=1
+            # 2. 黑方应将（将上来）→ is_check=False, red_check_count=1（保持）
+            # 3. 红方走车继续将军 → is_check=True, red_check_count=2
+            # 4. 黑方应将（将下去）→ is_check=False, red_check_count=2（保持）
+            # 
+            # 当重复局面达到5次时：
+            # - 如果任一方 check_count >= 2，说明处于长将循环中
+            # - 此时应判长将方负，而不是和棋
+            # 
             
-            # 违规判负
+            # 检查是否存在活跃的长将循环（任一方连续将军 >= 2 回合）
+            has_active_perpetual_check = (new_red_check >= 2) | (new_black_check >= 2)
+            
+            # 重复局面 + 长将循环 = 长将判负
+            is_repetition_check = is_fivefold_repetition & (is_check | has_active_perpetual_check)
+            
+            # 确定长将的违规方（进行将军的一方）
+            perpetual_check_violator = jnp.where(
+                new_red_check > new_black_check,
+                jnp.int32(0),  # 红方在长将
+                jnp.where(
+                    new_black_check > new_red_check,
+                    jnp.int32(1),  # 黑方在长将
+                    state.current_player  # 相等时，当前走子方负
+                )
+            )
+            
+            # 重复+捉 = 长捉（排除长将循环）
+            is_repetition_chase = is_fivefold_repetition & is_chase & ~is_check & ~has_active_perpetual_check
+            
+            # 普通重复（非将非捉且不在长将循环中）= 和棋
+            is_normal_repetition = is_fivefold_repetition & ~is_check & ~is_chase & ~has_active_perpetual_check
+            
+            # 违规判负（来自 check_violation 的检测）
             has_violation = violation_type > 0
             violation_winner = jnp.where(violator == 0, 1, jnp.where(violator == 1, 0, -1))  # 违规方判负
             
-            # 综合和棋判断
+            # 综合和棋判断（注意：长将循环中的重复不判和棋）
             is_draw = is_max_steps | is_no_capture_draw | is_normal_repetition | is_no_attackers
             
             # 记录结束原因
@@ -470,15 +498,23 @@ class XiangqiEnv:
             
             # 确定最终胜者
             # 优先级: 将死/困毙 > 违规判负 > 重复局面判负 > 和棋
-            repetition_winner = jnp.where(state.current_player == 0, 1, 0)  # 重复时走子方判负
+            
+            # 长将重复：长将方判负
+            perpetual_check_winner = jnp.where(perpetual_check_violator == 0, 1, 0)
+            
+            # 长捉重复：走子方判负
+            repetition_chase_winner = jnp.where(state.current_player == 0, 1, 0)
             
             winner = jnp.where(
                 basic_winner != -1, basic_winner,  # 将死/困毙
                 jnp.where(
-                    has_violation, violation_winner,  # 违规判负
+                    has_violation, violation_winner,  # 违规判负（包含长将/长捉/将捉交替）
                     jnp.where(
-                        is_repetition_check | is_repetition_chase, repetition_winner,  # 重复+将/捉
-                        -1  # 和棋
+                        is_repetition_check, perpetual_check_winner,  # 重复+长将：长将方负
+                        jnp.where(
+                            is_repetition_chase, repetition_chase_winner,  # 重复+捉：走子方负
+                            -1  # 和棋
+                        )
                     )
                 )
             )
