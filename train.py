@@ -52,19 +52,19 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构
-    num_channels: int = 128
-    num_blocks: int = 8
+    # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
+    num_channels: int = 96
+    num_blocks: int = 6
     
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    td_lambda: float = 0.99  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
+    td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 128           # 增加模拟次数，提升关键局面搜索质量
-    top_k: int = 32
+    num_simulations: int = 400           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 8                        # 缩小根节点候选：让搜索更集中、更深
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
@@ -75,13 +75,13 @@ class Config:
     weight_decay: float = 1e-4
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
-    temperature_steps: int = 60
+    temperature_steps: int = 40
     temperature_initial: float = 1.0
-    temperature_final: float = 0.01
+    temperature_final: float = 0.1
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
-    random_opening_steps: tuple = (2, 4, 6, 8, 12)  # 可选的开局随机步数（随机选择一个）
-    random_opening_prob: float = 0.7  # 每局随机开局的概率
+    random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
+    random_opening_prob: float = 0.4  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
