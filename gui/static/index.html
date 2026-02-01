@@ -214,14 +214,14 @@
                                         <label class="block text-xs text-gray-600 mb-1">
                                             模拟次数: {{ aiSimulations }}
                                         </label>
-                                        <input type="range" v-model.number="aiSimulations" min="32" max="512" step="32"
+                                        <input type="range" v-model.number="aiSimulations" min="32" max="2048" step="32"
                                                class="w-full h-2">
                                     </div>
                                     <div>
                                         <label class="block text-xs text-gray-600 mb-1">
                                             Top-K: {{ aiTopK }}
                                         </label>
-                                        <input type="range" v-model.number="aiTopK" min="8" max="64" step="8"
+                                        <input type="range" v-model.number="aiTopK" min="4" max="64" step="8"
                                                class="w-full h-2">
                                     </div>
                                     <div>
