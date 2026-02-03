@@ -289,9 +289,10 @@ class PikafishStats:
 
 class BatchGameEngine:
     """
-    高效批量对弈引擎（多卡并行）
+    高效批量对弈引擎（多卡并行 + 异步流水线）
     - 多 GPU 并行 MCTS 搜索
     - Pikafish 进程池异步处理（共享）
+    - 事件驱动，无忙等待
     """
     
     def __init__(self, params, pikafish_pool: PikafishPool):
@@ -311,6 +312,10 @@ class BatchGameEngine:
         self.fish_request_queue = queue.Queue()
         self.fish_response_queue = queue.Queue()
         
+        # 追踪等待中的 Pikafish 请求数量
+        self.pending_fish_requests = 0
+        self.pending_lock = threading.Lock()
+        
         # 启动 Pikafish 工作线程
         self.fish_workers = []
         self.stop_event = threading.Event()
@@ -323,11 +328,12 @@ class BatchGameEngine:
         """Pikafish 工作线程：从请求队列取任务，结果放入响应队列"""
         while not self.stop_event.is_set():
             try:
-                game_id, fen = self.fish_request_queue.get(timeout=0.1)
+                # 降低超时时间，提高响应速度
+                game_id, fen = self.fish_request_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
                 
-            engine = self.pikafish_pool.acquire(timeout=5.0)
+            engine = self.pikafish_pool.acquire(timeout=1.0)
             if engine is None:
                 # 放回队列重试
                 self.fish_request_queue.put((game_id, fen))
@@ -338,10 +344,19 @@ class BatchGameEngine:
                 self.fish_response_queue.put((game_id, uci_move, score))
             finally:
                 self.pikafish_pool.release(engine)
+                # 减少等待计数
+                with self.pending_lock:
+                    self.pending_fish_requests -= 1
+    
+    def _submit_fish_request(self, game_id: int, fen: str):
+        """提交 Pikafish 请求并更新计数"""
+        with self.pending_lock:
+            self.pending_fish_requests += 1
+        self.fish_request_queue.put((game_id, fen))
     
     def run_batch(self, num_games: int, rng_key) -> tuple:
         """
-        运行一批对弈
+        运行一批对弈（事件驱动，无忙等待）
         
         Returns:
             (samples, stats)
@@ -349,7 +364,11 @@ class BatchGameEngine:
         self.stats.reset()
         self.collected_samples = []
         self.games.clear()
-        self.rng_key = rng_key  # 初始化 MCTS 搜索用的随机数
+        self.rng_key = rng_key
+        
+        # 重置等待计数
+        with self.pending_lock:
+            self.pending_fish_requests = 0
         
         # 初始化所有游戏
         game_keys = jax.random.split(rng_key, num_games)
@@ -373,32 +392,61 @@ class BatchGameEngine:
                 # 提交 Pikafish 请求
                 fen = board_to_fen(np.array(state.board), current_player)
                 game.pending_fen = fen
-                self.fish_request_queue.put((i, fen))
+                self._submit_fish_request(i, fen)
             
             self.games[i] = game
         
-        # 主循环：直到所有游戏结束
-        while any(not g.finished for g in self.games.values()):
+        # 主循环：事件驱动，无忙等待
+        finished_count = 0
+        while finished_count < num_games:
             # 1. 处理所有等待模型的游戏（GPU 批量推理）
-            self._process_model_turns()
+            model_processed = self._process_model_turns()
             
-            # 2. 处理 Pikafish 响应
-            self._process_fish_responses()
+            # 2. 处理 Pikafish 响应（非阻塞批量处理）
+            fish_processed = self._process_fish_responses()
             
-            # 小睡避免忙等
-            time.sleep(0.001)
+            # 更新完成计数
+            finished_count = sum(1 for g in self.games.values() if g.finished)
+            
+            # 如果所有游戏完成，退出
+            if finished_count >= num_games:
+                break
+            
+            # 事件驱动：只在没有工作可做时才等待
+            if not model_processed and not fish_processed:
+                # 检查是否还有等待模型的游戏
+                has_model_work = any(
+                    not g.finished and g.waiting_for == "model" 
+                    for g in self.games.values()
+                )
+                
+                if has_model_work:
+                    # 有模型工作但没处理到，短暂让出 CPU
+                    time.sleep(0.0001)
+                else:
+                    # 只剩 Pikafish 工作，阻塞等待响应（最多 5ms）
+                    try:
+                        game_id, uci_move, score = self.fish_response_queue.get(timeout=0.005)
+                        self._handle_single_fish_response(game_id, uci_move, score)
+                    except queue.Empty:
+                        pass
         
         # 收集样本
         return self._collect_samples(), self.stats
     
-    def _process_model_turns(self):
-        """批量处理所有等待模型的游戏（多卡并行 MCTS 搜索）"""
+    def _process_model_turns(self) -> int:
+        """
+        批量处理所有等待模型的游戏（多卡并行 MCTS 搜索）
+        
+        Returns:
+            处理的游戏数量
+        """
         # 收集所有等待模型的游戏
         model_games = [g for g in self.games.values() 
                        if not g.finished and g.waiting_for == "model"]
         
         if not model_games:
-            return
+            return 0
         
         n_games = len(model_games)
         
@@ -432,10 +480,10 @@ class BatchGameEngine:
         
         action_weights, root_values = pmap_mcts_search(self.params, batch_state, search_keys)
         
-        # reshape 回 (total_padded, action_space)
-        action_weights = np.array(action_weights).reshape(total_padded, -1)
-        # 只取真实游戏的结果
-        action_weights = action_weights[:n_games]
+        # 高效 GPU→CPU 同步：使用 jax.device_get 避免额外复制
+        # 直接在设备上 reshape 后再传回 CPU
+        action_weights = action_weights.reshape(total_padded, -1)[:n_games]
+        action_weights = jax.device_get(action_weights)  # 单次同步
         
         # 处理每个游戏
         for i, game in enumerate(model_games):
@@ -479,66 +527,80 @@ class BatchGameEngine:
                 game.waiting_for = "pikafish"
                 fen = board_to_fen(np.array(game.state.board), next_player)
                 game.pending_fen = fen
-                self.fish_request_queue.put((game.game_id, fen))
+                self._submit_fish_request(game.game_id, fen)
+        
+        return n_games  # 返回处理数量
     
-    def _process_fish_responses(self):
-        """处理 Pikafish 响应"""
+    def _handle_single_fish_response(self, game_id: int, uci_move: Optional[str], score: int):
+        """处理单个 Pikafish 响应"""
+        game = self.games.get(game_id)
+        if game is None or game.finished:
+            return
+        
+        current_player = int(game.state.current_player)
+        game.last_score = score if current_player == 0 else -score
+        
+        if uci_move is None:
+            self._finish_game(game)
+            return
+        
+        # 转换走法
+        try:
+            from_sq, to_sq = uci_to_move(uci_move)
+            action = int(move_to_action(jnp.int32(from_sq), jnp.int32(to_sq)))
+        except:
+            self._finish_game(game)
+            return
+        
+        if action < 0 or not game.state.legal_action_mask[action]:
+            self._finish_game(game)
+            return
+        
+        # 执行动作
+        game.state = env.step(game.state, action)
+        game.step += 1
+        
+        # 检查评分差提前结束
+        if (game.step % config.pikafish_resign_check_interval == 0 and
+            abs(game.last_score) >= config.pikafish_resign_threshold):
+            game.resigned = True
+            self._finish_game(game)
+            return
+        
+        # 检查游戏是否结束
+        if self._check_game_end(game):
+            return
+        
+        # 切换到等待模型
+        next_player = int(game.state.current_player)
+        is_model_turn = (next_player == 0) == game.model_plays_red
+        
+        if is_model_turn:
+            game.waiting_for = "model"
+        else:
+            game.waiting_for = "pikafish"
+            fen = board_to_fen(np.array(game.state.board), next_player)
+            game.pending_fen = fen
+            self._submit_fish_request(game.game_id, fen)
+    
+    def _process_fish_responses(self) -> int:
+        """
+        批量处理 Pikafish 响应（非阻塞）
+        
+        Returns:
+            处理的响应数量
+        """
+        processed = 0
         while True:
             try:
                 game_id, uci_move, score = self.fish_response_queue.get_nowait()
             except queue.Empty:
                 break
             
-            game = self.games.get(game_id)
-            if game is None or game.finished:
-                continue
-            
-            current_player = int(game.state.current_player)
-            game.last_score = score if current_player == 0 else -score
-            
-            if uci_move is None:
-                # Pikafish 无合法走法
-                self._finish_game(game)
-                continue
-            
-            # 转换走法
-            try:
-                from_sq, to_sq = uci_to_move(uci_move)
-                action = int(move_to_action(jnp.int32(from_sq), jnp.int32(to_sq)))
-            except:
-                self._finish_game(game)
-                continue
-            
-            if action < 0 or not game.state.legal_action_mask[action]:
-                self._finish_game(game)
-                continue
-            
-            # 执行动作
-            game.state = env.step(game.state, action)
-            game.step += 1
-            
-            # 检查评分差提前结束
-            if (game.step % config.pikafish_resign_check_interval == 0 and
-                abs(game.last_score) >= config.pikafish_resign_threshold):
-                game.resigned = True
-                self._finish_game(game)
-                continue
-            
-            # 检查游戏是否结束
-            if self._check_game_end(game):
-                continue
-            
-            # 切换到等待模型
-            next_player = int(game.state.current_player)
-            is_model_turn = (next_player == 0) == game.model_plays_red
-            
-            if is_model_turn:
-                game.waiting_for = "model"
-            else:
-                game.waiting_for = "pikafish"
-                fen = board_to_fen(np.array(game.state.board), next_player)
-                game.pending_fen = fen
-                self.fish_request_queue.put((game.game_id, fen))
+            self._handle_single_fish_response(game_id, uci_move, score)
+            processed += 1
+        
+        return processed
     
     def _check_game_end(self, game: GameInstance) -> bool:
         """检查游戏是否结束"""

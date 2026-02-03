@@ -92,12 +92,12 @@ class PikafishEngine:
             # 启动读取线程
             threading.Thread(target=self._read_stdout, daemon=True).start()
             
-            # UCI 握手
+            # UCI 握手（降低轮询间隔）
             self._send("uci")
             start = time.time()
             while time.time() - start < 10:  # 10 秒超时
                 try:
-                    line = self.output_queue.get(timeout=0.1)
+                    line = self.output_queue.get(timeout=0.01)  # 10ms 轮询
                     if "uciok" in line:
                         self.ready = True
                         print(f"[Pikafish {self.engine_id}] 启动成功")
@@ -151,7 +151,7 @@ class PikafishEngine:
             start = time.time()
             while time.time() - start < 2:
                 try:
-                    line = self.output_queue.get(timeout=0.1)
+                    line = self.output_queue.get(timeout=0.01)  # 10ms 轮询
                     if "readyok" in line:
                         return True
                 except queue.Empty:
@@ -159,7 +159,7 @@ class PikafishEngine:
             return False
         
     def get_best_move(self, fen: str) -> Tuple[Optional[str], int]:
-        """获取最佳走法和评分"""
+        """获取最佳走法和评分（优化轮询间隔）"""
         with self._lock:
             if self.process is None or not self.ready:
                 return None, 0
@@ -176,12 +176,14 @@ class PikafishEngine:
             
             best_move = None
             score = 0
-            wait_seconds = max(5.0, self.depth * 1.0)  # 根据深度调整等待时间
+            # 优化等待时间：浅深度不需要等太久
+            wait_seconds = max(2.0, self.depth * 0.5)
             start_time = time.time()
             
             while time.time() - start_time < wait_seconds:
                 try:
-                    line = self.output_queue.get(timeout=0.1)
+                    # 降低轮询间隔：5ms（从 100ms 降低 20 倍）
+                    line = self.output_queue.get(timeout=0.005)
                     
                     # 解析评分
                     if "score cp" in line:
