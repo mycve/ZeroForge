@@ -65,7 +65,7 @@ class Config:
     
     # MCTS 搜索（Gumbel AlphaZero）
     num_simulations: int = 128            # MCTS 模拟次数（越多越准，越慢）
-    top_k: int = 16                       # 根节点候选动作数
+    top_k: int = 32                       # 根节点候选动作数
     
     # 探索
     temperature_steps: int = 40
@@ -235,6 +235,7 @@ class GameInstance:
     # 收集的样本
     obs_list: List[np.ndarray] = field(default_factory=list)
     policy_list: List[np.ndarray] = field(default_factory=list)
+    value_list: List[float] = field(default_factory=list)  # MCTS 根节点价值
     
     # 游戏状态
     step: int = 0
@@ -483,7 +484,8 @@ class BatchGameEngine:
         # 高效 GPU→CPU 同步：使用 jax.device_get 避免额外复制
         # 直接在设备上 reshape 后再传回 CPU
         action_weights = action_weights.reshape(total_padded, -1)[:n_games]
-        action_weights = jax.device_get(action_weights)  # 单次同步
+        root_values = root_values.reshape(total_padded)[:n_games]
+        action_weights, root_values = jax.device_get((action_weights, root_values))  # 单次同步
         
         # 处理每个游戏
         for i, game in enumerate(model_games):
@@ -505,9 +507,14 @@ class BatchGameEngine:
             game.rng_key, subkey = jax.random.split(game.rng_key)
             action = int(jax.random.choice(subkey, ACTION_SPACE_SIZE, p=probs))
             
-            # 记录样本（使用 MCTS 权重作为策略目标）
+            # 记录样本（使用 MCTS 权重作为策略目标，MCTS 价值作为价值目标）
             game.obs_list.append(obs_list[i])
             game.policy_list.append(weights.astype(np.float32))  # MCTS 改进后的策略
+            # 根据执子方调整价值符号（始终从模型视角）
+            mcts_value = float(root_values[i])
+            if not game.model_plays_red:
+                mcts_value = -mcts_value  # 黑方视角翻转
+            game.value_list.append(mcts_value)
             
             # 执行动作
             game.state = env.step(game.state, action)
@@ -626,26 +633,50 @@ class BatchGameEngine:
         self.stats.add_game(game.model_won, game.pikafish_won, game.step, game.resigned)
     
     def _collect_samples(self) -> Optional[Sample]:
-        """收集所有游戏的样本"""
+        """
+        收集所有游戏的样本
+        
+        价值目标使用 TD(λ) 风格的混合：
+        - λ=0.95: 高权重给 MC 结果，低权重给 MCTS 价值
+        - 从后往前计算折扣回报，融合 MCTS 价值和最终结果
+        """
         all_obs = []
         all_policy = []
         all_values = []
+        
+        # TD(λ) 参数
+        td_lambda = 0.95  # λ 越大越接近 MC，越小越接近 TD(0)
+        gamma = 1.0       # 折扣因子（棋类游戏通常用 1.0）
         
         for game in self.games.values():
             if len(game.obs_list) == 0:
                 continue
             
-            # MC 目标
+            n_steps = len(game.obs_list)
+            
+            # 最终结果（MC 目标）
             if game.model_won:
-                value = 1.0
+                final_value = 1.0
             elif game.pikafish_won:
-                value = -1.0
+                final_value = -1.0
             else:
-                value = 0.0
+                final_value = 0.0
+            
+            # TD(λ) 回报：从后往前计算
+            # G_t = (1-λ) * V(s_t) + λ * (r_t + γ * G_{t+1})
+            # 简化版：G_t = (1-λ) * mcts_value_t + λ * G_{t+1}
+            td_returns = [0.0] * n_steps
+            G = final_value  # 从最终结果开始
+            
+            for t in range(n_steps - 1, -1, -1):
+                mcts_v = game.value_list[t] if t < len(game.value_list) else 0.0
+                # 混合：(1-λ)*MCTS价值 + λ*未来回报
+                td_returns[t] = (1.0 - td_lambda) * mcts_v + td_lambda * G
+                G = td_returns[t]  # 传递给前一个状态
             
             all_obs.extend(game.obs_list)
             all_policy.extend(game.policy_list)
-            all_values.extend([value] * len(game.obs_list))
+            all_values.extend(td_returns)
         
         if not all_obs:
             return None
@@ -1019,11 +1050,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZeroForge Pikafish 对弈训练")
     parser.add_argument("--pikafish_path", type=str, default="./pikafish")
     parser.add_argument("--engines", type=int, default=64, help="Pikafish 进程池大小")
-    parser.add_argument("--games", type=int, default=512, help="并发游戏数")
+    parser.add_argument("--games", type=int, default=1024, help="并发游戏数")
     parser.add_argument("--depth", type=int, default=1, help="Pikafish 初始深度")
     parser.add_argument("--resign", type=int, default=350, help="提前结束阈值")
-    parser.add_argument("--simulations", type=int, default=64, help="MCTS 模拟次数")
-    parser.add_argument("--top_k", type=int, default=16, help="MCTS 候选动作数")
+    parser.add_argument("--simulations", type=int, default=128, help="MCTS 模拟次数")
+    parser.add_argument("--top_k", type=int, default=32, help="MCTS 候选动作数")
     
     args = parser.parse_args()
     
