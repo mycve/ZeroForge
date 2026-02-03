@@ -429,19 +429,19 @@
             const messageType = ref('info');
             
             // 设置
-            const redType = ref('ZeroForge AI');
+            const redType = ref('Human');
             const blackType = ref('ZeroForge AI');
-            const uciDepth = ref(10);
-            const aiDelay = ref(500);  // AI 思考间隔(ms)
+            const uciDepth = ref(7);
+            const aiDelay = ref(100);  // AI 思考间隔(ms)
             const ckptDir = ref('checkpoints');
             const checkpoints = ref([]);
             const selectedStep = ref(null);
             const modelInfo = ref(null);
             const fenInput = ref('');
             const moveHistory = ref([]);  // 走棋历史
-            const aiSimulations = ref(256);  // MCTS 模拟次数
-            const aiTopK = ref(32);  // Top-K 着法
-            const aiTemperature = ref(0);  // 采样温度: 0=贪婪, >0=增加多样性
+            const aiSimulations = ref(512);  // MCTS 模拟次数
+            const aiTopK = ref(16);  // Top-K 着法
+            const aiTemperature = ref(0.1);  // 采样温度: 0=贪婪, >0=增加多样性
             
             // 计算属性
             const legalTargets = computed(() => {
