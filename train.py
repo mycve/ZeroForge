@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 ZeroForge - 中国象棋 Pikafish 对弈训练
-模型 vs Pikafish + 深度自适应 + 评分差提前结束
+高效架构：GPU 批量推理 + Pikafish 进程池异步轮询
 """
 
 import os
-import sys
 import time
 import json
 import warnings
 import argparse
 import threading
+import queue
 from functools import partial
-from typing import NamedTuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import NamedTuple, Optional, List, Dict
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.numpy as jnp
@@ -21,21 +22,19 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 
-# --- JAX 编译缓存配置 ---
+# --- JAX 配置 ---
 cache_dir = os.path.abspath("jax_cache")
 os.makedirs(cache_dir, exist_ok=True)
 jax.config.update("jax_compilation_cache_dir", cache_dir)
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-
-# --- XLA 编译加速 ---
 os.environ["XLA_FLAGS"] = "--xla_gpu_enable_highest_priority_async_stream=true"
 jax.config.update("jax_enable_x64", False)
 
-from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
+from xiangqi.env import XiangqiEnv, XiangqiState, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import (
     rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH,
-    action_to_move, move_to_action, uci_to_move, move_to_uci,
+    move_to_action, uci_to_move,
 )
 from xiangqi.mirror import mirror_observation, mirror_policy
 from xiangqi.pikafish import PikafishPool, board_to_fen
@@ -47,7 +46,6 @@ from tensorboardX import SummaryWriter
 # ============================================================================
 
 class Config:
-    # 基础配置
     seed: int = 42
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
@@ -56,76 +54,65 @@ class Config:
     num_channels: int = 96
     num_blocks: int = 6
     
-    # 训练超参数
+    # 训练
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    
-    # 经验回放配置
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 4
-    
-    # 损失权重
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
     
-    # 探索策略
+    # 探索
     temperature_steps: int = 40
     temperature_initial: float = 1.0
     temperature_final: float = 0.1
     
-    # 环境规则
+    # 环境
     max_steps: int = 200
-    max_no_capture_steps: int = 120
-    repetition_threshold: int = 5
     
-    # Checkpoint 配置
+    # Checkpoint
     ckpt_interval: int = 10
     max_to_keep: int = 20
     keep_period: int = 50
     
     # ========== Pikafish 对弈配置 ==========
-    pikafish_path: str = "./pikafish"        # Pikafish 可执行文件路径
-    pikafish_num_engines: int = 16           # Pikafish 引擎实例数量
-    pikafish_initial_depth: int = 1          # 初始搜索深度
-    pikafish_min_depth: int = 1              # 最小搜索深度
-    pikafish_max_depth: int = 30             # 最大搜索深度
+    pikafish_path: str = "./pikafish"
+    pikafish_num_engines: int = 64           # 进程池大小（建议 = CPU 核心数）
+    pikafish_concurrent_games: int = 256     # 同时进行的游戏数
+    pikafish_initial_depth: int = 1
+    pikafish_min_depth: int = 1
+    pikafish_max_depth: int = 30
     
-    # 深度自适应阈值
-    pikafish_depth_up_winrate: float = 0.80  # 胜率超过此值，深度 +1
-    pikafish_depth_down_winrate: float = 0.20  # 胜率低于此值，深度 -1
-    pikafish_winrate_window: int = 5         # 计算胜率的滑动窗口
+    # 深度自适应
+    pikafish_depth_up_winrate: float = 0.80
+    pikafish_depth_down_winrate: float = 0.20
+    pikafish_winrate_window: int = 5
     
     # 评分差提前结束
-    pikafish_resign_threshold: int = 350     # 评分差超过此值判定结束（厘兵）
-    pikafish_resign_check_interval: int = 5  # 每 N 步检查一次
+    pikafish_resign_threshold: int = 350
+    pikafish_resign_check_interval: int = 5
     
-    # 模型执子配置
-    pikafish_alternate_color: bool = True    # 交替执红执黑
+    # 交替执子
+    pikafish_alternate_color: bool = True
 
 config = Config()
 
 # ============================================================================
-# 环境和设备
+# 环境和模型
 # ============================================================================
 
 devices = jax.local_devices()
 num_devices = len(devices)
 
-# 预计算旋转索引
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
-_ROTATED_IDX_NP = np.array(_ROTATED_IDX)  # NumPy 版本用于索引
+_ROTATED_IDX_NP = np.array(_ROTATED_IDX)
 
 def replicate_to_devices(pytree):
-    """将 pytree 复制到所有设备"""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         return jax.device_put_replicated(pytree, devices)
 
-env = XiangqiEnv(
-    max_steps=config.max_steps,
-    max_no_capture_steps=config.max_no_capture_steps,
-    repetition_threshold=config.repetition_threshold,
-)
+env = XiangqiEnv(max_steps=config.max_steps)
 
 net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
@@ -135,27 +122,52 @@ net = AlphaZeroNetwork(
 )
 
 def forward(params, obs, is_training=False):
-    """前向传播"""
     logits, value = net.apply({'params': params}, obs, train=is_training)
     return logits, value
+
+# JIT 编译的批量推理
+@jax.jit
+def batch_forward(params, obs_batch):
+    """批量前向传播"""
+    logits, values = net.apply({'params': params}, obs_batch, train=False)
+    return logits, values
 
 # ============================================================================
 # 数据结构
 # ============================================================================
 
 class Sample(NamedTuple):
-    obs: jnp.ndarray        # 观察 (uint8)
-    policy_tgt: jnp.ndarray # 策略目标
-    value_tgt: jnp.ndarray  # 价值目标（MC 目标：最终结果）
-    mask: jnp.ndarray       # 掩码
+    obs: jnp.ndarray
+    policy_tgt: jnp.ndarray
+    value_tgt: jnp.ndarray
+    mask: jnp.ndarray
 
-# ============================================================================
-# Pikafish 对弈统计
-# ============================================================================
+@dataclass
+class GameInstance:
+    """单局游戏实例"""
+    game_id: int
+    state: XiangqiState
+    model_plays_red: bool
+    rng_key: jnp.ndarray
+    
+    # 收集的样本
+    obs_list: List[np.ndarray] = field(default_factory=list)
+    policy_list: List[np.ndarray] = field(default_factory=list)
+    
+    # 游戏状态
+    step: int = 0
+    last_score: int = 0
+    finished: bool = False
+    resigned: bool = False
+    model_won: bool = False
+    pikafish_won: bool = False
+    
+    # 当前等待状态
+    waiting_for: str = "model"  # "model" 或 "pikafish"
+    pending_fen: str = ""
+    pending_engine_id: int = -1
 
 class PikafishStats:
-    """Pikafish 对弈统计"""
-    
     def __init__(self):
         self.reset()
         
@@ -167,7 +179,7 @@ class PikafishStats:
         self.total_steps = 0
         self.resign_count = 0
         
-    def add_game(self, model_won: bool, pikafish_won: bool, steps: int, resigned: bool):
+    def add_game(self, model_won, pikafish_won, steps, resigned):
         self.games_played += 1
         self.total_steps += steps
         if resigned:
@@ -179,225 +191,315 @@ class PikafishStats:
         else:
             self.draws += 1
             
-    def get_winrate(self) -> float:
+    def get_winrate(self):
         if self.games_played == 0:
             return 0.5
         return (self.model_wins + 0.5 * self.draws) / self.games_played
         
-    def get_avg_length(self) -> float:
+    def get_avg_length(self):
         if self.games_played == 0:
             return 0.0
         return self.total_steps / self.games_played
 
 # ============================================================================
-# Pikafish 对弈
+# 高效对弈引擎
 # ============================================================================
 
-def play_single_game_vs_pikafish(
-    params_np: dict,
-    pikafish_engine,
-    model_plays_red: bool,
-    rng_key: jnp.ndarray,
-) -> tuple:
+class BatchGameEngine:
     """
-    与 Pikafish 进行单局对弈
-    
-    Returns:
-        (obs_list, policy_list, final_value, model_won, pikafish_won, steps, resigned)
+    高效批量对弈引擎
+    - GPU 批量推理模型走法
+    - Pikafish 进程池异步处理
     """
-    # 初始化环境
-    state = env.init(rng_key)
     
-    # 收集模型走的步骤
-    obs_list = []
-    action_weights_list = []
-    
-    resigned = False
-    step = 0
-    last_score = 0
-    
-    while not state.terminated and step < config.max_steps:
-        current_player = int(state.current_player)
-        is_model_turn = (current_player == 0) == model_plays_red
+    def __init__(self, params_np, pikafish_pool: PikafishPool):
+        self.params_np = params_np
+        self.pikafish_pool = pikafish_pool
+        self.games: Dict[int, GameInstance] = {}
+        self.stats = PikafishStats()
+        self.collected_samples = []
         
-        if is_model_turn:
-            # 模型走子
-            obs = env.observe(state)
-            obs_list.append(np.array(obs, dtype=np.uint8))
+        # Pikafish 请求/响应队列
+        self.fish_request_queue = queue.Queue()
+        self.fish_response_queue = queue.Queue()
+        
+        # 启动 Pikafish 工作线程
+        self.fish_workers = []
+        self.stop_event = threading.Event()
+        for i in range(pikafish_pool.num_engines):
+            t = threading.Thread(target=self._fish_worker, daemon=True)
+            t.start()
+            self.fish_workers.append(t)
+    
+    def _fish_worker(self):
+        """Pikafish 工作线程：从请求队列取任务，结果放入响应队列"""
+        while not self.stop_event.is_set():
+            try:
+                game_id, fen = self.fish_request_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+                
+            engine = self.pikafish_pool.acquire(timeout=5.0)
+            if engine is None:
+                # 放回队列重试
+                self.fish_request_queue.put((game_id, fen))
+                continue
+                
+            try:
+                uci_move, score = engine.get_best_move(fen)
+                self.fish_response_queue.put((game_id, uci_move, score))
+            finally:
+                self.pikafish_pool.release(engine)
+    
+    def run_batch(self, num_games: int, rng_key) -> tuple:
+        """
+        运行一批对弈
+        
+        Returns:
+            (samples, stats)
+        """
+        self.stats.reset()
+        self.collected_samples = []
+        self.games.clear()
+        
+        # 初始化所有游戏
+        game_keys = jax.random.split(rng_key, num_games)
+        for i in range(num_games):
+            state = env.init(game_keys[i])
+            model_plays_red = (i % 2 == 0) if config.pikafish_alternate_color else True
             
-            # 网络推理
-            logits, value = forward(params_np, obs[None, ...])
-            logits = np.array(logits[0])
+            game = GameInstance(
+                game_id=i,
+                state=state,
+                model_plays_red=model_plays_red,
+                rng_key=game_keys[i],
+            )
+            
+            # 确定第一步谁走
+            current_player = int(state.current_player)
+            is_model_turn = (current_player == 0) == model_plays_red
+            game.waiting_for = "model" if is_model_turn else "pikafish"
+            
+            if game.waiting_for == "pikafish":
+                # 提交 Pikafish 请求
+                fen = board_to_fen(np.array(state.board), current_player)
+                game.pending_fen = fen
+                self.fish_request_queue.put((i, fen))
+            
+            self.games[i] = game
+        
+        # 主循环：直到所有游戏结束
+        while any(not g.finished for g in self.games.values()):
+            # 1. 处理所有等待模型的游戏（GPU 批量推理）
+            self._process_model_turns()
+            
+            # 2. 处理 Pikafish 响应
+            self._process_fish_responses()
+            
+            # 小睡避免忙等
+            time.sleep(0.001)
+        
+        # 收集样本
+        return self._collect_samples(), self.stats
+    
+    def _process_model_turns(self):
+        """批量处理所有等待模型的游戏"""
+        # 收集所有等待模型的游戏
+        model_games = [g for g in self.games.values() 
+                       if not g.finished and g.waiting_for == "model"]
+        
+        if not model_games:
+            return
+        
+        # 批量获取观察
+        obs_list = []
+        for game in model_games:
+            obs = env.observe(game.state)
+            obs_list.append(np.array(obs))
+        
+        obs_batch = np.stack(obs_list, axis=0)
+        
+        # GPU 批量推理
+        logits_batch, values_batch = batch_forward(self.params_np, obs_batch)
+        logits_batch = np.array(logits_batch)
+        
+        # 处理每个游戏
+        for i, game in enumerate(model_games):
+            current_player = int(game.state.current_player)
+            logits = logits_batch[i]
             
             # 视角归一化
             if current_player == 1:
                 logits = logits[_ROTATED_IDX_NP]
             
             # 温度采样
-            temp = config.temperature_initial if step < config.temperature_steps else config.temperature_final
+            temp = config.temperature_initial if game.step < config.temperature_steps else config.temperature_final
             logits = logits - np.max(logits)
-            legal_mask = np.array(state.legal_action_mask)
+            legal_mask = np.array(game.state.legal_action_mask)
             logits = np.where(legal_mask, logits, -1e10)
             
             exp_logits = np.exp(logits / max(temp, 1e-3))
             probs = exp_logits / (np.sum(exp_logits) + 1e-10)
             
-            rng_key, subkey = jax.random.split(rng_key)
+            game.rng_key, subkey = jax.random.split(game.rng_key)
             action = int(jax.random.choice(subkey, ACTION_SPACE_SIZE, p=probs))
             
-            # 记录策略（归一化到红方视角）
-            action_weights = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
-            action_weights[action] = 1.0
+            # 记录样本
+            game.obs_list.append(obs_list[i].astype(np.uint8))
+            policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+            policy[action] = 1.0
             if current_player == 1:
-                action_weights = action_weights[_ROTATED_IDX_NP]
-            action_weights_list.append(action_weights)
+                policy = policy[_ROTATED_IDX_NP]
+            game.policy_list.append(policy)
             
-        else:
-            # Pikafish 走子
-            board_np = np.array(state.board)
-            fen = board_to_fen(board_np, current_player)
+            # 执行动作
+            game.state = env.step(game.state, action)
+            game.step += 1
             
-            uci_move, score = pikafish_engine.get_best_move(fen)
-            last_score = score if current_player == 0 else -score  # 统一为红方视角
+            # 检查游戏是否结束
+            if self._check_game_end(game):
+                continue
+            
+            # 切换到等待 Pikafish
+            next_player = int(game.state.current_player)
+            is_model_turn = (next_player == 0) == game.model_plays_red
+            
+            if is_model_turn:
+                game.waiting_for = "model"
+            else:
+                game.waiting_for = "pikafish"
+                fen = board_to_fen(np.array(game.state.board), next_player)
+                game.pending_fen = fen
+                self.fish_request_queue.put((game.game_id, fen))
+    
+    def _process_fish_responses(self):
+        """处理 Pikafish 响应"""
+        while True:
+            try:
+                game_id, uci_move, score = self.fish_response_queue.get_nowait()
+            except queue.Empty:
+                break
+            
+            game = self.games.get(game_id)
+            if game is None or game.finished:
+                continue
+            
+            current_player = int(game.state.current_player)
+            game.last_score = score if current_player == 0 else -score
             
             if uci_move is None:
-                break
-                
-            from_sq, to_sq = uci_to_move(uci_move)
-            action = int(move_to_action(jnp.int32(from_sq), jnp.int32(to_sq)))
+                # Pikafish 无合法走法
+                self._finish_game(game)
+                continue
             
-            if action < 0 or not state.legal_action_mask[action]:
-                print(f"[警告] Pikafish 走法转换失败: {uci_move}")
-                break
+            # 转换走法
+            try:
+                from_sq, to_sq = uci_to_move(uci_move)
+                action = int(move_to_action(jnp.int32(from_sq), jnp.int32(to_sq)))
+            except:
+                self._finish_game(game)
+                continue
             
-        # 执行动作
-        state = env.step(state, action)
-        step += 1
+            if action < 0 or not game.state.legal_action_mask[action]:
+                self._finish_game(game)
+                continue
+            
+            # 执行动作
+            game.state = env.step(game.state, action)
+            game.step += 1
+            
+            # 检查评分差提前结束
+            if (game.step % config.pikafish_resign_check_interval == 0 and
+                abs(game.last_score) >= config.pikafish_resign_threshold):
+                game.resigned = True
+                self._finish_game(game)
+                continue
+            
+            # 检查游戏是否结束
+            if self._check_game_end(game):
+                continue
+            
+            # 切换到等待模型
+            next_player = int(game.state.current_player)
+            is_model_turn = (next_player == 0) == game.model_plays_red
+            
+            if is_model_turn:
+                game.waiting_for = "model"
+            else:
+                game.waiting_for = "pikafish"
+                fen = board_to_fen(np.array(game.state.board), next_player)
+                game.pending_fen = fen
+                self.fish_request_queue.put((game.game_id, fen))
+    
+    def _check_game_end(self, game: GameInstance) -> bool:
+        """检查游戏是否结束"""
+        if game.state.terminated or game.step >= config.max_steps:
+            self._finish_game(game)
+            return True
+        return False
+    
+    def _finish_game(self, game: GameInstance):
+        """结束游戏，确定胜负"""
+        game.finished = True
         
-        # 检查评分差提前结束
-        if (step % config.pikafish_resign_check_interval == 0 and 
-            abs(last_score) >= config.pikafish_resign_threshold):
-            resigned = True
-            break
-    
-    # 确定胜负
-    if state.terminated:
-        winner = int(state.winner)
-    elif resigned:
-        winner = 0 if last_score > 0 else 1
-    else:
-        winner = -1
+        if game.state.terminated:
+            winner = int(game.state.winner)
+        elif game.resigned:
+            winner = 0 if game.last_score > 0 else 1
+        else:
+            winner = -1
         
-    model_won = (winner == 0) == model_plays_red if winner != -1 else False
-    pikafish_won = (winner == 0) != model_plays_red if winner != -1 else False
+        game.model_won = (winner == 0) == game.model_plays_red if winner != -1 else False
+        game.pikafish_won = (winner == 0) != game.model_plays_red if winner != -1 else False
+        
+        self.stats.add_game(game.model_won, game.pikafish_won, game.step, game.resigned)
     
-    # MC 目标：最终结果
-    if model_won:
-        final_value = 1.0
-    elif pikafish_won:
-        final_value = -1.0
-    else:
-        final_value = 0.0
-    
-    return (obs_list, action_weights_list, final_value, 
-            model_won, pikafish_won, step, resigned)
-
-
-def play_vs_pikafish_batch(
-    params,
-    pikafish_pool,
-    num_games: int,
-    rng_key: jnp.ndarray,
-) -> tuple:
-    """批量与 Pikafish 对弈"""
-    params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
-    
-    stats = PikafishStats()
-    all_obs = []
-    all_policy = []
-    all_values = []
-    
-    game_keys = jax.random.split(rng_key, num_games)
-    
-    def play_game(game_idx):
-        engine = pikafish_pool.acquire()
-        if engine is None:
+    def _collect_samples(self) -> Optional[Sample]:
+        """收集所有游戏的样本"""
+        all_obs = []
+        all_policy = []
+        all_values = []
+        
+        for game in self.games.values():
+            if len(game.obs_list) == 0:
+                continue
+            
+            # MC 目标
+            if game.model_won:
+                value = 1.0
+            elif game.pikafish_won:
+                value = -1.0
+            else:
+                value = 0.0
+            
+            all_obs.extend(game.obs_list)
+            all_policy.extend(game.policy_list)
+            all_values.extend([value] * len(game.obs_list))
+        
+        if not all_obs:
             return None
-        try:
-            engine.new_game()
-            model_plays_red = (game_idx % 2 == 0) if config.pikafish_alternate_color else True
-            return play_single_game_vs_pikafish(
-                params_np, engine, model_plays_red, game_keys[game_idx]
-            )
-        finally:
-            pikafish_pool.release(engine)
-    
-    # 并行对弈
-    with ThreadPoolExecutor(max_workers=pikafish_pool.num_engines) as executor:
-        futures = {executor.submit(play_game, i): i for i in range(num_games)}
         
-        for future in as_completed(futures):
-            result = future.result()
-            if result is None:
-                continue
-                
-            (obs_list, policy_list, final_value,
-             model_won, pikafish_won, steps, resigned) = result
-            
-            if len(obs_list) == 0:
-                continue
-            
-            # 收集样本（每个步骤都使用 MC 目标：最终结果）
-            all_obs.extend(obs_list)
-            all_policy.extend(policy_list)
-            all_values.extend([final_value] * len(obs_list))
-            
-            stats.add_game(model_won, pikafish_won, steps, resigned)
+        return Sample(
+            obs=jnp.array(np.array(all_obs, dtype=np.uint8)),
+            policy_tgt=jnp.array(np.array(all_policy, dtype=np.float32)),
+            value_tgt=jnp.array(np.array(all_values, dtype=np.float32)),
+            mask=jnp.ones(len(all_obs), dtype=jnp.bool_),
+        )
     
-    if len(all_obs) == 0:
-        return None, stats
-    
-    # 构造 Sample
-    samples = Sample(
-        obs=jnp.array(np.array(all_obs, dtype=np.uint8)),
-        policy_tgt=jnp.array(np.array(all_policy, dtype=np.float32)),
-        value_tgt=jnp.array(np.array(all_values, dtype=np.float32)),
-        mask=jnp.ones(len(all_obs), dtype=jnp.bool_),
-    )
-    
-    return samples, stats
-
-
-def adaptive_depth_update(current_depth: int, winrate_history: list) -> int:
-    """根据胜率自适应调整深度"""
-    window = config.pikafish_winrate_window
-    if len(winrate_history) < window:
-        return current_depth
-        
-    recent_winrate = sum(winrate_history[-window:]) / window
-    
-    new_depth = current_depth
-    if recent_winrate >= config.pikafish_depth_up_winrate:
-        new_depth = min(current_depth + 1, config.pikafish_max_depth)
-        print(f"[深度调整] 胜率 {recent_winrate:.1%} >= {config.pikafish_depth_up_winrate:.0%}, "
-              f"深度 {current_depth} → {new_depth}")
-    elif recent_winrate <= config.pikafish_depth_down_winrate:
-        new_depth = max(current_depth - 1, config.pikafish_min_depth)
-        print(f"[深度调整] 胜率 {recent_winrate:.1%} <= {config.pikafish_depth_down_winrate:.0%}, "
-              f"深度 {current_depth} → {new_depth}")
-              
-    return new_depth
+    def shutdown(self):
+        """关闭工作线程"""
+        self.stop_event.set()
+        for t in self.fish_workers:
+            t.join(timeout=1.0)
 
 # ============================================================================
 # 训练
 # ============================================================================
 
 def loss_fn(params, samples: Sample, rng_key):
-    """损失函数：策略 + 价值（MC 目标）"""
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
     
-    # 随机镜像增强
     do_mirror = jax.random.bernoulli(rng_key, 0.5)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
@@ -409,22 +511,17 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
-    # 策略损失
     policy_loss = jnp.sum(optax.softmax_cross_entropy(logits, policy_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
-    
-    # 价值损失（MC 目标）
     value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
     return total_loss, (policy_loss, value_loss)
 
 # ============================================================================
-# 经验回放缓冲区
+# 经验回放
 # ============================================================================
 
 class ReplayBuffer:
-    """NumPy 环形缓冲区"""
-    
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
@@ -436,7 +533,6 @@ class ReplayBuffer:
         self.total_added = 0
 
     def add(self, samples: Sample):
-        """添加样本"""
         obs_np = np.array(samples.obs, dtype=np.uint8)
         policy_np = np.array(samples.policy_tgt, dtype=np.float32)
         value_np = np.array(samples.value_tgt, dtype=np.float32)
@@ -455,7 +551,6 @@ class ReplayBuffer:
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key) -> Sample:
-        """采样"""
         idx = np.random.randint(0, self.size, size=batch_size)
         return Sample(
             obs=jnp.asarray(self.obs[idx], dtype=jnp.uint8),
@@ -468,7 +563,7 @@ class ReplayBuffer:
         return {"size": self.size, "total_added": self.total_added}
 
 # ============================================================================
-# Checkpoint 管理
+# Checkpoint
 # ============================================================================
 
 class TrainState(NamedTuple):
@@ -477,11 +572,10 @@ class TrainState(NamedTuple):
     iteration: int
     frames: int
     rng_key: jnp.ndarray
-    pikafish_depth: int  # 当前 Pikafish 深度
-    winrate_history: list  # 胜率历史
+    pikafish_depth: int
+    winrate_history: list
 
-
-def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
+def create_checkpoint_manager(ckpt_dir: str):
     ckpt_dir = os.path.abspath(ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
     options = ocp.CheckpointManagerOptions(
@@ -491,9 +585,7 @@ def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
     )
     return ocp.CheckpointManager(directory=ckpt_dir, options=options)
 
-
-def save_checkpoint(ckpt_manager: ocp.CheckpointManager, train_state: TrainState, step: int):
-    """保存 checkpoint"""
+def save_checkpoint(ckpt_manager, train_state: TrainState, step: int):
     params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.params))
     opt_state_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.opt_state))
     
@@ -507,7 +599,6 @@ def save_checkpoint(ckpt_manager: ocp.CheckpointManager, train_state: TrainState
     }
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
     
-    # 保存胜率历史
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     with open(os.path.join(meta_dir, "winrate_history.json"), "w") as f:
@@ -515,15 +606,13 @@ def save_checkpoint(ckpt_manager: ocp.CheckpointManager, train_state: TrainState
     
     print(f"[Checkpoint] 已保存 step={step}, depth={train_state.pikafish_depth}")
 
-
-def restore_checkpoint(ckpt_manager: ocp.CheckpointManager, params_template: dict, opt_state_template: dict) -> Optional[tuple]:
-    """恢复 checkpoint"""
+def restore_checkpoint(ckpt_manager, params_template, opt_state_template):
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
-        print("[Checkpoint] 未找到已有 checkpoint，从头开始训练")
+        print("[Checkpoint] 未找到 checkpoint，从头开始")
         return None
     
-    print(f"[Checkpoint] 正在恢复 step={latest_step}...")
+    print(f"[Checkpoint] 恢复 step={latest_step}...")
     
     restore_target = {
         "params": params_template,
@@ -543,7 +632,6 @@ def restore_checkpoint(ckpt_manager: ocp.CheckpointManager, params_template: dic
     rng_key = restored["rng_key"]
     pikafish_depth = int(restored["pikafish_depth"])
     
-    # 恢复胜率历史
     winrate_history = []
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{latest_step}")
     history_file = os.path.join(meta_dir, "winrate_history.json")
@@ -551,46 +639,59 @@ def restore_checkpoint(ckpt_manager: ocp.CheckpointManager, params_template: dic
         with open(history_file, "r") as f:
             winrate_history = json.load(f)
     
-    print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, depth={pikafish_depth}")
+    print(f"[Checkpoint] 恢复完成: iteration={iteration}, depth={pikafish_depth}")
     return params, opt_state, iteration, frames, rng_key, pikafish_depth, winrate_history
+
+def adaptive_depth_update(current_depth: int, winrate_history: list) -> int:
+    window = config.pikafish_winrate_window
+    if len(winrate_history) < window:
+        return current_depth
+        
+    recent_winrate = sum(winrate_history[-window:]) / window
+    
+    new_depth = current_depth
+    if recent_winrate >= config.pikafish_depth_up_winrate:
+        new_depth = min(current_depth + 1, config.pikafish_max_depth)
+        print(f"[深度调整] 胜率 {recent_winrate:.1%} >= {config.pikafish_depth_up_winrate:.0%}, 深度 {current_depth} → {new_depth}")
+    elif recent_winrate <= config.pikafish_depth_down_winrate:
+        new_depth = max(current_depth - 1, config.pikafish_min_depth)
+        print(f"[深度调整] 胜率 {recent_winrate:.1%} <= {config.pikafish_depth_down_winrate:.0%}, 深度 {current_depth} → {new_depth}")
+              
+    return new_depth
 
 # ============================================================================
 # 主循环
 # ============================================================================
 
 def main():
-    print("=" * 60)
-    print("ZeroForge - Pikafish 对弈训练")
-    print("=" * 60)
+    print("=" * 70)
+    print("ZeroForge - Pikafish 对弈训练（高效批量架构）")
+    print("=" * 70)
     print(f"Pikafish 路径: {config.pikafish_path}")
-    print(f"引擎数量: {config.pikafish_num_engines}")
+    print(f"进程池大小: {config.pikafish_num_engines}")
+    print(f"并发游戏数: {config.pikafish_concurrent_games}")
     print(f"初始深度: {config.pikafish_initial_depth}")
     print(f"深度范围: [{config.pikafish_min_depth}, {config.pikafish_max_depth}]")
-    print(f"深度+1 阈值: 胜率 >= {config.pikafish_depth_up_winrate:.0%}")
-    print(f"深度-1 阈值: 胜率 <= {config.pikafish_depth_down_winrate:.0%}")
-    print(f"提前结束: 评分差 >= {config.pikafish_resign_threshold} cp")
-    print("=" * 60)
+    print(f"GPU 数量: {num_devices}")
+    print("=" * 70)
     
-    # 启动 Pikafish 引擎池
+    # 启动 Pikafish 进程池
     pikafish_pool = PikafishPool(config.pikafish_path, config.pikafish_num_engines)
     success_count = pikafish_pool.start()
     
     if success_count == 0:
         print("[错误] 无法启动 Pikafish 引擎！")
-        print("请确保 pikafish 在 PATH 中，或使用 --pikafish_path 指定路径")
         return
     
-    # 创建目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
     
-    # 初始化回放缓冲区
+    # 初始化
     replay_buffer = ReplayBuffer(
         max_size=config.replay_buffer_size,
         obs_shape=(NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH),
         action_size=ACTION_SPACE_SIZE
     )
     
-    # 初始化模型
     rng_key = jax.random.PRNGKey(config.seed)
     rng_key, subkey = jax.random.split(rng_key)
     dummy_obs = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH))
@@ -600,13 +701,11 @@ def main():
     optimizer = optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
-    # 尝试恢复
     ckpt_manager = create_checkpoint_manager(config.ckpt_dir)
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template)
     
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, current_depth, winrate_history = restored
-        print(f"[断点续训] iteration={iteration}, depth={current_depth}")
     else:
         params = params_template
         opt_state = opt_state_template
@@ -615,7 +714,6 @@ def main():
         current_depth = config.pikafish_initial_depth
         winrate_history = []
     
-    # 设置深度
     pikafish_pool.set_depth(current_depth)
     
     # 分发到设备
@@ -630,24 +728,32 @@ def main():
     
     writer = SummaryWriter(config.log_dir)
     
-    print(f"\n开始训练！每次迭代对弈 {config.pikafish_num_engines * 4} 局\n")
+    # 获取 CPU 参数用于推理
+    params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
+    
+    # 创建批量对弈引擎
+    game_engine = BatchGameEngine(params_np, pikafish_pool)
+    
+    print(f"\n开始训练！每轮 {config.pikafish_concurrent_games} 局并发对弈\n")
     
     try:
         while True:
             iteration += 1
             st = time.time()
             
-            # 与 Pikafish 对弈
-            rng_key, sk = jax.random.split(rng_key)
-            num_games = config.pikafish_num_engines * 4
+            # 更新推理参数
+            params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
+            game_engine.params_np = params_np
             
-            samples, stats = play_vs_pikafish_batch(params, pikafish_pool, num_games, sk)
+            # 批量对弈
+            rng_key, sk = jax.random.split(rng_key)
+            samples, stats = game_engine.run_batch(config.pikafish_concurrent_games, sk)
             
             if samples is None:
-                print(f"[警告] 迭代 {iteration} 未收集到样本")
+                print(f"[警告] 迭代 {iteration} 无样本")
                 continue
             
-            # 更新胜率历史和深度
+            # 更新胜率和深度
             winrate = stats.get_winrate()
             winrate_history.append(winrate)
             
@@ -656,13 +762,13 @@ def main():
                 current_depth = new_depth
                 pikafish_pool.set_depth(current_depth)
             
-            # 添加到缓冲区
+            # 添加样本
             replay_buffer.add(samples)
             new_frames = len(samples.obs)
             frames += new_frames
             
             # 训练
-            num_updates = max(1, min((new_frames * config.sample_reuse_times) // config.training_batch_size, 10))
+            num_updates = max(1, min((new_frames * config.sample_reuse_times) // config.training_batch_size, 20))
             
             sample_keys = jax.random.split(rng_key, num_updates + 1)
             rng_key = sample_keys[0]
@@ -691,27 +797,23 @@ def main():
                     vloss_acc = vloss_acc + vloss
                 actual_updates += 1
             
-            # 计算损失
             if actual_updates > 0:
                 avg_ploss = float(ploss_acc.mean() / actual_updates)
                 avg_vloss = float(vloss_acc.mean() / actual_updates)
             else:
                 avg_ploss, avg_vloss = 0.0, 0.0
             
-            # 统计
             iter_time = time.time() - st
             fps = new_frames / iter_time
             buf_stats = replay_buffer.stats()
             avg_len = stats.get_avg_length()
             
-            # 打印日志
             print(f"iter={iteration:4d} | depth={current_depth:2d} | "
                   f"胜率={winrate:.1%} (模型{stats.model_wins} 鱼{stats.pikafish_wins} 和{stats.draws}) | "
                   f"len={avg_len:.1f} resign={stats.resign_count} | "
                   f"ploss={avg_ploss:.4f} vloss={avg_vloss:.4f} | "
                   f"fps={fps:.0f} buf={buf_stats['size']//1000}k")
             
-            # TensorBoard
             writer.add_scalar("pikafish/depth", current_depth, iteration)
             writer.add_scalar("pikafish/winrate", winrate, iteration)
             writer.add_scalar("pikafish/model_wins", stats.model_wins, iteration)
@@ -724,7 +826,6 @@ def main():
             writer.add_scalar("stats/fps", fps, iteration)
             writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
             
-            # 保存 checkpoint
             if iteration % config.ckpt_interval == 0:
                 train_state = TrainState(
                     params=params,
@@ -740,25 +841,24 @@ def main():
     except KeyboardInterrupt:
         print("\n[中断] 正在关闭...")
     finally:
+        game_engine.shutdown()
         pikafish_pool.shutdown()
-        print("[完成] Pikafish 引擎已关闭")
+        print("[完成] 已关闭")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZeroForge Pikafish 对弈训练")
-    parser.add_argument("--pikafish_path", type=str, default="./pikafish",
-                        help="Pikafish 可执行文件路径")
-    parser.add_argument("--engines", type=int, default=16,
-                        help="Pikafish 引擎数量")
-    parser.add_argument("--depth", type=int, default=1,
-                        help="初始搜索深度")
-    parser.add_argument("--resign", type=int, default=350,
-                        help="评分差提前结束阈值（厘兵）")
+    parser.add_argument("--pikafish_path", type=str, default="./pikafish")
+    parser.add_argument("--engines", type=int, default=64, help="Pikafish 进程池大小")
+    parser.add_argument("--games", type=int, default=256, help="并发游戏数")
+    parser.add_argument("--depth", type=int, default=1, help="初始深度")
+    parser.add_argument("--resign", type=int, default=350, help="提前结束阈值")
     
     args = parser.parse_args()
     
     config.pikafish_path = args.pikafish_path
     config.pikafish_num_engines = args.engines
+    config.pikafish_concurrent_games = args.games
     config.pikafish_initial_depth = args.depth
     config.pikafish_resign_threshold = args.resign
     
