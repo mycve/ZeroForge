@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import mctx
 import orbax.checkpoint as ocp
 
 # --- JAX 配置 ---
@@ -61,6 +62,10 @@ class Config:
     sample_reuse_times: int = 4
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
+    
+    # MCTS 搜索（Gumbel AlphaZero）
+    num_simulations: int = 128            # MCTS 模拟次数（越多越准，越慢）
+    top_k: int = 16                       # 根节点候选动作数
     
     # 探索
     temperature_steps: int = 40
@@ -131,6 +136,83 @@ def batch_forward(params, obs_batch):
     """批量前向传播"""
     logits, values = net.apply({'params': params}, obs_batch, train=False)
     return logits, values
+
+def recurrent_fn(params, rng_key, action, state):
+    """MCTS 递归函数"""
+    prev_player = state.current_player
+    state = jax.vmap(env.step)(state, action)
+    obs = jax.vmap(env.observe)(state)
+    logits, value = forward(params, obs)
+    
+    # 视角归一化
+    logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    
+    reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
+    value = jnp.where(state.terminated, 0.0, value)
+    discount = jnp.where(state.terminated, 0.0, -1.0)
+    
+    return mctx.RecurrentFnOutput(reward=reward, discount=discount, prior_logits=logits, value=value), state
+
+def _single_device_mcts(params, states, rng_key):
+    """
+    单设备 MCTS 搜索（内部函数）
+    
+    Args:
+        params: 模型参数
+        states: 批量游戏状态 (batch, ...)
+        rng_key: 随机数
+        
+    Returns:
+        action_weights: (batch, action_space) 策略权重
+        root_values: (batch,) 根节点价值
+    """
+    obs = jax.vmap(env.observe)(states)
+    logits, values = forward(params, obs)
+    
+    # 视角归一化
+    is_red = states.current_player == 0
+    logits = jnp.where(is_red[:, None], logits, logits[:, _ROTATED_IDX])
+    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+    logits = jnp.where(states.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    
+    root = mctx.RootFnOutput(prior_logits=logits, value=values, embedding=states)
+    
+    policy_output = mctx.gumbel_muzero_policy(
+        params=params,
+        rng_key=rng_key,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=config.num_simulations,
+        max_num_considered_actions=config.top_k,
+        invalid_actions=~states.legal_action_mask,
+    )
+    
+    # 归一化策略权重到红方视角
+    action_weights = policy_output.action_weights
+    action_weights = jnp.where(is_red[:, None], action_weights, action_weights[:, _ROTATED_IDX])
+    
+    root_values = policy_output.search_tree.node_values[:, 0]
+    
+    return action_weights, root_values
+
+# 多卡并行 MCTS 搜索
+@partial(jax.pmap, axis_name='d')
+def pmap_mcts_search(params, states, rng_key):
+    """
+    多卡并行 MCTS 搜索
+    
+    Args:
+        params: 模型参数（已复制到各设备）
+        states: 批量游戏状态 (num_devices, batch_per_device, ...)
+        rng_key: 随机数 (num_devices, 2)
+        
+    Returns:
+        action_weights: (num_devices, batch_per_device, action_space)
+        root_values: (num_devices, batch_per_device)
+    """
+    return _single_device_mcts(params, states, rng_key)
 
 # ============================================================================
 # 数据结构
@@ -207,17 +289,23 @@ class PikafishStats:
 
 class BatchGameEngine:
     """
-    高效批量对弈引擎
-    - GPU 批量推理模型走法
-    - Pikafish 进程池异步处理
+    高效批量对弈引擎（多卡并行）
+    - 多 GPU 并行 MCTS 搜索
+    - Pikafish 进程池异步处理（共享）
     """
     
-    def __init__(self, params_np, pikafish_pool: PikafishPool):
-        self.params_np = params_np
+    def __init__(self, params, pikafish_pool: PikafishPool):
+        """
+        Args:
+            params: 已复制到各设备的模型参数
+            pikafish_pool: Pikafish 进程池（所有设备共享）
+        """
+        self.params = params  # 已复制到各设备
         self.pikafish_pool = pikafish_pool
         self.games: Dict[int, GameInstance] = {}
         self.stats = PikafishStats()
         self.collected_samples = []
+        self.rng_key = jax.random.PRNGKey(0)  # MCTS 搜索用的随机数
         
         # Pikafish 请求/响应队列
         self.fish_request_queue = queue.Queue()
@@ -261,6 +349,7 @@ class BatchGameEngine:
         self.stats.reset()
         self.collected_samples = []
         self.games.clear()
+        self.rng_key = rng_key  # 初始化 MCTS 搜索用的随机数
         
         # 初始化所有游戏
         game_keys = jax.random.split(rng_key, num_games)
@@ -303,7 +392,7 @@ class BatchGameEngine:
         return self._collect_samples(), self.stats
     
     def _process_model_turns(self):
-        """批量处理所有等待模型的游戏"""
+        """批量处理所有等待模型的游戏（多卡并行 MCTS 搜索）"""
         # 收集所有等待模型的游戏
         model_games = [g for g in self.games.values() 
                        if not g.finished and g.waiting_for == "model"]
@@ -311,46 +400,66 @@ class BatchGameEngine:
         if not model_games:
             return
         
-        # 批量获取观察
-        obs_list = []
-        for game in model_games:
-            obs = env.observe(game.state)
-            obs_list.append(np.array(obs))
+        n_games = len(model_games)
         
-        obs_batch = np.stack(obs_list, axis=0)
+        # 计算每个设备的批量大小（向上取整，需要 padding）
+        batch_per_device = (n_games + num_devices - 1) // num_devices
+        total_padded = batch_per_device * num_devices
         
-        # GPU 批量推理
-        logits_batch, values_batch = batch_forward(self.params_np, obs_batch)
-        logits_batch = np.array(logits_batch)
+        # 收集状态并 padding
+        states_list = [g.state for g in model_games]
+        
+        # 用第一个状态 padding
+        dummy_state = states_list[0]
+        while len(states_list) < total_padded:
+            states_list.append(dummy_state)
+        
+        # 堆叠状态为批量
+        batch_state = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *states_list)
+        
+        # reshape 为 (num_devices, batch_per_device, ...)
+        batch_state = jax.tree.map(
+            lambda x: x.reshape(num_devices, batch_per_device, *x.shape[1:]), 
+            batch_state
+        )
+        
+        # 批量获取观察（用于记录样本，只需要真实游戏的）
+        obs_list = [np.array(env.observe(g.state), dtype=np.uint8) for g in model_games]
+        
+        # 多卡并行 MCTS 搜索
+        self.rng_key, *search_keys = jax.random.split(self.rng_key, num_devices + 1)
+        search_keys = jnp.stack(search_keys, axis=0)  # (num_devices, 2)
+        
+        action_weights, root_values = pmap_mcts_search(self.params, batch_state, search_keys)
+        
+        # reshape 回 (total_padded, action_space)
+        action_weights = np.array(action_weights).reshape(total_padded, -1)
+        # 只取真实游戏的结果
+        action_weights = action_weights[:n_games]
         
         # 处理每个游戏
         for i, game in enumerate(model_games):
             current_player = int(game.state.current_player)
-            logits = logits_batch[i]
-            
-            # 视角归一化
-            if current_player == 1:
-                logits = logits[_ROTATED_IDX_NP]
+            weights = action_weights[i]  # 已经归一化到红方视角
             
             # 温度采样
             temp = config.temperature_initial if game.step < config.temperature_steps else config.temperature_final
-            logits = logits - np.max(logits)
             legal_mask = np.array(game.state.legal_action_mask)
-            logits = np.where(legal_mask, logits, -1e10)
             
-            exp_logits = np.exp(logits / max(temp, 1e-3))
-            probs = exp_logits / (np.sum(exp_logits) + 1e-10)
+            # 从 MCTS 权重采样
+            log_weights = np.log(weights + 1e-10) / max(temp, 1e-3)
+            log_weights = np.where(legal_mask, log_weights, -np.inf)
+            log_weights = log_weights - np.max(log_weights)
+            probs = np.exp(log_weights)
+            probs = np.where(legal_mask, probs, 0.0)
+            probs = probs / (np.sum(probs) + 1e-10)
             
             game.rng_key, subkey = jax.random.split(game.rng_key)
             action = int(jax.random.choice(subkey, ACTION_SPACE_SIZE, p=probs))
             
-            # 记录样本
-            game.obs_list.append(obs_list[i].astype(np.uint8))
-            policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
-            policy[action] = 1.0
-            if current_player == 1:
-                policy = policy[_ROTATED_IDX_NP]
-            game.policy_list.append(policy)
+            # 记录样本（使用 MCTS 权重作为策略目标）
+            game.obs_list.append(obs_list[i])
+            game.policy_list.append(weights.astype(np.float32))  # MCTS 改进后的策略
             
             # 执行动作
             game.state = env.step(game.state, action)
@@ -665,13 +774,15 @@ def adaptive_depth_update(current_depth: int, winrate_history: list) -> int:
 
 def main():
     print("=" * 70)
-    print("ZeroForge - Pikafish 对弈训练（高效批量架构）")
+    print("ZeroForge - Pikafish 对弈训练（Gumbel MCTS + 批量架构）")
     print("=" * 70)
     print(f"Pikafish 路径: {config.pikafish_path}")
     print(f"进程池大小: {config.pikafish_num_engines}")
     print(f"并发游戏数: {config.pikafish_concurrent_games}")
-    print(f"初始深度: {config.pikafish_initial_depth}")
+    print(f"Pikafish 初始深度: {config.pikafish_initial_depth}")
     print(f"深度范围: [{config.pikafish_min_depth}, {config.pikafish_max_depth}]")
+    print(f"MCTS 模拟次数: {config.num_simulations}")
+    print(f"MCTS 候选动作: {config.top_k}")
     print(f"GPU 数量: {num_devices}")
     print("=" * 70)
     
@@ -728,22 +839,18 @@ def main():
     
     writer = SummaryWriter(config.log_dir)
     
-    # 获取 CPU 参数用于推理
-    params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
+    # 创建批量对弈引擎（使用已复制到各设备的参数）
+    game_engine = BatchGameEngine(params, pikafish_pool)
     
-    # 创建批量对弈引擎
-    game_engine = BatchGameEngine(params_np, pikafish_pool)
-    
-    print(f"\n开始训练！每轮 {config.pikafish_concurrent_games} 局并发对弈\n")
+    print(f"\n开始训练！{num_devices} GPU 并行，每轮 {config.pikafish_concurrent_games} 局并发对弈\n")
     
     try:
         while True:
             iteration += 1
             st = time.time()
             
-            # 更新推理参数
-            params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
-            game_engine.params_np = params_np
+            # 更新推理参数（已复制到各设备）
+            game_engine.params = params
             
             # 批量对弈
             rng_key, sk = jax.random.split(rng_key)
@@ -850,9 +957,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZeroForge Pikafish 对弈训练")
     parser.add_argument("--pikafish_path", type=str, default="./pikafish")
     parser.add_argument("--engines", type=int, default=64, help="Pikafish 进程池大小")
-    parser.add_argument("--games", type=int, default=256, help="并发游戏数")
-    parser.add_argument("--depth", type=int, default=1, help="初始深度")
+    parser.add_argument("--games", type=int, default=512, help="并发游戏数")
+    parser.add_argument("--depth", type=int, default=1, help="Pikafish 初始深度")
     parser.add_argument("--resign", type=int, default=350, help="提前结束阈值")
+    parser.add_argument("--simulations", type=int, default=64, help="MCTS 模拟次数")
+    parser.add_argument("--top_k", type=int, default=16, help="MCTS 候选动作数")
     
     args = parser.parse_args()
     
@@ -861,5 +970,7 @@ if __name__ == "__main__":
     config.pikafish_concurrent_games = args.games
     config.pikafish_initial_depth = args.depth
     config.pikafish_resign_threshold = args.resign
+    config.num_simulations = args.simulations
+    config.top_k = args.top_k
     
     main()
