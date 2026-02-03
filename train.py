@@ -84,7 +84,7 @@ class Config:
     keep_period: int = 50
     
     # ========== Pikafish 对弈配置 ==========
-    pikafish_path: str = "pikafish"          # Pikafish 可执行文件路径
+    pikafish_path: str = "./pikafish"        # Pikafish 可执行文件路径
     pikafish_num_engines: int = 16           # Pikafish 引擎实例数量
     pikafish_initial_depth: int = 1          # 初始搜索深度
     pikafish_min_depth: int = 1              # 最小搜索深度
@@ -746,7 +746,7 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZeroForge Pikafish 对弈训练")
-    parser.add_argument("--pikafish_path", type=str, default="pikafish",
+    parser.add_argument("--pikafish_path", type=str, default="./pikafish",
                         help="Pikafish 可执行文件路径")
     parser.add_argument("--engines", type=int, default=16,
                         help="Pikafish 引擎数量")
