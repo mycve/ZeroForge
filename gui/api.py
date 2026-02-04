@@ -191,26 +191,44 @@ class ModelManager:
         self.step = 0
         self.channels = 0
         self.num_blocks = 0
+        self.last_error = ""
 
     def _infer_channels(self, params) -> Optional[int]:
+        # GNN 结构：首个 Dense_0 的输出维度即 channels
         try:
-            conv0 = params.get("Conv_0") if hasattr(params, "get") else params["Conv_0"]
-            return int(conv0["kernel"].shape[-1])
+            if hasattr(params, "get") and params.get("Dense_0") is not None:
+                dense0 = params.get("Dense_0")
+                return int(dense0["kernel"].shape[-1])
+            if "Dense_0" in params:
+                dense0 = params["Dense_0"]
+                return int(dense0["kernel"].shape[-1])
+        except Exception:
+            pass
+        # 兜底：扫描 Dense_* 的 kernel 形状
+        try:
+            for k in params.keys():
+                if str(k).startswith("Dense_"):
+                    kernel = params[k]["kernel"]
+                    if kernel.ndim == 2:
+                        return int(kernel.shape[-1])
         except Exception:
             return None
+        return None
 
     def _infer_num_blocks(self, params) -> int:
         try:
-            return len([k for k in params.keys() if str(k).startswith("ResBlock_")])
+            return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
         except Exception:
             return 0
 
     def load(self, ckpt_dir: str, step: int) -> bool:
+        self.last_error = ""
         ckpt_dir = os.path.abspath(ckpt_dir)
         ckpt_manager = ocp.CheckpointManager(ckpt_dir)
         if step == 0:
             step = ckpt_manager.latest_step()
         if step is None:
+            self.last_error = f"未找到 checkpoint: {ckpt_dir}"
             return False
 
         restored = None
@@ -221,7 +239,8 @@ class ModelManager:
                 ckpt_path = os.path.join(ckpt_dir, str(step))
                 restored = ocp.StandardCheckpointer().restore(ckpt_path)
             except Exception as e:
-                print(f"[AI] Checkpoint 恢复失败: {e}")
+                self.last_error = f"Checkpoint 恢复失败: {e}"
+                print(f"[AI] {self.last_error}")
                 return False
 
         params = None
@@ -232,11 +251,18 @@ class ModelManager:
                 params = restored["default"].get("params")
 
         if params is None:
+            self.last_error = "Checkpoint 中未找到 params"
+            print(f"[AI] {self.last_error}")
             return False
 
         channels = self._infer_channels(params)
         num_blocks = self._infer_num_blocks(params)
         if not channels or num_blocks <= 0:
+            self.last_error = (
+                f"模型结构推断失败: channels={channels}, num_blocks={num_blocks} "
+                "(可能是旧 CNN checkpoint 或参数格式不匹配)"
+            )
+            print(f"[AI] {self.last_error}")
             return False
 
         self.net = AlphaZeroNetwork(
@@ -793,7 +819,8 @@ async def load_model(req: LoadModelRequest):
             "num_blocks": model_mgr.num_blocks,
         }
     else:
-        raise HTTPException(status_code=400, detail="Failed to load model")
+        detail = model_mgr.last_error or "Failed to load model"
+        raise HTTPException(status_code=400, detail=detail)
 
 
 @app.get("/api/model_info")
