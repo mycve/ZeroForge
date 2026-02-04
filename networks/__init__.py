@@ -2,9 +2,8 @@
 神经网络模块
 """
 
-from networks.alphazero import AlphaZeroNetwork, create_train_state
+from networks.alphazero import AlphaZeroNetwork
 
 __all__ = [
     "AlphaZeroNetwork",
-    "create_train_state",
 ]

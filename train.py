@@ -63,8 +63,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 128           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 32                        # 缩小根节点候选：让搜索更集中、更深
+    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 16                        # 缩小根节点候选：让搜索更集中、更深
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
@@ -78,13 +78,18 @@ class Config:
     temperature_steps: int = 40
     temperature_initial: float = 1.0
     temperature_final: float = 0.1
+
+    # 认输加速（算力有限时的对局加速）
+    resign_enabled: bool = True
+    resign_threshold: float = 0.75  # 当前玩家胜率过低时直接认输
+    resign_min_steps: int = 20      # 过早认输会伤害训练稳定性
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
     random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
     random_opening_prob: float = 0.4  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 总步数 400 步（200回合）判和
+    max_steps: int = 150              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
@@ -224,21 +229,41 @@ def selfplay(params, rng_key):
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
-        # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
-        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        # 仅有一个走法时不进行模拟（直接执行）
+        legal_counts = jnp.sum(state.legal_action_mask, axis=-1)
+        only_one_move = legal_counts == 1
         
-        # 统一策略：只执行一次 MCTS 搜索
-        policy_output = mctx.gumbel_muzero_policy(
-            params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
-            num_simulations=config.num_simulations,
-            max_num_considered_actions=config.top_k,
-            invalid_actions=~state.legal_action_mask,
+        def _mcts_policy():
+            # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
+            root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+            # 统一策略：只执行一次 MCTS 搜索
+            policy_output = mctx.gumbel_muzero_policy(
+                params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+                num_simulations=config.num_simulations,
+                max_num_considered_actions=config.top_k,
+                invalid_actions=~state.legal_action_mask,
+            )
+            aw = policy_output.action_weights
+            rv = policy_output.search_tree.node_values[:, 0]
+            return aw, rv
+        
+        def _direct_policy():
+            action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
+            aw = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
+            rv = value
+            return aw, rv
+        
+        action_weights, root_value = jax.lax.cond(
+            jnp.all(only_one_move),
+            _direct_policy,
+            _mcts_policy,
         )
         
-        action_weights = policy_output.action_weights
-        # MCTS 搜索完成后根节点的价值估计，作为 n-step TD 的 bootstrap 目标
-        # node_values 形状: (batch, num_nodes)，索引 0 是根节点
-        root_value = policy_output.search_tree.node_values[:, 0]
+        # 若只有一个合法走法，则覆盖对应样本的 MCTS 结果
+        action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
+        one_hot = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
+        action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
+        root_value = jnp.where(only_one_move, value, root_value)
         
         temp = jnp.where(state.step_count < config.temperature_steps, 
                          config.temperature_initial, config.temperature_final)
@@ -260,7 +285,33 @@ def selfplay(params, rng_key):
         action = jax.vmap(_sample_action)(action_weights, temp, sample_keys, state.legal_action_mask)
         
         actor = state.current_player
-        next_state = jax.vmap(env.step)(state, action)
+        
+        # 胜率差异过大时认输加速（只允许劣势方认输）
+        resign_ok = (
+            config.resign_enabled
+            & (state.step_count >= config.resign_min_steps)
+            & (value < -config.resign_threshold)
+        )
+        
+        def _apply_resign(s):
+            loser = s.current_player
+            winner = jnp.where(loser == 0, 1, 0).astype(jnp.int32)
+            rewards = jnp.where(
+                loser == 0,
+                jnp.array([-1.0, 1.0], dtype=jnp.float32),
+                jnp.array([1.0, -1.0], dtype=jnp.float32),
+            )
+            return s.replace(
+                terminated=jnp.bool_(True),
+                rewards=rewards,
+                winner=winner,
+                draw_reason=jnp.int32(9),  # 9=认输（自定义）
+                legal_action_mask=jnp.zeros_like(s.legal_action_mask),
+            )
+        
+        next_state = jax.vmap(lambda s, a, r: jax.lax.cond(
+            r, lambda: _apply_resign(s), lambda: env.step(s, a)
+        ))(state, action, resign_ok)
         
         normalized_action_weights = jnp.where(state.current_player[:, None] == 0, 
                                               action_weights, action_weights[:, _ROTATED_IDX])
@@ -771,7 +822,7 @@ def restore_checkpoint(
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: Pre-LN ResNet + SE + Global Pooling + Gumbel + TD(λ) + 经验回放 + 断点续训")
+    print("特性: 格子图 GNN + Global Pooling + Gumbel + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -847,7 +898,7 @@ def main():
         # 批量计算所有统计量，只触发一次同步
         # 结束原因编码：
         # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
-        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
+        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙, 9=认输
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         stats_data = jnp.array([
             first_term.sum(),                              # 总对局数
@@ -862,12 +913,13 @@ def main():
             ((first_term & (reasons == 6)).sum()),         # 长捉判负
             ((first_term & (reasons == 7)).sum()),         # 将捉交替判负
             ((first_term & (reasons == 8)).sum()),         # 将死/困毙
+            ((first_term & (reasons == 9)).sum()),         # 认输
         ], dtype=jnp.int32)
         
         # 一次性同步所有统计
         stats = [int(x) for x in stats_data]
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, 
-         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = stats
+         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate, d_resign) = stats
         
         # 3. 对局长度
         game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
