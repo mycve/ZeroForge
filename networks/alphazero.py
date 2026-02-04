@@ -6,7 +6,7 @@ AlphaZero 网络 - 格子图 GNN 架构
 import numpy as np
 import jax.numpy as jnp
 import flax.linen as nn
-from xiangqi.actions import BOARD_HEIGHT, BOARD_WIDTH
+from xiangqi.actions import BOARD_HEIGHT, BOARD_WIDTH, ACTION_SPACE_SIZE
 
 
 def _build_grid_neighbors(height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
@@ -63,7 +63,7 @@ class AlphaZeroNetwork(nn.Module):
     - 轻量消息传递 + 残差 MLP
     - 全局池化输出价值
     """
-    action_space_size: int = 2086
+    action_space_size: int = ACTION_SPACE_SIZE
     channels: int = 96
     num_blocks: int = 6
     dtype: jnp.dtype = jnp.float32

@@ -7,7 +7,7 @@
 - 每个位置的可能移动方向根据棋子类型不同而不同
 - 使用 from-to 编码，但只保留实际可能的移动
 
-总动作数: 2086 (经过压缩)
+总动作数: 2550 (几何可达动作总数)
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _generate_all_possible_moves():
 
 # 预计算动作映射表
 _ALL_MOVES = _generate_all_possible_moves()
-ACTION_SPACE_SIZE = len(_ALL_MOVES)  # 应该约为 2086
+ACTION_SPACE_SIZE = len(_ALL_MOVES)  # 应该为 2550
 
 # 创建双向映射
 _MOVE_TO_ACTION = {move: idx for idx, move in enumerate(_ALL_MOVES)}
