@@ -55,6 +55,7 @@ class Config:
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 96
     num_blocks: int = 6
+    network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -129,11 +130,18 @@ env = XiangqiEnv(
     repetition_threshold=config.repetition_threshold,
 )
 
+_DTYPE_MAP = {
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
+}
+if config.network_dtype not in _DTYPE_MAP:
+    raise ValueError(f"非法网络 dtype: {config.network_dtype}, 仅支持 {list(_DTYPE_MAP.keys())}")
+
 net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
-    dtype=jnp.bfloat16,
+    dtype=_DTYPE_MAP[config.network_dtype],
 )
 
 def forward(params, obs, is_training=False):
@@ -1041,8 +1049,14 @@ def main():
                     eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
                 
                 # 双边评估
-                winners_r = evaluate(params, past_params, eval_keys_r)
-                winners_b = evaluate(past_params, params, eval_keys_b)
+                try:
+                    winners_r = evaluate(params, past_params, eval_keys_r)
+                    winners_b = evaluate(past_params, params, eval_keys_b)
+                except Exception as e:
+                    print(f"[评估错误] 当前模型 dtype={config.network_dtype}, action_size={ACTION_SPACE_SIZE}")
+                    print(f"[评估错误] params dtype: {jax.tree.leaves(params)[0].dtype}")
+                    print(f"[评估错误] past_params dtype: {jax.tree.leaves(past_params)[0].dtype}")
+                    raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
                 wr = (winners_r == 0).sum()
                 wb = (winners_b == 1).sum()
                 score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
