@@ -52,10 +52,10 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
-    num_channels: int = 96
-    num_blocks: int = 6
-    network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
+    # 网络架构
+    num_channels: int = 128
+    num_blocks: int = 8
+    network_dtype: str = "float32"
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -64,8 +64,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 24                        # 缩小根节点候选：让搜索更集中、更深
+    num_simulations: int = 64           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 16                        # 缩小根节点候选：让搜索更集中、更深
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
