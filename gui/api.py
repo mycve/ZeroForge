@@ -217,7 +217,13 @@ class ModelManager:
         return None
 
     def _infer_num_blocks(self, params) -> int:
+        """推断 GNN 块数量（支持旧版 GraphBlock 和新版 MultiEdgeGraphBlock）"""
         try:
+            # 新版：MultiEdgeGraphBlock_*
+            multi_blocks = len([k for k in params.keys() if str(k).startswith("MultiEdgeGraphBlock_")])
+            if multi_blocks > 0:
+                return multi_blocks
+            # 旧版：GraphBlock_*
             return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
         except Exception:
             return 0
