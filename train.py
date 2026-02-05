@@ -64,8 +64,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 128           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 32                        # 缩小根节点候选：让搜索更集中、更深
+    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 24                        # 缩小根节点候选：让搜索更集中、更深
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
@@ -76,14 +76,9 @@ class Config:
     weight_decay: float = 1e-4
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
-    temperature_steps: int = 20
+    temperature_steps: int = 30
     temperature_initial: float = 1.0
     temperature_final: float = 0.1
-
-    # 认输加速（算力有限时的对局加速）
-    resign_enabled: bool = True
-    resign_threshold: float = 0.75  # 当前玩家胜率过低时直接认输
-    resign_min_steps: int = 20      # 过早认输会伤害训练稳定性
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
     random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
@@ -294,32 +289,8 @@ def selfplay(params, rng_key):
         
         actor = state.current_player
         
-        # 胜率差异过大时认输加速（只允许劣势方认输）
-        resign_ok = (
-            config.resign_enabled
-            & (state.step_count >= config.resign_min_steps)
-            & (value < -config.resign_threshold)
-        )
-        
-        def _apply_resign(s):
-            loser = s.current_player
-            winner = jnp.where(loser == 0, 1, 0).astype(jnp.int32)
-            rewards = jnp.where(
-                loser == 0,
-                jnp.array([-1.0, 1.0], dtype=jnp.float32),
-                jnp.array([1.0, -1.0], dtype=jnp.float32),
-            )
-            return s.replace(
-                terminated=jnp.bool_(True),
-                rewards=rewards,
-                winner=winner,
-                draw_reason=jnp.int32(9),  # 9=认输（自定义）
-                legal_action_mask=jnp.zeros_like(s.legal_action_mask),
-            )
-        
-        next_state = jax.vmap(lambda s, a, r: jax.lax.cond(
-            r, lambda: _apply_resign(s), lambda: env.step(s, a)
-        ))(state, action, resign_ok)
+        # 执行动作
+        next_state = jax.vmap(env.step)(state, action)
         
         normalized_action_weights = jnp.where(state.current_player[:, None] == 0, 
                                               action_weights, action_weights[:, _ROTATED_IDX])
@@ -906,7 +877,7 @@ def main():
         # 批量计算所有统计量，只触发一次同步
         # 结束原因编码：
         # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋, 
-        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙, 9=认输
+        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
         first_term = (jnp.cumsum(term, axis=1) == 1) & term
         stats_data = jnp.array([
             first_term.sum(),                              # 总对局数
@@ -921,13 +892,12 @@ def main():
             ((first_term & (reasons == 6)).sum()),         # 长捉判负
             ((first_term & (reasons == 7)).sum()),         # 将捉交替判负
             ((first_term & (reasons == 8)).sum()),         # 将死/困毙
-            ((first_term & (reasons == 9)).sum()),         # 认输
         ], dtype=jnp.int32)
         
         # 一次性同步所有统计
         stats = [int(x) for x in stats_data]
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition, 
-         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate, d_resign) = stats
+         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = stats
         
         # 3. 对局长度
         game_lengths = jnp.where(term, jnp.arange(config.max_steps)[None, :, None], config.max_steps)
