@@ -37,8 +37,11 @@ NUM_HISTORY_STEPS = 8
 # 每步的通道数: 7种棋子 × 2方 = 14
 CHANNELS_PER_STEP = 14
 
-# 总观察通道数: (8历史 + 1当前) × 14棋子 = 126
-NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP
+# 差分特征通道数: 2层差分 × 2通道(from/to) = 4
+NUM_DIFF_CHANNELS = 4
+
+# 总观察通道数: (8历史 + 1当前) × 14棋子 + 4差分 = 130
+NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP + NUM_DIFF_CHANNELS
 
 # 重复局面检测: 保存最近 N 步的局面哈希
 POSITION_HISTORY_SIZE = 256
@@ -619,8 +622,22 @@ class XiangqiEnv:
         history_encoded = jax.vmap(encode_board)(history)
         history_flat = history_encoded.reshape(-1, BOARD_HEIGHT, BOARD_WIDTH)
         
-        # 最终观察: 仅包含棋盘和历史平面 (126, 10, 9)
-        observation = jnp.concatenate([current_encoded, history_flat], axis=0)
+        # === 差分特征：显式编码棋子移动 ===
+        # 差分 1：当前 vs 上一步（最近的移动）
+        # move_from: 棋子离开的位置（上一步有棋子，当前没有）
+        # move_to: 棋子到达的位置（上一步没棋子，当前有）
+        diff1_from = ((history[0] != 0) & (board == 0)).astype(jnp.float32)
+        diff1_to = ((history[0] == 0) & (board != 0)).astype(jnp.float32)
+        
+        # 差分 2：上一步 vs 再上一步（对手的移动）
+        diff2_from = ((history[1] != 0) & (history[0] == 0)).astype(jnp.float32)
+        diff2_to = ((history[1] == 0) & (history[0] != 0)).astype(jnp.float32)
+        
+        # 差分特征 (4, 10, 9)
+        diff_features = jnp.stack([diff1_from, diff1_to, diff2_from, diff2_to], axis=0)
+        
+        # 最终观察: 棋盘 + 历史 + 差分 (130, 10, 9)
+        observation = jnp.concatenate([current_encoded, history_flat, diff_features], axis=0)
         
         return observation
     
