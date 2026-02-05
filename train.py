@@ -75,9 +75,6 @@ class Config:
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
     
-    # Q值策略分布配置（使用 Q 值而非访问计数作为策略目标）
-    q_policy_temperature: float = 1.0  # Q值转策略的温度，越小分布越尖锐
-    
     # 分布式价值配置（使用分位数回归）
     num_quantiles: int = 64            # 分位数数量
     quantile_huber_kappa: float = 1.0  # Huber 损失阈值
@@ -262,23 +259,46 @@ def selfplay(params, rng_key):
                 invalid_actions=~state.legal_action_mask,
             )
             
-            # === 使用 Q 值策略分布替代访问计数 ===
-            # 获取根节点 Q 值
+            # === 官方 Gumbel MuZero 策略改进公式 ===
+            # improved_policy = softmax(prior_logits + scaled_completed_qvalues)
+            # 参考：https://openreview.net/forum?id=bERaNdoegnO
+            
+            # 获取根节点 Q 值和访问计数
             root_indices = jnp.zeros(batch_size, dtype=jnp.int32)
             qvalues = policy_output.search_tree.qvalues(root_indices)  # [B, num_actions]
-            
-            # 访问计数掩码：只使用访问过的动作
             visit_counts = policy_output.search_tree.children_visits[:, 0]  # [B, num_actions]
+            raw_value = policy_output.search_tree.raw_values[:, 0]  # [B]
+            prior_logits_root = policy_output.search_tree.children_prior_logits[:, 0]  # [B, num_actions]
+            
+            # 1. 计算 mixed_value 用于补全未访问动作的 Q 值
+            prior_probs = jax.nn.softmax(prior_logits_root, axis=-1)
+            prior_probs = jnp.maximum(prior_probs, 1e-8)
             visited_mask = visit_counts > 0
+            sum_probs = jnp.sum(jnp.where(visited_mask, prior_probs, 0.0), axis=-1, keepdims=True)
+            weighted_q = jnp.sum(jnp.where(
+                visited_mask,
+                prior_probs * qvalues / jnp.maximum(sum_probs, 1e-8),
+                0.0), axis=-1)
+            sum_visits = jnp.sum(visit_counts, axis=-1)
+            mixed_value = (raw_value + sum_visits * weighted_q) / (sum_visits + 1)
             
-            # 未访问动作设为最小 Q 值（减1确保被抑制）
-            q_min = jnp.min(qvalues, axis=-1, keepdims=True)
-            qvalues_masked = jnp.where(visited_mask, qvalues, q_min - 1.0)
+            # 2. 用 mixed_value 补全未访问动作
+            completed_qvalues = jnp.where(visited_mask, qvalues, mixed_value[:, None])
             
-            # Q 值转策略分布（温度 softmax）
-            q_scaled = qvalues_masked / config.q_policy_temperature
-            q_scaled = jnp.where(state.legal_action_mask, q_scaled, jnp.finfo(q_scaled.dtype).min)
-            q_policy = jax.nn.softmax(q_scaled, axis=-1)
+            # 3. 归一化到 [0, 1] 区间
+            q_min = jnp.min(completed_qvalues, axis=-1, keepdims=True)
+            q_max = jnp.max(completed_qvalues, axis=-1, keepdims=True)
+            rescaled_q = (completed_qvalues - q_min) / jnp.maximum(q_max - q_min, 1e-8)
+            
+            # 4. 缩放 Q 值（官方参数：value_scale=0.1, maxvisit_init=50）
+            maxvisit = jnp.max(visit_counts, axis=-1, keepdims=True)
+            visit_scale = 50.0 + maxvisit
+            scaled_q = visit_scale * 0.1 * rescaled_q
+            
+            # 5. 改进策略 = softmax(prior_logits + scaled_qvalues)
+            improved_logits = prior_logits_root + scaled_q
+            improved_logits = jnp.where(state.legal_action_mask, improved_logits, jnp.finfo(improved_logits.dtype).min)
+            q_policy = jax.nn.softmax(improved_logits, axis=-1)
             
             rv = policy_output.search_tree.node_values[:, 0]
             return q_policy, rv
