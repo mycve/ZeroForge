@@ -191,6 +191,7 @@ class ModelManager:
         self.step = 0
         self.channels = 0
         self.num_blocks = 0
+        self.num_quantiles = 64  # 默认分位数数量
         self.last_error = ""
 
     def _infer_channels(self, params) -> Optional[int]:
@@ -220,6 +221,24 @@ class ModelManager:
             return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
         except Exception:
             return 0
+
+    def _infer_num_quantiles(self, params) -> int:
+        """推断分位数数量（从价值头最后一层 Dense 的输出维度）"""
+        try:
+            # 价值头结构：Dense_2（或最后一个 Dense）的输出维度
+            # 按索引倒序查找，假设策略头和价值头各有两个 Dense
+            dense_keys = sorted([k for k in params.keys() if str(k).startswith("Dense_")])
+            if dense_keys:
+                last_dense = params[dense_keys[-1]]
+                out_dim = int(last_dense["kernel"].shape[-1])
+                # 如果输出是 1，说明是旧版单点价值网络
+                if out_dim == 1:
+                    return 1
+                # 否则返回分位数数量
+                return out_dim
+        except Exception:
+            pass
+        return 64  # 默认值
 
     def load(self, ckpt_dir: str, step: int) -> bool:
         self.last_error = ""
@@ -257,6 +276,7 @@ class ModelManager:
 
         channels = self._infer_channels(params)
         num_blocks = self._infer_num_blocks(params)
+        num_quantiles = self._infer_num_quantiles(params)
         if not channels or num_blocks <= 0:
             self.last_error = (
                 f"模型结构推断失败: channels={channels}, num_blocks={num_blocks} "
@@ -269,12 +289,14 @@ class ModelManager:
             action_space_size=ACTION_SPACE_SIZE,
             channels=channels,
             num_blocks=num_blocks,
+            num_quantiles=num_quantiles,
         )
         self.params = params
         self.step = step
         self.channels = channels
         self.num_blocks = num_blocks
-        print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}")
+        self.num_quantiles = num_quantiles
+        print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}, quantiles={num_quantiles}")
         return True
 
 
@@ -390,7 +412,9 @@ def create_mcts_recurrent_fn():
         prev_p = state.current_player
         ns = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(ns)
-        l, v = model_mgr.net.apply({'params': params}, obs, train=False)
+        l, v_quantiles = model_mgr.net.apply({'params': params}, obs, train=False)
+        # 分布式价值：取分位数均值作为 MCTS 价值估计
+        v = jnp.mean(v_quantiles, axis=-1) if v_quantiles.ndim > 1 else v_quantiles
         l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
         l = l - jnp.max(l, axis=-1, keepdims=True)
         l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
@@ -428,7 +452,9 @@ def get_ai_action(
         mcts_recurrent_fn = create_mcts_recurrent_fn()
     
     obs = env.observe(state.jax_state)[None, ...]
-    logits, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+    logits, v_quantiles = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+    # 分布式价值：取分位数均值作为 MCTS 价值估计
+    value = jnp.mean(v_quantiles, axis=-1) if v_quantiles.ndim > 1 else v_quantiles
     
     if state.current_player == 1:
         logits = logits[:, _ROTATED_IDX]

@@ -61,11 +61,12 @@ class AlphaZeroNetwork(nn.Module):
     设计原则：
     - 用格子图编码局面关系（四邻接）
     - 轻量消息传递 + 残差 MLP
-    - 全局池化输出价值
+    - 全局池化输出价值（分布式：64分位数）
     """
     action_space_size: int = ACTION_SPACE_SIZE
     channels: int = 96
     num_blocks: int = 6
+    num_quantiles: int = 64  # 分布式价值：分位数数量
     dtype: jnp.dtype = jnp.float32
     
     def setup(self):
@@ -101,11 +102,11 @@ class AlphaZeroNetwork(nn.Module):
         p = p.reshape((batch_size, -1))  # [B, 90*32] = [B, 2880]
         p = nn.Dense(self.action_space_size, dtype=self.dtype)(p)
         
-        # 价值头：全局池化
+        # 价值头：全局池化 -> 分布式价值（64分位数）
         v = jnp.mean(h, axis=1)
         v = nn.Dense(128, dtype=self.dtype)(v)
         v = nn.relu(v)
-        v = nn.Dense(1, dtype=self.dtype)(v)
-        v = jnp.tanh(v).squeeze(-1)
+        v_quantiles = nn.Dense(self.num_quantiles, dtype=self.dtype)(v)
+        v_quantiles = jnp.tanh(v_quantiles)  # [-1, 1] 范围
         
-        return p.astype(jnp.float32), v.astype(jnp.float32)
+        return p.astype(jnp.float32), v_quantiles.astype(jnp.float32)

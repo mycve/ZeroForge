@@ -75,6 +75,13 @@ class Config:
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
     
+    # Q值策略分布配置（使用 Q 值而非访问计数作为策略目标）
+    q_policy_temperature: float = 1.0  # Q值转策略的温度，越小分布越尖锐
+    
+    # 分布式价值配置（使用分位数回归）
+    num_quantiles: int = 64            # 分位数数量
+    quantile_huber_kappa: float = 1.0  # Huber 损失阈值
+    
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
     temperature_initial: float = 1.0
@@ -136,13 +143,21 @@ net = AlphaZeroNetwork(
     action_space_size=env.action_space_size,
     channels=config.num_channels,
     num_blocks=config.num_blocks,
+    num_quantiles=config.num_quantiles,
     dtype=_DTYPE_MAP[config.network_dtype],
 )
 
 def forward(params, obs, is_training=False):
-    """前向传播 (LayerNorm 架构，无需 batch_stats)"""
-    logits, value = net.apply({'params': params}, obs, train=is_training)
+    """前向传播 - MCTS 使用，返回分位数均值作为价值"""
+    logits, v_quantiles = net.apply({'params': params}, obs, train=is_training)
+    # MCTS 需要单一价值，使用分位数的均值
+    value = jnp.mean(v_quantiles, axis=-1)
     return logits, value
+
+def forward_with_quantiles(params, obs, is_training=False):
+    """前向传播 - 训练使用，返回完整分位数分布"""
+    logits, v_quantiles = net.apply({'params': params}, obs, train=is_training)
+    return logits, v_quantiles
 
 def recurrent_fn(params, rng_key, action, state):
     """MCTS 递归函数"""
@@ -246,9 +261,27 @@ def selfplay(params, rng_key):
                 max_num_considered_actions=config.top_k,
                 invalid_actions=~state.legal_action_mask,
             )
-            aw = policy_output.action_weights
+            
+            # === 使用 Q 值策略分布替代访问计数 ===
+            # 获取根节点 Q 值
+            root_indices = jnp.zeros(batch_size, dtype=jnp.int32)
+            qvalues = policy_output.search_tree.qvalues(root_indices)  # [B, num_actions]
+            
+            # 访问计数掩码：只使用访问过的动作
+            visit_counts = policy_output.search_tree.children_visits[:, 0]  # [B, num_actions]
+            visited_mask = visit_counts > 0
+            
+            # 未访问动作设为最小 Q 值（减1确保被抑制）
+            q_min = jnp.min(qvalues, axis=-1, keepdims=True)
+            qvalues_masked = jnp.where(visited_mask, qvalues, q_min - 1.0)
+            
+            # Q 值转策略分布（温度 softmax）
+            q_scaled = qvalues_masked / config.q_policy_temperature
+            q_scaled = jnp.where(state.legal_action_mask, q_scaled, jnp.finfo(q_scaled.dtype).min)
+            q_policy = jax.nn.softmax(q_scaled, axis=-1)
+            
             rv = policy_output.search_tree.node_values[:, 0]
-            return aw, rv
+            return q_policy, rv
         
         def _direct_policy():
             action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
@@ -401,11 +434,49 @@ def compute_targets(data: SelfplayOutput):
 # 训练与评估
 # ============================================================================
 
+# 预计算分位点 (均匀分布，避免边界)
+_QUANTILE_TAUS = jnp.linspace(0.5 / 64, 1.0 - 0.5 / 64, 64)
+
+def quantile_huber_loss(predictions, targets, kappa=1.0):
+    """分位数 Huber 损失
+    
+    使用分位数回归训练价值分布，比单点 L2 损失更稳定、更鲁棒。
+    
+    Args:
+        predictions: [B, N] 预测的 N 个分位数
+        targets: [B] 目标值
+        kappa: Huber 损失的阈值，默认 1.0
+    
+    Returns:
+        [B] 每个样本的分位数损失
+    """
+    # 扩展维度: predictions [B, N], targets [B, 1]
+    targets = targets[:, None]
+    
+    # 残差: [B, N]
+    delta = targets - predictions
+    
+    # Huber 损失（平滑 L1）
+    abs_delta = jnp.abs(delta)
+    huber = jnp.where(
+        abs_delta <= kappa,
+        0.5 * delta ** 2,
+        kappa * (abs_delta - 0.5 * kappa)
+    )
+    
+    # 分位数权重: tau 用于欠估计，(1-tau) 用于过估计
+    tau = _QUANTILE_TAUS[None, :]  # [1, N]
+    weight = jnp.where(delta < 0, tau, 1.0 - tau)
+    
+    # 加权 Huber 损失，返回每个样本的平均损失
+    return jnp.mean(weight * huber, axis=-1)  # [B]
+
+
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
-    - 价值损失：拟合 Monte Carlo 目标（游戏最终结果）
+    - 策略损失：交叉熵，拟合 Q 值策略分布
+    - 价值损失：分位数 Huber 损失，拟合 TD(λ) 目标分布
     """
     # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
     obs = samples.obs.astype(jnp.float32)
@@ -416,11 +487,12 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
-    logits, value = forward(params, obs, is_training=True)
+    # 使用 forward_with_quantiles 获取完整分位数分布
+    logits, v_quantiles = forward_with_quantiles(params, obs, is_training=True)
     
     # 强制转换为 float32 进行损失计算，避免数值不稳定
     logits = logits.astype(jnp.float32)
-    value = value.astype(jnp.float32)
+    v_quantiles = v_quantiles.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
@@ -428,8 +500,9 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失 (TD(λ) 目标，λ加权平均兼顾收敛速度和稳定性)
-    value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+    # 分位数价值损失（更稳定、更鲁棒）
+    value_loss_per_sample = quantile_huber_loss(v_quantiles, value_tgt, kappa=config.quantile_huber_kappa)
+    value_loss = jnp.sum(value_loss_per_sample * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
     
