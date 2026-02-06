@@ -52,28 +52,29 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构
+    # 网络架构（GAT+SE 增强块更强，6 层即可；BF16 在 5090 上推理速度翻倍）
     num_channels: int = 128
-    num_blocks: int = 8
-    network_dtype: str = "float32"
+    num_blocks: int = 6
+    network_dtype: str = "bfloat16"
     
-    # 训练超参数
-    learning_rate: float = 2e-4
-    training_batch_size: int = 512
+    # 训练超参数（大 batch 配合 warmup+cosine lr schedule）
+    learning_rate: float = 3e-4
+    training_batch_size: int = 2048
     td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
-    # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 512
-    num_simulations: int = 128           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 32                        # 缩小根节点候选：让搜索更集中、更深
+    # 自对弈与搜索 (Gumbel 优势：64 sims 即可产生强信号，top_k=16 配合 Sequential Halving)
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 64            # 模拟次数：Gumbel 低模拟高效率
+    top_k: int = 16                        # 缩小根节点候选：配合 64 sims 的 4 阶段减半
     
-    # 经验回放配置
+    # 经验回放配置（更高复用率，提升数据效率）
     replay_buffer_size: int = 2000000
-    sample_reuse_times: int = 4
+    sample_reuse_times: int = 6
     
     # 损失权重
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
+    material_loss_weight: float = 0.1  # 辅助子力差损失权重
     
     # 分布式价值配置（使用分位数回归）
     num_quantiles: int = 64            # 分位数数量
@@ -84,9 +85,9 @@ class Config:
     temperature_initial: float = 1.0
     temperature_final: float = 0.1
     
-    # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
-    random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
-    random_opening_prob: float = 0.4  # 每局随机开局的概率
+    # 随机开局配置（更激进的多样性，加速开局学习）
+    random_opening_steps: tuple = (2, 4, 6, 8, 10, 12)  # 可选的开局随机步数（随机选择一个）
+    random_opening_prob: float = 0.5  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 150              # 总步数 400 步（200回合）判和
@@ -146,15 +147,15 @@ net = AlphaZeroNetwork(
 
 def forward(params, obs, is_training=False):
     """前向传播 - MCTS 使用，返回分位数均值作为价值"""
-    logits, v_quantiles = net.apply({'params': params}, obs, train=is_training)
+    logits, v_quantiles, _material = net.apply({'params': params}, obs, train=is_training)
     # MCTS 需要单一价值，使用分位数的均值
     value = jnp.mean(v_quantiles, axis=-1)
     return logits, value
 
 def forward_with_quantiles(params, obs, is_training=False):
-    """前向传播 - 训练使用，返回完整分位数分布"""
-    logits, v_quantiles = net.apply({'params': params}, obs, train=is_training)
-    return logits, v_quantiles
+    """前向传播 - 训练使用，返回完整分位数分布和辅助预测"""
+    logits, v_quantiles, material_pred = net.apply({'params': params}, obs, train=is_training)
+    return logits, v_quantiles, material_pred
 
 def recurrent_fn(params, rng_key, action, state):
     """MCTS 递归函数"""
@@ -259,47 +260,11 @@ def selfplay(params, rng_key):
                 invalid_actions=~state.legal_action_mask,
             )
             
-            # === 官方 Gumbel MuZero 策略改进公式 ===
-            # improved_policy = softmax(prior_logits + scaled_completed_qvalues)
+            # mctx 库已实现完整的 Gumbel MuZero 策略改进公式：
+            # improved_policy = softmax(logits + σ(completed_qvalues))
+            # σ 包含 mixed_value 补全、[0,1] 归一化、value_scale=0.1 缩放
             # 参考：https://openreview.net/forum?id=bERaNdoegnO
-            
-            # 获取根节点 Q 值和访问计数
-            root_indices = jnp.zeros(batch_size, dtype=jnp.int32)
-            qvalues = policy_output.search_tree.qvalues(root_indices)  # [B, num_actions]
-            visit_counts = policy_output.search_tree.children_visits[:, 0]  # [B, num_actions]
-            raw_value = policy_output.search_tree.raw_values[:, 0]  # [B]
-            prior_logits_root = policy_output.search_tree.children_prior_logits[:, 0]  # [B, num_actions]
-            
-            # 1. 计算 mixed_value 用于补全未访问动作的 Q 值
-            prior_probs = jax.nn.softmax(prior_logits_root, axis=-1)
-            prior_probs = jnp.maximum(prior_probs, 1e-8)
-            visited_mask = visit_counts > 0
-            sum_probs = jnp.sum(jnp.where(visited_mask, prior_probs, 0.0), axis=-1, keepdims=True)
-            weighted_q = jnp.sum(jnp.where(
-                visited_mask,
-                prior_probs * qvalues / jnp.maximum(sum_probs, 1e-8),
-                0.0), axis=-1)
-            sum_visits = jnp.sum(visit_counts, axis=-1)
-            mixed_value = (raw_value + sum_visits * weighted_q) / (sum_visits + 1)
-            
-            # 2. 用 mixed_value 补全未访问动作
-            completed_qvalues = jnp.where(visited_mask, qvalues, mixed_value[:, None])
-            
-            # 3. 归一化到 [0, 1] 区间
-            q_min = jnp.min(completed_qvalues, axis=-1, keepdims=True)
-            q_max = jnp.max(completed_qvalues, axis=-1, keepdims=True)
-            rescaled_q = (completed_qvalues - q_min) / jnp.maximum(q_max - q_min, 1e-8)
-            
-            # 4. 缩放 Q 值（官方参数：value_scale=0.1, maxvisit_init=50）
-            maxvisit = jnp.max(visit_counts, axis=-1, keepdims=True)
-            visit_scale = 50.0 + maxvisit
-            scaled_q = visit_scale * 0.1 * rescaled_q
-            
-            # 5. 改进策略 = softmax(prior_logits + scaled_qvalues)
-            improved_logits = prior_logits_root + scaled_q
-            improved_logits = jnp.where(state.legal_action_mask, improved_logits, jnp.finfo(improved_logits.dtype).min)
-            q_policy = jax.nn.softmax(improved_logits, axis=-1)
-            
+            q_policy = policy_output.action_weights
             rv = policy_output.search_tree.node_values[:, 0]
             return q_policy, rv
         
@@ -454,6 +419,19 @@ def compute_targets(data: SelfplayOutput):
 # 训练与评估
 # ============================================================================
 
+# 子力差计算（辅助任务）
+# 观察通道顺序：将(0)士(1)象(2)马(3)车(4)炮(5)兵(6) | 卒(7)炮(8)车(9)马(10)象(11)士(12)将(13)
+_MY_PIECE_VALUES = jnp.array([0.0, 2.0, 2.0, 4.0, 9.0, 4.5, 1.0])   # 我方棋子价值
+_OPP_PIECE_VALUES = jnp.array([1.0, 4.5, 9.0, 4.0, 2.0, 2.0, 0.0])  # 对方棋子价值
+
+def compute_material_diff(obs):
+    """从观察张量计算子力差（当前玩家视角），归一化到 [-1, 1]"""
+    my_counts = jnp.sum(obs[:7], axis=(-2, -1))     # [7] 我方各棋子数量
+    opp_counts = jnp.sum(obs[7:14], axis=(-2, -1))  # [7] 对方各棋子数量
+    my_mat = jnp.dot(my_counts, _MY_PIECE_VALUES)
+    opp_mat = jnp.dot(opp_counts, _OPP_PIECE_VALUES)
+    return jnp.clip((my_mat - opp_mat) / 50.0, -1.0, 1.0)
+
 # 预计算分位点 (均匀分布，避免边界)
 _QUANTILE_TAUS = jnp.linspace(0.5 / 64, 1.0 - 0.5 / 64, 64)
 
@@ -497,6 +475,7 @@ def loss_fn(params, samples: Sample, rng_key):
     
     - 策略损失：交叉熵，拟合 Q 值策略分布
     - 价值损失：分位数 Huber 损失，拟合 TD(λ) 目标分布
+    - 辅助损失：子力差 MSE，加速特征学习
     """
     # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
     obs = samples.obs.astype(jnp.float32)
@@ -507,12 +486,13 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
-    # 使用 forward_with_quantiles 获取完整分位数分布
-    logits, v_quantiles = forward_with_quantiles(params, obs, is_training=True)
+    # 使用 forward_with_quantiles 获取完整分位数分布和辅助预测
+    logits, v_quantiles, material_pred = forward_with_quantiles(params, obs, is_training=True)
     
     # 强制转换为 float32 进行损失计算，避免数值不稳定
     logits = logits.astype(jnp.float32)
     v_quantiles = v_quantiles.astype(jnp.float32)
+    material_pred = material_pred.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
@@ -524,9 +504,15 @@ def loss_fn(params, samples: Sample, rng_key):
     value_loss_per_sample = quantile_huber_loss(v_quantiles, value_tgt, kappa=config.quantile_huber_kappa)
     value_loss = jnp.sum(value_loss_per_sample * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    total_loss = policy_loss + config.value_loss_weight * value_loss
+    # 辅助损失：子力差预测（从观察直接计算目标，镜像不变）
+    material_tgt = jax.vmap(compute_material_diff)(obs)
+    material_loss = jnp.sum((material_pred - material_tgt) ** 2 * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    return total_loss, (policy_loss, value_loss)
+    total_loss = (policy_loss 
+                  + config.value_loss_weight * value_loss 
+                  + config.material_loss_weight * material_loss)
+    
+    return total_loss, (policy_loss, value_loss, material_loss)
 
 @jax.pmap
 def evaluate(params_red, params_black, rng_key):
@@ -913,7 +899,15 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
     
-    optimizer = optax.adamw(config.learning_rate, weight_decay=config.weight_decay)
+    # 学习率调度：Warmup + Cosine 衰减（大 batch 需要 warmup 稳定训练）
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=1e-5,                    # warmup 起点（很小，避免初期梯度爆炸）
+        peak_value=config.learning_rate,    # 峰值学习率
+        warmup_steps=200,                   # 前 200 次迭代线性 warmup
+        decay_steps=5000,                   # 5000 次迭代后余弦衰减到 end_value
+        end_value=1e-5,                     # 最终学习率
+    )
+    optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -939,10 +933,10 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        grads, (ploss, vloss, mloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         # AdamW 需要传入 params 参数来计算权重衰减
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, ploss, vloss
+        return optax.apply_updates(params, updates), opt_state, ploss, vloss, mloss
 
     writer = SummaryWriter(config.log_dir)
     start_time_total = time.time()
@@ -1012,8 +1006,8 @@ def main():
         rng_key = sample_keys[0]
         
         # 批量训练：采样 → 训练 → 累积损失，最后一次性同步
-        policy_losses, value_losses = [], []
-        ploss_acc, vloss_acc = None, None
+        policy_losses, value_losses, material_losses = [], [], []
+        ploss_acc, vloss_acc, mloss_acc = None, None, None
         
         for i in range(num_updates):
             sk_sample = sample_keys[i+1]
@@ -1026,22 +1020,25 @@ def main():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
             
-            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
+            params, opt_state, ploss, vloss, mloss = train_step(params, opt_state, batch, train_keys)
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
-                ploss_acc, vloss_acc = ploss, vloss
+                ploss_acc, vloss_acc, mloss_acc = ploss, vloss, mloss
             else:
                 ploss_acc = ploss_acc + ploss
                 vloss_acc = vloss_acc + vloss
+                mloss_acc = mloss_acc + mloss
         
         # 一次性同步所有累积损失
         if num_updates > 0:
             policy_losses = [float(ploss_acc.mean() / num_updates)]
             value_losses = [float(vloss_acc.mean() / num_updates)]
+            material_losses = [float(mloss_acc.mean() / num_updates)]
         else:
             policy_losses = [0.0]
             value_losses = [0.0]
+            material_losses = [0.0]
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
@@ -1051,13 +1048,14 @@ def main():
         fps = new_frames / iter_time
         buf_stats = replay_buffer.stats()
         
-        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
+        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} mloss={np.mean(material_losses):.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
         writer.add_scalar("train/value_loss", np.mean(value_losses), iteration)
+        writer.add_scalar("train/material_loss", np.mean(material_losses), iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)

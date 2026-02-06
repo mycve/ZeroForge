@@ -10,6 +10,7 @@ AlphaZero 网络 - 多边类型 GNN 架构
 5. 象步边 - 象的攻击范围（田字对角）
 """
 
+import jax
 import numpy as np
 import jax.numpy as jnp
 import flax.linen as nn
@@ -92,10 +93,12 @@ def _build_all_edges(height: int, width: int) -> dict:
 
 
 class MultiEdgeGraphBlock(nn.Module):
-    """多边类型图消息传递块
+    """多边类型图消息传递块 (增强版)
     
-    每种边类型有独立的消息变换，最后聚合所有边类型的消息。
-    这样模型可以学习不同类型关系的不同重要性。
+    增强：
+    - GAT 注意力：动态学习邻居权重，替代简单均值聚合
+    - SE 模块：通道注意力，动态调整特征通道权重
+    - 全局特征注入：将全局上下文信息注入每个节点
     """
     hidden_dim: int
     num_edge_types: int = 5  # adjacent, row, col, knight, elephant
@@ -110,45 +113,68 @@ class MultiEdgeGraphBlock(nn.Module):
             edge_masks: list of [N, max_deg] 每种边类型的有效掩码
         """
         B, N, F = h.shape
+        head_dim = max(self.hidden_dim // 4, 16)
         
-        # 对每种边类型分别计算消息
+        # 全局特征注入：将全局池化特征广播到每个节点
+        global_feat = jnp.mean(h, axis=1, keepdims=True)  # [B, 1, F]
+        global_feat_broadcast = jnp.broadcast_to(global_feat, h.shape)  # [B, N, F]
+        
+        # 对每种边类型分别计算 GAT 注意力消息
         all_messages = []
         for i, (neighbor_idx, neighbor_mask) in enumerate(zip(edge_indices, edge_masks)):
-            # 聚合该边类型的邻居特征
             idx = jnp.where(neighbor_idx < 0, 0, neighbor_idx)
             neigh = jnp.take(h, idx, axis=1)  # (B, N, M, F)
-            mask = neighbor_mask[None, :, :, None]  # (1, N, M, 1)
-            neigh_sum = jnp.sum(neigh * mask, axis=2)
-            denom = jnp.maximum(jnp.sum(mask, axis=2), 1.0)
-            neigh_mean = neigh_sum / denom  # (B, N, F)
+            mask = neighbor_mask[None, :, :]  # (1, N, M)
             
-            # 每种边类型有独立的线性变换
-            msg = nn.Dense(self.hidden_dim, dtype=self.dtype, name=f'edge_proj_{i}')(neigh_mean)
+            # GAT 注意力：query-key 点积
+            query = nn.Dense(head_dim, dtype=self.dtype, name=f'attn_q_{i}')(h)  # [B, N, D]
+            key = nn.Dense(head_dim, dtype=self.dtype, name=f'attn_k_{i}')(neigh)  # [B, N, M, D]
+            attn_logits = jnp.sum(query[:, :, None, :] * key, axis=-1)  # [B, N, M]
+            attn_logits = attn_logits / (head_dim ** 0.5)
+            attn_logits = jnp.where(mask, attn_logits, -1e9)
+            attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # [B, N, M]
+            attn_weights = jnp.where(mask, attn_weights, 0.0)
+            
+            # 注意力加权聚合（替代均值聚合）
+            neigh_weighted = jnp.sum(neigh * attn_weights[..., None], axis=2)  # [B, N, F]
+            
+            msg = nn.Dense(self.hidden_dim, dtype=self.dtype, name=f'edge_proj_{i}')(neigh_weighted)
             all_messages.append(msg)
         
         # 聚合所有边类型的消息（求和）
         aggregated = sum(all_messages)
         
-        # 残差 MLP
-        x = jnp.concatenate([h, aggregated], axis=-1)
+        # 残差 MLP（拼接原始特征 + 聚合消息 + 全局特征）
+        x = jnp.concatenate([h, aggregated, global_feat_broadcast], axis=-1)
         x = nn.LayerNorm(dtype=self.dtype)(x)
         x = nn.Dense(self.hidden_dim, dtype=self.dtype)(x)
         x = nn.relu(x)
         x = nn.Dense(self.hidden_dim, dtype=self.dtype)(x)
         
-        return h + x
+        out = h + x
+        
+        # SE 模块：通道注意力
+        se = jnp.mean(out, axis=1, keepdims=True)  # [B, 1, F] 全局池化
+        se = nn.Dense(self.hidden_dim // 4, dtype=self.dtype, name='se_fc1')(se)
+        se = nn.relu(se)
+        se = nn.Dense(self.hidden_dim, dtype=self.dtype, name='se_fc2')(se)
+        se = jax.nn.sigmoid(se)  # [B, 1, F]
+        out = out * se  # 通道缩放
+        
+        return out
 
 
 class AlphaZeroNetwork(nn.Module):
-    """多边类型 GNN 网络
+    """多边类型 GNN 网络 (增强版)
     
     设计原则：
-    - 多种边类型显式编码象棋规则
+    - 多种边类型显式编码象棋规则（GAT 注意力 + SE + 全局特征注入）
     - 相邻边：局部特征
     - 行列边：车/炮攻击线
     - 马步边：马的攻击范围
     - 象步边：象的攻击范围
     - 全局池化输出价值（分布式：64分位数）
+    - 辅助头：子力差预测（加速特征学习）
     """
     action_space_size: int = ACTION_SPACE_SIZE
     channels: int = 96
@@ -205,4 +231,14 @@ class AlphaZeroNetwork(nn.Module):
         v_quantiles = nn.Dense(self.num_quantiles, dtype=self.dtype)(v)
         v_quantiles = jnp.tanh(v_quantiles)  # [-1, 1] 范围
         
-        return p.astype(jnp.float32), v_quantiles.astype(jnp.float32)
+        # 辅助头：子力差预测（加速特征学习）
+        m = jnp.mean(h, axis=1)  # 全局池化
+        m = nn.Dense(64, dtype=self.dtype, name='material_fc1')(m)
+        m = nn.relu(m)
+        material_pred = nn.Dense(1, dtype=self.dtype, name='material_fc2')(m)
+        material_pred = jnp.tanh(material_pred)  # [-1, 1]
+        material_pred = material_pred.squeeze(-1)  # [B]
+        
+        return (p.astype(jnp.float32), 
+                v_quantiles.astype(jnp.float32),
+                material_pred.astype(jnp.float32))

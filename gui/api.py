@@ -418,7 +418,7 @@ def create_mcts_recurrent_fn():
         prev_p = state.current_player
         ns = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(ns)
-        l, v_quantiles = model_mgr.net.apply({'params': params}, obs, train=False)
+        l, v_quantiles, _material = model_mgr.net.apply({'params': params}, obs, train=False)
         # 分布式价值：取分位数均值作为 MCTS 价值估计
         v = jnp.mean(v_quantiles, axis=-1) if v_quantiles.ndim > 1 else v_quantiles
         l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
@@ -458,7 +458,7 @@ def get_ai_action(
         mcts_recurrent_fn = create_mcts_recurrent_fn()
     
     obs = env.observe(state.jax_state)[None, ...]
-    logits, v_quantiles = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+    logits, v_quantiles, _material = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
     # 分布式价值：取分位数均值作为 MCTS 价值估计
     value = jnp.mean(v_quantiles, axis=-1) if v_quantiles.ndim > 1 else v_quantiles
     
