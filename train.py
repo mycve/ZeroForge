@@ -62,6 +62,10 @@ class Config:
     training_batch_size: int = 2048
     td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
+    # 参数 EMA（Polyak Averaging，用平滑参数做自对弈和评估）
+    # 训练时用原始参数做梯度更新，自对弈用 EMA 参数推理（更平滑稳定）
+    ema_decay: float = 0.999          # EMA 衰减率，越接近 1 越平滑
+    
     # 自对弈与搜索 (Gumbel 优势：64 sims 即可产生强信号，top_k=16 配合 Sequential Halving)
     selfplay_batch_size: int = 2048
     num_simulations: int = 64            # 模拟次数：Gumbel 低模拟高效率
@@ -439,7 +443,7 @@ def compute_targets(data: SelfplayOutput):
     policy_mask = value_mask & data.is_full_search
     
     return Sample(
-        obs=data.obs, 
+        obs=data.obs.astype(jnp.uint8),  # 在 GPU 上转 uint8，减少 4x GPU→CPU 传输带宽
         policy_tgt=data.action_weights, 
         value_tgt=value_tgt,
         mask=value_mask,
@@ -766,7 +770,8 @@ class ReplayBuffer:
 
 class TrainState(NamedTuple):
     """完整训练状态，用于断点续训"""
-    params: dict                    # 模型参数
+    params: dict                    # 模型参数（梯度更新用）
+    ema_params: dict                # EMA 参数（自对弈和评估用）
     opt_state: dict                 # 优化器状态
     iteration: int                  # 当前迭代次数
     frames: int                     # 总帧数
@@ -810,12 +815,14 @@ def save_checkpoint(
     """
     # 从设备获取参数（只取第一个设备的副本）
     params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.params))
+    ema_params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.ema_params))
     opt_state_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.opt_state))
     rng_key_np = jax.device_get(train_state.rng_key)
     
     # 构建完整状态字典
     state_dict = {
         "params": params_np,
+        "ema_params": ema_params_np,
         "opt_state": opt_state_np,
         "iteration": np.array(train_state.iteration),
         "frames": np.array(train_state.frames),
@@ -855,7 +862,7 @@ def restore_checkpoint(
     
     Returns:
         None 如果没有 checkpoint
-        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
+        (params, ema_params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
@@ -867,6 +874,7 @@ def restore_checkpoint(
     # 构建恢复目标结构 (提供给 orbax 以正确恢复)
     restore_target = {
         "params": params_template,
+        "ema_params": params_template,  # EMA 参数结构与 params 相同
         "opt_state": opt_state_template,
         "iteration": np.array(0),
         "frames": np.array(0),
@@ -877,6 +885,7 @@ def restore_checkpoint(
     restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
     
     params = restored["params"]
+    ema_params = restored["ema_params"]
     opt_state = restored["opt_state"]
     iteration = int(restored["iteration"])
     frames = int(restored["frames"])
@@ -912,7 +921,7 @@ def restore_checkpoint(
     else:
         print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}")
     
-    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
+    return params, ema_params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
 
 
 # ============================================================================
@@ -957,11 +966,12 @@ def main():
     
     if restored is not None:
         # 从 checkpoint 恢复
-        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        params, ema_params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         # 全新训练
         params = params_template
+        ema_params = params_template  # 初始 EMA = 训练参数
         opt_state = opt_state_template
         iteration = 0
         frames = 0
@@ -970,6 +980,7 @@ def main():
     
     # 分发到所有设备
     params = replicate_to_devices(params)
+    ema_params = replicate_to_devices(ema_params)
     opt_state = replicate_to_devices(opt_state)
     
     @partial(jax.pmap, axis_name='i')
@@ -978,6 +989,14 @@ def main():
         # AdamW 需要传入 params 参数来计算权重衰减
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss, mloss
+    
+    @jax.pmap
+    def update_ema(ema_p, p):
+        """EMA 参数更新：ema = decay * ema + (1 - decay) * params"""
+        return jax.tree.map(
+            lambda e, t: config.ema_decay * e + (1.0 - config.ema_decay) * t,
+            ema_p, p
+        )
 
     writer = SummaryWriter(config.log_dir)
     start_time_total = time.time()
@@ -992,15 +1011,15 @@ def main():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             selfplay_keys = jax.device_put_sharded(list(jax.random.split(sk1, num_devices)), devices)
-        data = selfplay(params, selfplay_keys)
+        # 自对弈使用 EMA 参数（比训练参数更平滑稳定）
+        data = selfplay(ema_params, selfplay_keys)
         samples = compute_targets(data)
         
-        # 优化：延迟统计计算，减少同步点
-        # 只传输必要的小数据到 CPU，而不是整个 data
-        data_np = jax.device_get(data)
-        term = data_np.terminated
-        winner = data_np.winner
-        reasons = data_np.draw_reason
+        # 优化：只传输统计所需的 3 个字段（< 5 MB），而非整个 data（~15 GB）
+        # data 中的 obs(float32)、action_weights 等大张量完全不需要传到 CPU 做统计
+        term = jax.device_get(data.terminated)
+        winner = jax.device_get(data.winner)
+        reasons = jax.device_get(data.draw_reason)
         
         # 批量计算所有统计量，只触发一次同步
         # 结束原因编码：
@@ -1081,6 +1100,9 @@ def main():
             value_losses = [0.0]
             material_losses = [0.0]
         
+        # --- 更新 EMA 参数（每次迭代训练完成后） ---
+        ema_params = update_ema(ema_params, params)
+        
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
         
@@ -1119,13 +1141,14 @@ def main():
         
         # === Checkpoint 保存 (使用 orbax 官方方案) ===
         if iteration % config.ckpt_interval == 0:
-            # 更新历史模型
-            params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
-            history_models[iteration] = params_np
+            # 更新历史模型（存储 EMA 参数，与自对弈/评估使用的参数一致）
+            ema_params_np = jax.device_get(jax.tree.map(lambda x: x[0], ema_params))
+            history_models[iteration] = ema_params_np
             
             # 保存完整训练状态
             train_state = TrainState(
                 params=params,
+                ema_params=ema_params,
                 opt_state=opt_state,
                 iteration=iteration,
                 frames=frames,
@@ -1150,10 +1173,10 @@ def main():
                     eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
                     eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
                 
-                # 双边评估
+                # 双边评估（使用 EMA 参数，与自对弈一致）
                 try:
-                    winners_r = evaluate(params, past_params, eval_keys_r)
-                    winners_b = evaluate(past_params, params, eval_keys_b)
+                    winners_r = evaluate(ema_params, past_params, eval_keys_r)
+                    winners_b = evaluate(past_params, ema_params, eval_keys_b)
                 except Exception as e:
                     print(f"[评估错误] 当前模型 dtype={config.network_dtype}, action_size={ACTION_SPACE_SIZE}")
                     print(f"[评估错误] params dtype: {jax.tree.leaves(params)[0].dtype}")
