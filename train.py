@@ -71,7 +71,7 @@ class Config:
     # 大部分步骤用快速搜索加速自对弈，少部分步骤用完整搜索产生高质量策略目标
     # 快速步的价值目标仍参与训练，策略目标不参与（质量不足）
     fast_sim_ratio: float = 0.75        # 75% 步骤使用快速搜索（约 2.9x 自对弈加速）
-    fast_num_simulations: int = 8       # 快速搜索模拟次数
+    fast_num_simulations: int = 16       # 快速搜索模拟次数
     fast_top_k: int = 4                 # 快速搜索 top_k（8 sims 配合 2 阶段减半）
     
     # 经验回放配置（更高复用率，提升数据效率）
