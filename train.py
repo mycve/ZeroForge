@@ -67,6 +67,13 @@ class Config:
     num_simulations: int = 64            # 模拟次数：Gumbel 低模拟高效率
     top_k: int = 16                        # 缩小根节点候选：配合 64 sims 的 4 阶段减半
     
+    # 算力随机化（Playout Cap Randomization，KataGo 核心技术）
+    # 大部分步骤用快速搜索加速自对弈，少部分步骤用完整搜索产生高质量策略目标
+    # 快速步的价值目标仍参与训练，策略目标不参与（质量不足）
+    fast_sim_ratio: float = 0.75        # 75% 步骤使用快速搜索（约 2.9x 自对弈加速）
+    fast_num_simulations: int = 8       # 快速搜索模拟次数
+    fast_top_k: int = 4                 # 快速搜索 top_k（8 sims 配合 2 阶段减半）
+    
     # 经验回放配置（更高复用率，提升数据效率）
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 6
@@ -187,13 +194,15 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    root_value: jnp.ndarray  # MCTS 搜索后的价值估计，用于 n-step TD bootstrap
+    root_value: jnp.ndarray      # MCTS 搜索后的价值估计，用于 n-step TD bootstrap
+    is_full_search: jnp.ndarray  # 是否使用完整搜索（快速搜索步的策略不参与训练）
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
-    value_tgt: jnp.ndarray  # TD(λ) 目标：加权平均的 λ-return
-    mask: jnp.ndarray
+    value_tgt: jnp.ndarray      # TD(λ) 目标：加权平均的 λ-return
+    mask: jnp.ndarray            # 价值/辅助损失掩码（游戏结束前的步骤）
+    policy_mask: jnp.ndarray     # 策略损失掩码（仅完整搜索步骤参与策略训练）
 
 # ============================================================================
 # 自玩
@@ -239,7 +248,7 @@ def selfplay(params, rng_key):
     batch_size = config.selfplay_batch_size // num_devices
     
     def step_fn(state, key):
-        key_search, key_sample, key_next = jax.random.split(key, 3)
+        key_search, key_sample, key_next, key_cap = jax.random.split(key, 4)
         obs = jax.vmap(env.observe)(state)
         logits, value = forward(params, obs)
         
@@ -252,29 +261,45 @@ def selfplay(params, rng_key):
         def _mcts_policy():
             # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
             root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-            # 统一策略：只执行一次 MCTS 搜索
-            policy_output = mctx.gumbel_muzero_policy(
-                params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
-                num_simulations=config.num_simulations,
-                max_num_considered_actions=config.top_k,
-                invalid_actions=~state.legal_action_mask,
-            )
             
-            # mctx 库已实现完整的 Gumbel MuZero 策略改进公式：
-            # improved_policy = softmax(logits + σ(completed_qvalues))
-            # σ 包含 mixed_value 补全、[0,1] 归一化、value_scale=0.1 缩放
-            # 参考：https://openreview.net/forum?id=bERaNdoegnO
-            q_policy = policy_output.action_weights
-            rv = policy_output.search_tree.node_values[:, 0]
-            return q_policy, rv
+            def _full_search():
+                """完整搜索：64 sims + top_k=16，产生高质量策略目标"""
+                policy_output = mctx.gumbel_muzero_policy(
+                    params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+                    num_simulations=config.num_simulations,
+                    max_num_considered_actions=config.top_k,
+                    invalid_actions=~state.legal_action_mask,
+                )
+                return (policy_output.action_weights,
+                        policy_output.search_tree.node_values[:, 0],
+                        jnp.bool_(True))
+            
+            def _fast_search():
+                """快速搜索：8 sims + top_k=4，仍远优于原始策略网络"""
+                policy_output = mctx.gumbel_muzero_policy(
+                    params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+                    num_simulations=config.fast_num_simulations,
+                    max_num_considered_actions=config.fast_top_k,
+                    invalid_actions=~state.legal_action_mask,
+                )
+                return (policy_output.action_weights,
+                        policy_output.search_tree.node_values[:, 0],
+                        jnp.bool_(False))
+            
+            # 算力随机化 (Playout Cap Randomization)：
+            # 以 fast_sim_ratio 概率使用快速搜索，其余使用完整搜索
+            # 两个分支的输出形状完全一致，lax.cond 只编译不同 num_simulations 的 MCTS
+            do_full = jax.random.uniform(key_cap) >= config.fast_sim_ratio
+            return jax.lax.cond(do_full, _full_search, _fast_search)
         
         def _direct_policy():
+            """单一合法走法：跳过 MCTS，视为完整搜索"""
             action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
             aw = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
             rv = value
-            return aw, rv
+            return aw, rv, jnp.bool_(True)
         
-        action_weights, root_value = jax.lax.cond(
+        action_weights, root_value, is_full = jax.lax.cond(
             jnp.all(only_one_move),
             _direct_policy,
             _mcts_policy,
@@ -320,6 +345,7 @@ def selfplay(params, rng_key):
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
             root_value=root_value,  # MCTS 搜索后的价值估计
+            is_full_search=jnp.broadcast_to(is_full, (batch_size,)),  # 广播到 batch 维度
         )
         
         # 重置已结束的游戏，并有一定概率使用随机开局
@@ -408,11 +434,16 @@ def compute_targets(data: SelfplayOutput):
     )
     value_tgt = value_tgt_rev[::-1]  # 翻转回正序
     
+    # 策略掩码：仅完整搜索 & 游戏未结束的步骤参与策略训练
+    # 快速搜索步的 action_weights 质量不足，不作为策略目标
+    policy_mask = value_mask & data.is_full_search
+    
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
         value_tgt=value_tgt,
         mask=value_mask,
+        policy_mask=policy_mask,
     )
 
 # ============================================================================
@@ -496,9 +527,9 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
-    # 策略损失（所有样本）
+    # 策略损失（仅完整搜索步骤参与，快速搜索的策略质量不足）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
-    policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+    policy_loss = jnp.sum(policy_ce * samples.policy_mask) / jnp.maximum(jnp.sum(samples.policy_mask), 1.0)
     
     # 分位数价值损失（更稳定、更鲁棒）
     value_loss_per_sample = quantile_huber_loss(v_quantiles, value_tgt, kappa=config.quantile_huber_kappa)
@@ -620,6 +651,7 @@ class ReplayBuffer:
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.value_tgt = np.zeros((max_size,), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
+        self.policy_mask = np.zeros((max_size,), dtype=np.bool_)  # 策略损失掩码
         
         self.ptr = 0
         self.size = 0
@@ -634,6 +666,7 @@ class ReplayBuffer:
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         value_flat = samples_np.value_tgt.reshape(-1)
         mask_flat = samples_np.mask.reshape(-1)
+        policy_mask_flat = samples_np.policy_mask.reshape(-1)
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -643,6 +676,7 @@ class ReplayBuffer:
         self.policy_tgt[indices] = policy_flat
         self.value_tgt[indices] = value_flat
         self.mask[indices] = mask_flat
+        self.policy_mask[indices] = policy_mask_flat
         
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
@@ -664,6 +698,7 @@ class ReplayBuffer:
         policy_batch = self.policy_tgt[idx]
         value_batch = self.value_tgt[idx]
         mask_batch = self.mask[idx]
+        policy_mask_batch = self.policy_mask[idx]
         
         # obs 保持 uint8 传输（节省 4x 带宽），在 GPU 上转换
         # 使用 jax.device_put 显式控制设备放置
@@ -671,7 +706,8 @@ class ReplayBuffer:
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             value_tgt=jnp.asarray(value_batch),
-            mask=jnp.asarray(mask_batch)
+            mask=jnp.asarray(mask_batch),
+            policy_mask=jnp.asarray(policy_mask_batch),
         )
     
     def cleanup(self):
@@ -684,6 +720,7 @@ class ReplayBuffer:
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
             "value_tgt": self.value_tgt, "mask": self.mask,
+            "policy_mask": self.policy_mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
@@ -696,6 +733,8 @@ class ReplayBuffer:
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
         
+        loaded_policy_mask = np.array(state["policy_mask"])
+        
         # 如果加载的数据比当前缓冲区小，直接复制到前面
         old_max = loaded_obs.shape[0]
         actual_samples = min(loaded_size, old_max)
@@ -706,6 +745,7 @@ class ReplayBuffer:
             self.policy_tgt[:old_max] = loaded_policy
             self.value_tgt[:old_max] = loaded_value
             self.mask[:old_max] = loaded_mask
+            self.policy_mask[:old_max] = loaded_policy_mask
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
@@ -714,6 +754,7 @@ class ReplayBuffer:
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.value_tgt[:] = loaded_value[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
+            self.policy_mask[:] = loaded_policy_mask[:self.max_size]
             self.size = self.max_size
             self.ptr = 0
         
