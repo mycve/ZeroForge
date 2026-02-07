@@ -1069,9 +1069,12 @@ def main():
         policy_losses, value_losses, material_losses = [], [], []
         ploss_acc, vloss_acc, mloss_acc = None, None, None
         
+        # 确保训练 batch 大小能被设备数整除
+        effective_train_batch = (config.training_batch_size // num_devices) * num_devices
+        
         for i in range(num_updates):
             sk_sample = sample_keys[i+1]
-            batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
+            batch_flat = replay_buffer.sample(effective_train_batch, sk_sample)
             batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
             
             # 分发训练 Key 到各设备
