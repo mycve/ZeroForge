@@ -67,17 +67,21 @@ class Config:
     # 训练时用原始参数做梯度更新，自对弈用 EMA 参数推理（更平滑稳定）
     ema_decay: float = 0.999          # EMA 衰减率，越接近 1 越平滑
     
-    # 自对弈与搜索 (Gumbel 优势：64 sims 即可产生强信号，top_k=16 配合 Sequential Halving)
+    # 自对弈与搜索
+    # 完整搜索：128 sims + top_k=16（4 阶段 Sequential Halving: 16→8→4→2）
+    # 训练早期网络 prior 差，需要更多模拟来修正策略；后期可酌情降低
     selfplay_batch_size: int = 2048
-    num_simulations: int = 64            # 模拟次数：Gumbel 低模拟高效率
-    top_k: int = 16                        # 缩小根节点候选：配合 64 sims 的 4 阶段减半
+    num_simulations: int = 128           # 完整搜索模拟次数
+    top_k: int = 32                        # 完整搜索候选动作数
     
     # 算力随机化（Playout Cap Randomization，KataGo 核心技术）
-    # 大部分步骤用快速搜索加速自对弈，少部分步骤用完整搜索产生高质量策略目标
-    # 快速步的价值目标仍参与训练，策略目标不参与（质量不足）
-    fast_sim_ratio: float = 0.75        # 75% 步骤使用快速搜索（约 2.9x 自对弈加速）
-    fast_num_simulations: int = 8       # 快速搜索模拟次数
-    fast_top_k: int = 4                 # 快速搜索 top_k（8 sims 配合 2 阶段减半）
+    # 50% 步骤用快速搜索加速自对弈，50% 用完整搜索产生高质量策略目标
+    # 快速步的价值目标仍参与训练，策略目标不参与（质量相对不足）
+    # 快速搜索：32 sims + top_k=8（3 阶段 Sequential Halving: 8→4→2）
+    # 平均模拟：0.5×128 + 0.5×32 = 80 次/步，兼顾信号质量和速度
+    fast_sim_ratio: float = 0.5          # 50% 步骤使用快速搜索（约 1.6x 自对弈加速）
+    fast_num_simulations: int = 32       # 快速搜索模拟次数（KataGo 快速搜索也用 100+）
+    fast_top_k: int = 8                  # 快速搜索 top_k（32 sims 配合 3 阶段减半）
     
     # 经验回放配置（更高复用率，提升数据效率）
     replay_buffer_size: int = 2000000
