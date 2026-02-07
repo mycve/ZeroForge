@@ -71,8 +71,8 @@ class Config:
     # 完整搜索：128 sims + top_k=16（4 阶段 Sequential Halving: 16→8→4→2）
     # 训练早期网络 prior 差，需要更多模拟来修正策略；后期可酌情降低
     selfplay_batch_size: int = 2048
-    num_simulations: int = 128           # 完整搜索模拟次数
-    top_k: int = 32                        # 完整搜索候选动作数
+    num_simulations: int = 96           # 完整搜索模拟次数
+    top_k: int = 24                        # 完整搜索候选动作数
     
     # 算力随机化（Playout Cap Randomization，KataGo 核心技术）
     # 50% 步骤用快速搜索加速自对弈，50% 用完整搜索产生高质量策略目标
