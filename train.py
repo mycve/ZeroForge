@@ -69,14 +69,14 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 64 sims 对训练足够，top_k=16 配合 4 阶段 Sequential Halving)
     selfplay_batch_size: int = 1024
-    num_simulations: int = 64            # 完整搜索模拟次数
-    top_k: int = 16                      # 完整搜索候选动作数
+    num_simulations: int = 128            # 完整搜索模拟次数
+    top_k: int = 32                      # 完整搜索候选动作数
     
     # 算力非对称（Per-game Asymmetric Compute）
     # 开局前随机分配强弱方：强方使用完整搜索，弱方使用快速搜索
     # 强方始终使用 num_simulations 次模拟，弱方始终使用 fast_num_simulations 次
     # 平均模拟：0.5×96 + 0.5×8 = 52 次/步
-    fast_num_simulations: int = 8        # 弱方搜索模拟次数
+    fast_num_simulations: int = 16        # 弱方搜索模拟次数
     fast_top_k: int = 4                  # 弱方搜索 top_k
     
     # 经验回放配置（更高复用率，提升数据效率）
