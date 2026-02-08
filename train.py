@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ZeroForge - 中国象棋 Gumbel AlphaZero
-现代化极简顶级架构：算力非对称 + 视角归一化 + 镜像增强 + 标准 ELO
+现代化极简顶级架构：对称算力 + 视角归一化 + 镜像增强 + 标准 ELO
 """
 
 import os
@@ -55,7 +55,7 @@ class Config:
     
     # 网络架构（GAT+SE 增强块更强，6 层即可；BF16 在 5090 上推理速度翻倍）
     num_channels: int = 128
-    num_blocks: int = 6
+    num_blocks: int = 8
     network_dtype: str = "bfloat16"
     
     # 训练超参数（大 batch 配合 warmup+cosine lr schedule）
@@ -68,19 +68,13 @@ class Config:
     ema_decay: float = 0.999          # EMA 衰减率，越接近 1 越平滑
     
     # 自对弈与搜索 (Gumbel 64 sims 对训练足够，top_k=16 配合 4 阶段 Sequential Halving)
-    selfplay_batch_size: int = 1024
+    selfplay_batch_size: int = 256
     num_simulations: int = 128            # 完整搜索模拟次数
     top_k: int = 32                      # 完整搜索候选动作数
     
-    # 算力非对称（Per-game Asymmetric Compute）
-    # 开局前随机分配强弱方：强方使用完整搜索，弱方使用快速搜索
-    # 强方始终使用 num_simulations 次模拟，弱方始终使用 fast_num_simulations 次
-    # 平均模拟：0.5×96 + 0.5×8 = 52 次/步
-    fast_num_simulations: int = 16        # 弱方搜索模拟次数
-    fast_top_k: int = 4                  # 弱方搜索 top_k
     
     # 经验回放配置（更高复用率，提升数据效率）
-    replay_buffer_size: int = 2000000
+    replay_buffer_size: int = 500000
     sample_reuse_times: int = 4
     
     # 损失权重
@@ -98,7 +92,7 @@ class Config:
     temperature_final: float = 0.1
     
     # 随机开局配置（更激进的多样性，加速开局学习）
-    random_opening_steps: tuple = (2, 4, 6, 8, 10, 12)  # 可选的开局随机步数（随机选择一个）
+    random_opening_steps: tuple = (2, 4, 6, 8, 10)  # 可选的开局随机步数（随机选择一个）
     random_opening_prob: float = 0.5  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
@@ -200,7 +194,7 @@ class SelfplayOutput(NamedTuple):
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
     root_value: jnp.ndarray      # MCTS 搜索后的价值估计，用于 n-step TD bootstrap
-    is_full_search: jnp.ndarray  # 是否使用完整搜索（仅强方回合的策略参与训练）
+    is_full_search: jnp.ndarray  # 是否使用完整搜索（对称算力下始终为 True）
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -247,13 +241,12 @@ def selfplay(params, rng_key):
     高性能自玩算子：
     - 使用 lax.scan 消除 Python 循环开销
     - Gumbel 算法无需 Dirichlet 噪声 (Gumbel 噪声已提供足够探索)
-    - 算力非对称：开局前随机分配强弱方，强方完整搜索，弱方快速搜索
+    - 对称算力：每步双方都使用完整搜索，所有步骤产生高质量策略目标
     - 支持随机开局增加开局多样性
     """
     batch_size = config.selfplay_batch_size // num_devices
     
-    def step_fn(state, inputs):
-        key, step_idx = inputs
+    def step_fn(state, key):
         key_search, key_sample, key_next = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
         logits, value = forward(params, obs)
@@ -268,34 +261,16 @@ def selfplay(params, rng_key):
             # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
             root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
             
-            def _full_search():
-                """强方搜索：完整模拟，产生高质量策略目标"""
-                policy_output = mctx.gumbel_muzero_policy(
-                    params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
-                    num_simulations=config.num_simulations,
-                    max_num_considered_actions=config.top_k,
-                    invalid_actions=~state.legal_action_mask,
-                )
-                return (policy_output.action_weights,
-                        policy_output.search_tree.node_values[:, 0],
-                        jnp.bool_(True))
-            
-            def _fast_search():
-                """弱方搜索：快速模拟，仍远优于原始策略网络"""
-                policy_output = mctx.gumbel_muzero_policy(
-                    params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
-                    num_simulations=config.fast_num_simulations,
-                    max_num_considered_actions=config.fast_top_k,
-                    invalid_actions=~state.legal_action_mask,
-                )
-                return (policy_output.action_weights,
-                        policy_output.search_tree.node_values[:, 0],
-                        jnp.bool_(False))
-            
-            # 算力非对称：强方回合使用完整搜索，弱方回合使用快速搜索
-            # step_idx % 2 确定当前回合是哪方的（偶数=红方，奇数=黑方）
-            is_strong_turn = (step_idx % 2) == strong_player
-            return jax.lax.cond(is_strong_turn, _full_search, _fast_search)
+            # 对称算力：每步都使用完整搜索，双方全力对弈
+            policy_output = mctx.gumbel_muzero_policy(
+                params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+                num_simulations=config.num_simulations,
+                max_num_considered_actions=config.top_k,
+                invalid_actions=~state.legal_action_mask,
+            )
+            return (policy_output.action_weights,
+                    policy_output.search_tree.node_values[:, 0],
+                    jnp.bool_(True))
         
         def _direct_policy():
             """单一合法走法：跳过 MCTS，视为完整搜索"""
@@ -395,14 +370,7 @@ def selfplay(params, rng_key):
         )
     
     state = jax.vmap(_init_with_random_opening)(jax.random.split(rng_key, batch_size))
-    
-    # 算力非对称：开局前随机决定哪一方为强方（0=红方强，1=黑方强）
-    rng_key, key_strong = jax.random.split(rng_key)
-    strong_player = jax.random.randint(key_strong, (), 0, 2)
-    
-    scan_keys = jax.random.split(rng_key, config.max_steps)
-    scan_indices = jnp.arange(config.max_steps)
-    _, data = jax.lax.scan(step_fn, state, (scan_keys, scan_indices))
+    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
     return data
 
 @jax.pmap
@@ -446,8 +414,8 @@ def compute_targets(data: SelfplayOutput):
     )
     value_tgt = value_tgt_rev[::-1]  # 翻转回正序
     
-    # 策略掩码：仅强方完整搜索 & 游戏未结束的步骤参与策略训练
-    # 弱方快速搜索步的 action_weights 质量不足，不作为策略目标
+    # 策略掩码：对称算力下 is_full_search 始终为 True，等价于 value_mask
+    # 所有未结束步骤的策略目标都参与训练
     policy_mask = value_mask & data.is_full_search
     
     return Sample(
@@ -539,7 +507,7 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
-    # 策略损失（仅强方搜索步骤参与，弱方搜索的策略质量不足）
+    # 策略损失（对称算力下所有步骤都参与）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.policy_mask) / jnp.maximum(jnp.sum(samples.policy_mask), 1.0)
     
