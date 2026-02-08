@@ -81,7 +81,7 @@ class Config:
     
     # 经验回放配置（更高复用率，提升数据效率）
     replay_buffer_size: int = 2000000
-    sample_reuse_times: int = 6
+    sample_reuse_times: int = 4
     
     # 损失权重
     value_loss_weight: float = 1.5
