@@ -174,10 +174,24 @@ net = AlphaZeroNetwork(
     dtype=_DTYPE_MAP[config.network_dtype],
 )
 
+eval_net = AlphaZeroNetwork(
+    action_space_size=env.action_space_size,
+    channels=config.num_channels,
+    num_blocks=config.num_blocks,
+    dtype=jnp.float32,
+)
+
 def forward(params, obs, is_training=False):
     """前向传播 (LayerNorm 架构，无需 batch_stats)"""
     logits, value = net.apply({'params': params}, obs, train=is_training)
     return logits, value
+
+
+def eval_forward(params, obs):
+    """评估前向传播：固定 float32，规避部分 GPU 上 BF16 Triton 编译问题。"""
+    logits, value = eval_net.apply({'params': params}, obs, train=False)
+    return logits, value
+
 
 def recurrent_fn(params, rng_key, action, state):
     """MCTS 递归函数"""
@@ -483,11 +497,33 @@ def evaluate(params_red, params_black, rng_key):
     """
     batch_size = config.eval_games // num_devices
     
+    def recurrent_fn_eval(params, rng_key, action, state):
+        """评估递归函数：仅用于评估阶段，强制 float32 前向。"""
+        prev_player = state.current_player
+        state = jax.vmap(env.step)(state, action)
+        obs = jax.vmap(env.observe)(state)
+        logits, value = eval_forward(params, obs)
+        
+        logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        
+        reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
+        value = jnp.where(state.terminated, 0.0, value)
+        discount = jnp.where(state.terminated, 0.0, -1.0)
+        
+        return mctx.RecurrentFnOutput(
+            reward=reward,
+            discount=discount,
+            prior_logits=logits,
+            value=value,
+        ), state
+
     def evaluate_recurrent_fn(params_pair, rng_key, action, state):
         p_red, p_black = params_pair
         # 分别计算两个模型的输出
-        out_red, next_state = recurrent_fn(p_red, rng_key, action, state)
-        out_black, _ = recurrent_fn(p_black, rng_key, action, state)
+        out_red, next_state = recurrent_fn_eval(p_red, rng_key, action, state)
+        out_black, _ = recurrent_fn_eval(p_black, rng_key, action, state)
         # 根据搜索模型索引进行合并
         use_red = state.search_model_index == 0
         out = jax.tree.map(
@@ -502,8 +538,8 @@ def evaluate(params_red, params_black, rng_key):
         state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
         
         obs = jax.vmap(env.observe)(state)
-        logits_r, value_r = forward(params_red, obs)
-        logits_b, value_b = forward(params_black, obs)
+        logits_r, value_r = eval_forward(params_red, obs)
+        logits_b, value_b = eval_forward(params_black, obs)
         
         logits = jnp.where(is_red[:, None], logits_r, logits_b)
         value = jnp.where(is_red, value_r, value_b)
