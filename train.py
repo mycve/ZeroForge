@@ -23,18 +23,6 @@ import orbax.checkpoint as ocp
 # 开启持久化编译缓存，二次启动秒开
 cache_dir = os.path.abspath("jax_cache")
 os.makedirs(cache_dir, exist_ok=True)
-jax.config.update("jax_compilation_cache_dir", cache_dir)
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)  # 缓存所有编译结果
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)  # 不管编译时间都缓存
-
-# --- XLA 编译加速建议 (无损方案) ---
-# 1. 允许 XLA 融合更多算子
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_enable_highest_priority_async_stream=true"
-)
-# 2. 强制使用 32 位哈希 (已在 env.py 实现)
-# 3. 避免不需要的 64 位运算
-jax.config.update("jax_enable_x64", False)
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
@@ -55,7 +43,7 @@ class Config:
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 96
     num_blocks: int = 6
-    network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
+    network_dtype: str = "float16"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -115,6 +103,46 @@ _QTRANSFORM = partial(
 
 devices = jax.local_devices()
 num_devices = len(devices)
+
+def _align_to_device_multiple(value: int, field_name: str) -> int:
+    """将批量参数对齐到设备数整数倍，避免 pmap 前 reshape 出错。"""
+    if num_devices <= 0:
+        raise RuntimeError("未检测到可用设备")
+    if value <= 0:
+        aligned = num_devices
+    else:
+        aligned = (value // num_devices) * num_devices
+        if aligned == 0:
+            aligned = num_devices
+    if aligned != value:
+        print(f"[Config] {field_name} 从 {value} 自动调整为 {aligned} (num_devices={num_devices})")
+    return aligned
+
+
+def _shard_batch_for_devices(batch_flat):
+    """将平铺 batch 安全切分到多设备，必要时裁掉尾部样本。"""
+    first_leaf = jax.tree.leaves(batch_flat)[0]
+    total = int(first_leaf.shape[0])
+    if total < num_devices:
+        raise ValueError(
+            f"训练 batch 太小: {total} < num_devices({num_devices})，请增大 training_batch_size"
+        )
+    per_device = total // num_devices
+    usable = per_device * num_devices
+    if usable != total:
+        print(f"[Batch] 训练 batch {total} 无法整除设备数 {num_devices}，自动裁剪为 {usable}")
+
+    def _reshape(x):
+        x = x[:usable]
+        return x.reshape((num_devices, per_device) + x.shape[1:])
+
+    return jax.tree.map(_reshape, batch_flat)
+
+
+# 动态设备数下的批量自动对齐（避免 reshape/device_put_sharded 错误）
+config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_size, "selfplay_batch_size")
+config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
+config.eval_games = _align_to_device_multiple(config.eval_games, "eval_games")
 
 # 预计算旋转索引，避免在 JIT 循环内重复计算
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -936,7 +964,7 @@ def main():
         for i in range(num_updates):
             sk_sample = sample_keys[i+1]
             batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
-            batch = jax.tree.map(lambda x: x.reshape((num_devices, -1) + x.shape[1:]), batch_flat)
+            batch = _shard_batch_for_devices(batch_flat)
             
             # 分发训练 Key 到各设备
             train_key = jax.random.split(sample_keys[i+1], 1)[0]
