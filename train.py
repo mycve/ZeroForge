@@ -60,12 +60,12 @@ class Config:
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
+    td_lambda: float = 0.99  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 24                        # 缩小根节点候选：让搜索更集中、更深
+    num_simulations: int = 256           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 32                        # 缩小根节点候选：让搜索更集中、更深
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
