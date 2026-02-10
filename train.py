@@ -43,7 +43,7 @@ class Config:
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 96
     num_blocks: int = 6
-    network_dtype: str = "float16"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
+    network_dtype: str = "bfloat16"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
     learning_rate: float = 2e-4
