@@ -11,6 +11,7 @@ import subprocess
 import threading
 import queue
 import concurrent.futures
+from functools import partial
 from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
@@ -41,6 +42,12 @@ from networks.alphazero import AlphaZeroNetwork
 
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
+MCTS_QTRANSFORM_VALUE_SCALE = 0.25
+MCTS_GUMBEL_SCALE = 0.3
+MCTS_QTRANSFORM = partial(
+    mctx.qtransform_completed_by_mix_value,
+    value_scale=MCTS_QTRANSFORM_VALUE_SCALE,
+)
 
 # Pikafish 路径（程序目录下）
 PIKAFISH_PATH = Path(__file__).parent.parent / "pikafish"
@@ -448,7 +455,9 @@ def get_ai_action(
         recurrent_fn=mcts_recurrent_fn,
         num_simulations=num_simulations, 
         max_num_considered_actions=top_k,
-        invalid_actions=invalid_mask[None, ...]
+        invalid_actions=invalid_mask[None, ...],
+        qtransform=MCTS_QTRANSFORM,
+        gumbel_scale=MCTS_GUMBEL_SCALE,
     )
     
     search_value = float(policy_output.search_tree.node_values[0, 0])

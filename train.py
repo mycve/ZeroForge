@@ -65,15 +65,18 @@ class Config:
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
     num_simulations: int = 256           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 32                        # 缩小根节点候选：让搜索更集中、更深
+    top_k: int = 48                        # 根节点候选数，适当增大以保留高风险分支
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 4
     
     # 损失权重
-    value_loss_weight: float = 1.5
+    value_loss_weight: float = 1.1
     weight_decay: float = 1e-4
+    qtransform_value_scale: float = 0.25   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.3     # 自博弈增加探索，鼓励策略多样性
+    eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
@@ -101,6 +104,10 @@ class Config:
     keep_period: int = 50           # 每 N 次迭代永久保留一个 checkpoint
 
 config = Config()
+_QTRANSFORM = partial(
+    mctx.qtransform_completed_by_mix_value,
+    value_scale=config.qtransform_value_scale,
+)
 
 # ============================================================================
 # 环境和设备
@@ -245,6 +252,8 @@ def selfplay(params, rng_key):
                 num_simulations=config.num_simulations,
                 max_num_considered_actions=config.top_k,
                 invalid_actions=~state.legal_action_mask,
+                qtransform=_QTRANSFORM,
+                gumbel_scale=config.selfplay_gumbel_scale,
             )
             aw = policy_output.action_weights
             rv = policy_output.search_tree.node_values[:, 0]
@@ -481,6 +490,8 @@ def evaluate(params_red, params_black, rng_key):
             recurrent_fn=evaluate_recurrent_fn,
             num_simulations=config.num_simulations, max_num_considered_actions=config.top_k,
             invalid_actions=~state.legal_action_mask,
+            qtransform=_QTRANSFORM,
+            gumbel_scale=config.eval_gumbel_scale,
         )
         
         # 分阶段温度策略，增加开局多样性
