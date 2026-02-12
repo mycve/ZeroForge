@@ -48,22 +48,22 @@ class Config:
     # 训练超参数
     learning_rate: float = 2e-4
     training_batch_size: int = 512
-    td_lambda: float = 0.99  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
+    td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 196           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 48                        # 根节点候选数，适当增大以保留高风险分支
+    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 24                        # 根节点候选数，适当增大以保留高风险分支
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 4
     
     # 损失权重
-    value_loss_weight: float = 1.1
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.25   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.3     # 自博弈增加探索，鼓励策略多样性
+    qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0     # 自博弈增加探索，鼓励策略多样性
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
@@ -76,7 +76,7 @@ class Config:
     random_opening_prob: float = 0.4  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 150              # 总步数 400 步（200回合）判和
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
