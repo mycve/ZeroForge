@@ -41,9 +41,9 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
-    num_channels: int = 96
+    num_channels: int = 256
     num_blocks: int = 6
-    network_dtype: str = "bfloat16"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
+    network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
     learning_rate: float = 2e-4
@@ -52,8 +52,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 512
-    num_simulations: int = 96           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 24                        # 根节点候选数，适当增大以保留高风险分支
+    num_simulations: int = 32           # 模拟次数：越多搜索越深，但速度越慢
+    top_k: int = 8                        # 根节点候选数，适当增大以保留高风险分支
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
