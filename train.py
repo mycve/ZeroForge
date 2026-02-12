@@ -73,7 +73,7 @@ class Config:
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
     random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
-    random_opening_prob: float = 0.4  # 每局随机开局的概率
+    random_opening_prob: float = 0.0  # 每局随机开局的概率
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
