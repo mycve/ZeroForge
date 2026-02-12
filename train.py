@@ -47,12 +47,12 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4
-    training_batch_size: int = 512
+    training_batch_size: int = 1024
     td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 512
-    num_simulations: int = 32           # 模拟次数：越多搜索越深，但速度越慢
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 40           # 模拟次数：越多搜索越深，但速度越慢
     top_k: int = 8                        # 根节点候选数，适当增大以保留高风险分支
     
     # 经验回放配置
@@ -60,7 +60,7 @@ class Config:
     sample_reuse_times: int = 4
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0     # 自博弈增加探索，鼓励策略多样性
