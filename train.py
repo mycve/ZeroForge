@@ -42,7 +42,7 @@ class Config:
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 256
-    num_blocks: int = 6
+    num_blocks: int = 8
     network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
@@ -51,7 +51,7 @@ class Config:
     td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    selfplay_batch_size: int = 1024
+    selfplay_batch_size: int = 2048
     num_simulations: int = 40           # 模拟次数：越多搜索越深，但速度越慢
     top_k: int = 8                        # 根节点候选数，适当增大以保留高风险分支
     
@@ -63,7 +63,7 @@ class Config:
     value_loss_weight: float = 1.5
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0     # 自博弈增加探索，鼓励策略多样性
+    selfplay_gumbel_scale: float = 1.1     # 自博弈增加探索，鼓励策略多样性
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
