@@ -61,11 +61,13 @@ class Config:
     
     # 损失权重
     value_loss_weight: float = 1.0
+    wdl_loss_weight: float = 0.3
     value_huber_delta: float = 0.5
     value_target_clip: float = 1.0
+    wdl_label_smoothing: float = 0.05
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 0.6     # 降低根节点随机性，减少训练目标抖动
+    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
@@ -185,14 +187,14 @@ eval_net = AlphaZeroNetwork(
 
 def forward(params, obs, is_training=False):
     """前向传播 (LayerNorm 架构，无需 batch_stats)"""
-    logits, value = net.apply({'params': params}, obs, train=is_training)
-    return logits, value
+    logits, value, wdl_logits = net.apply({'params': params}, obs, train=is_training)
+    return logits, value, wdl_logits
 
 
 def eval_forward(params, obs):
     """评估前向传播：固定 float32，规避部分 GPU 上 BF16 Triton 编译问题。"""
-    logits, value = eval_net.apply({'params': params}, obs, train=False)
-    return logits, value
+    logits, value, wdl_logits = eval_net.apply({'params': params}, obs, train=False)
+    return logits, value, wdl_logits
 
 
 def recurrent_fn(params, rng_key, action, state):
@@ -200,7 +202,7 @@ def recurrent_fn(params, rng_key, action, state):
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
-    logits, value = forward(params, obs)
+    logits, value, _ = forward(params, obs)
     
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     
@@ -231,6 +233,7 @@ class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
     value_tgt: jnp.ndarray  # TD(λ) 目标：加权平均的 λ-return
+    wdl_tgt: jnp.ndarray    # WDL(one-hot): [win, draw, loss]
     mask: jnp.ndarray
 
 # ============================================================================
@@ -279,7 +282,7 @@ def selfplay(params, rng_key):
     def step_fn(state, key):
         key_search, key_sample, key_next = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
-        logits, value = forward(params, obs)
+        logits, value, _ = forward(params, obs)
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
@@ -443,11 +446,30 @@ def compute_targets(data: SelfplayOutput):
     )
     value_tgt = value_tgt_rev[::-1]  # 翻转回正序
     value_tgt = jnp.clip(value_tgt, -config.value_target_clip, config.value_target_clip)
+
+    # Monte Carlo 回报用于构造稳定的 WDL 分类目标
+    def scan_mc(carry, inputs):
+        reward_t, discount_t = inputs
+        g_mc = reward_t + discount_t * carry
+        return g_mc, g_mc
+
+    _, mc_tgt_rev = jax.lax.scan(
+        scan_mc,
+        jnp.zeros(batch_size),
+        (data.reward[::-1], data.discount[::-1]),
+    )
+    mc_tgt = jnp.clip(mc_tgt_rev[::-1], -1.0, 1.0)
+    wdl_idx = jnp.where(mc_tgt > 1e-6, 0, jnp.where(mc_tgt < -1e-6, 2, 1))
+    wdl_tgt = jax.nn.one_hot(wdl_idx, 3, dtype=jnp.float32)
+    if config.wdl_label_smoothing > 0.0:
+        smooth = config.wdl_label_smoothing
+        wdl_tgt = wdl_tgt * (1.0 - smooth) + smooth / 3.0
     
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
         value_tgt=value_tgt,
+        wdl_tgt=wdl_tgt,
         mask=value_mask,
     )
 
@@ -470,17 +492,19 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
-    logits, value = forward(params, obs, is_training=True)
+    logits, value, wdl_logits = forward(params, obs, is_training=True)
     
     # 强制转换为 float32 进行损失计算，避免数值不稳定
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
+    wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = jnp.clip(
         samples.value_tgt.astype(jnp.float32),
         -config.value_target_clip,
         config.value_target_clip
     )
+    wdl_tgt = samples.wdl_tgt.astype(jnp.float32)
     
     # 策略损失（所有样本）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
@@ -489,10 +513,18 @@ def loss_fn(params, samples: Sample, rng_key):
     # 价值损失：Huber 对异常目标更稳
     value_loss_per = optax.huber_loss(value, value_tgt, delta=config.value_huber_delta)
     value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+
+    # WDL 分类损失：帮助 value 头学习胜和负离散结构
+    wdl_ce = optax.softmax_cross_entropy(wdl_logits, wdl_tgt)
+    wdl_loss = jnp.sum(wdl_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    total_loss = policy_loss + config.value_loss_weight * value_loss
+    total_loss = (
+        policy_loss
+        + config.value_loss_weight * value_loss
+        + config.wdl_loss_weight * wdl_loss
+    )
     
-    return total_loss, (policy_loss, value_loss)
+    return total_loss, (policy_loss, value_loss, wdl_loss)
 
 @jax.pmap
 def evaluate(params_red, params_black, rng_key):
@@ -510,7 +542,7 @@ def evaluate(params_red, params_black, rng_key):
         prev_player = state.current_player
         state = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(state)
-        logits, value = eval_forward(params, obs)
+        logits, value, _ = eval_forward(params, obs)
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
@@ -546,8 +578,8 @@ def evaluate(params_red, params_black, rng_key):
         state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
         
         obs = jax.vmap(env.observe)(state)
-        logits_r, value_r = eval_forward(params_red, obs)
-        logits_b, value_b = eval_forward(params_black, obs)
+        logits_r, value_r, _ = eval_forward(params_red, obs)
+        logits_b, value_b, _ = eval_forward(params_black, obs)
         
         logits = jnp.where(is_red[:, None], logits_r, logits_b)
         value = jnp.where(is_red, value_r, value_b)
@@ -626,6 +658,7 @@ class ReplayBuffer:
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.value_tgt = np.zeros((max_size,), dtype=np.float32)
+        self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
         
         self.ptr = 0
@@ -640,6 +673,7 @@ class ReplayBuffer:
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         value_flat = samples_np.value_tgt.reshape(-1)
+        wdl_flat = samples_np.wdl_tgt.reshape(-1, *samples_np.wdl_tgt.shape[3:])
         mask_flat = samples_np.mask.reshape(-1)
         
         n_new = obs_flat.shape[0]
@@ -649,6 +683,7 @@ class ReplayBuffer:
         self.obs[indices] = obs_flat
         self.policy_tgt[indices] = policy_flat
         self.value_tgt[indices] = value_flat
+        self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
         
         self.ptr = (self.ptr + n_new) % self.max_size
@@ -670,6 +705,7 @@ class ReplayBuffer:
         obs_batch = self.obs[idx]
         policy_batch = self.policy_tgt[idx]
         value_batch = self.value_tgt[idx]
+        wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
         
         # obs 保持 uint8 传输（节省 4x 带宽），在 GPU 上转换
@@ -678,6 +714,7 @@ class ReplayBuffer:
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             value_tgt=jnp.asarray(value_batch),
+            wdl_tgt=jnp.asarray(wdl_batch),
             mask=jnp.asarray(mask_batch)
         )
     
@@ -690,7 +727,7 @@ class ReplayBuffer:
     def state_dict(self):
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
-            "value_tgt": self.value_tgt, "mask": self.mask,
+            "value_tgt": self.value_tgt, "wdl_tgt": self.wdl_tgt, "mask": self.mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
@@ -699,6 +736,7 @@ class ReplayBuffer:
         loaded_obs = np.array(state["obs"])
         loaded_policy = np.array(state["policy_tgt"])
         loaded_value = np.array(state["value_tgt"])
+        loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
@@ -712,6 +750,7 @@ class ReplayBuffer:
             self.obs[:old_max] = loaded_obs
             self.policy_tgt[:old_max] = loaded_policy
             self.value_tgt[:old_max] = loaded_value
+            self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
@@ -720,6 +759,7 @@ class ReplayBuffer:
             self.obs[:] = loaded_obs[:self.max_size]
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.value_tgt[:] = loaded_value[:self.max_size]
+            self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
             self.size = self.max_size
             self.ptr = 0
@@ -839,13 +879,8 @@ def restore_checkpoint(
         "rng_key": jax.random.PRNGKey(0),
     }
     
-    # 恢复主状态
-    try:
-        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
-    except Exception as e:
-        print(f"[Checkpoint] 恢复失败（可能是网络结构已变更）: {e}")
-        print("[Checkpoint] 将从头开始训练。若需继续旧实验，请切回旧网络结构。")
-        return None
+    # 恢复主状态（严格模式：结构不匹配直接抛错）
+    restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
     
     params = restored["params"]
     opt_state = restored["opt_state"]
@@ -937,10 +972,10 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        grads, (ploss, vloss, wdl_loss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         # AdamW 需要传入 params 参数来计算权重衰减
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, ploss, vloss
+        return optax.apply_updates(params, updates), opt_state, ploss, vloss, wdl_loss
 
     writer = SummaryWriter(config.log_dir)
     start_time_total = time.time()
@@ -1010,8 +1045,8 @@ def main():
         rng_key = sample_keys[0]
         
         # 批量训练：采样 → 训练 → 累积损失，最后一次性同步
-        policy_losses, value_losses = [], []
-        ploss_acc, vloss_acc = None, None
+        policy_losses, value_losses, wdl_losses = [], [], []
+        ploss_acc, vloss_acc, wdl_acc = None, None, None
         
         for i in range(num_updates):
             sk_sample = sample_keys[i+1]
@@ -1024,22 +1059,25 @@ def main():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
             
-            params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
+            params, opt_state, ploss, vloss, wdl_loss = train_step(params, opt_state, batch, train_keys)
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
-                ploss_acc, vloss_acc = ploss, vloss
+                ploss_acc, vloss_acc, wdl_acc = ploss, vloss, wdl_loss
             else:
                 ploss_acc = ploss_acc + ploss
                 vloss_acc = vloss_acc + vloss
+                wdl_acc = wdl_acc + wdl_loss
         
         # 一次性同步所有累积损失
         if num_updates > 0:
             policy_losses = [float(ploss_acc.mean() / num_updates)]
             value_losses = [float(vloss_acc.mean() / num_updates)]
+            wdl_losses = [float(wdl_acc.mean() / num_updates)]
         else:
             policy_losses = [0.0]
             value_losses = [0.0]
+            wdl_losses = [0.0]
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
@@ -1049,13 +1087,15 @@ def main():
         fps = new_frames / iter_time
         buf_stats = replay_buffer.stats()
         
-        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} vloss={np.mean(value_losses):.4f} | "
+        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} "
+              f"vloss={np.mean(value_losses):.4f} wdl={np.mean(wdl_losses):.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
         writer.add_scalar("train/value_loss", np.mean(value_losses), iteration)
+        writer.add_scalar("train/wdl_loss", np.mean(wdl_losses), iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
