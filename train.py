@@ -42,34 +42,36 @@ class Config:
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 256
-    num_blocks: int = 8
+    num_blocks: int = 12
     network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
-    learning_rate: float = 2e-4
-    training_batch_size: int = 1024
-    td_lambda: float = 0.95  # TD(λ) 加权平均：λ=0 纯TD，λ=1 纯MC，0.95 是常用值
+    learning_rate: float = 1.5e-4
+    training_batch_size: int = 4096
+    td_lambda: float = 0.90  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 40           # 模拟次数：越多搜索越深，但速度越慢
-    top_k: int = 8                        # 根节点候选数，适当增大以保留高风险分支
+    num_simulations: int = 40           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 4
     
     # 损失权重
-    value_loss_weight: float = 1.5
+    value_loss_weight: float = 1.0
+    value_huber_delta: float = 0.5
+    value_target_clip: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.1     # 自博弈增加探索，鼓励策略多样性
+    selfplay_gumbel_scale: float = 0.6     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
     temperature_initial: float = 1.0
-    temperature_final: float = 0.1
+    temperature_final: float = 0.05
     
     # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
     random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
@@ -440,6 +442,7 @@ def compute_targets(data: SelfplayOutput):
         (data.reward[::-1], data.discount[::-1], value_next[::-1])  # 反转输入
     )
     value_tgt = value_tgt_rev[::-1]  # 翻转回正序
+    value_tgt = jnp.clip(value_tgt, -config.value_target_clip, config.value_target_clip)
     
     return Sample(
         obs=data.obs, 
@@ -456,7 +459,7 @@ def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
     - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
-    - 价值损失：拟合 Monte Carlo 目标（游戏最终结果）
+    - 价值损失：拟合 TD(λ) 目标（Huber + clipping 降低离群噪声）
     """
     # obs 以 uint8 传输（节省 4x 带宽），在 GPU 上转为 float32
     obs = samples.obs.astype(jnp.float32)
@@ -473,14 +476,19 @@ def loss_fn(params, samples: Sample, rng_key):
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
-    value_tgt = samples.value_tgt.astype(jnp.float32)
+    value_tgt = jnp.clip(
+        samples.value_tgt.astype(jnp.float32),
+        -config.value_target_clip,
+        config.value_target_clip
+    )
     
     # 策略损失（所有样本）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失 (TD(λ) 目标，λ加权平均兼顾收敛速度和稳定性)
-    value_loss = jnp.sum(optax.l2_loss(value, value_tgt) * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+    # 价值损失：Huber 对异常目标更稳
+    value_loss_per = optax.huber_loss(value, value_tgt, delta=config.value_huber_delta)
+    value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
     
@@ -558,27 +566,30 @@ def evaluate(params_red, params_black, rng_key):
             gumbel_scale=config.eval_gumbel_scale,
         )
         
-        # 分阶段温度策略，增加开局多样性
-        # 前 6 步（3回合）: 高温度产生多样化开局
-        # 6-20 步: 中等温度保持探索
-        # 20 步后: 低温度减少臭棋
+        # 分阶段温度策略：降低噪声，提升评估稳定性与可比性
         temp = jnp.where(
-            state.step_count < 6, 0.8,
-            jnp.where(state.step_count < 20, 0.4, 0.05)
+            state.step_count < 6, 0.25,
+            jnp.where(state.step_count < 20, 0.08, 0.0)
         )
         
         def _sample_action(w, t, k, legal_mask):
             """温度采样 (log 空间避免数值下溢)"""
-            t = jnp.maximum(t, 1e-3)
-            w_masked = jnp.where(legal_mask, w, 0.0)
-            log_w = jnp.log(w_masked + 1e-10)
-            log_w_temp = log_w / t
-            log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
-            log_w_temp = log_w_temp - jnp.max(log_w_temp)
-            w_temp = jnp.exp(log_w_temp)
-            w_temp = jnp.where(legal_mask, w_temp, 0.0)
-            w_prob = w_temp / jnp.maximum(jnp.sum(w_temp), 1e-10)
-            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
+            greedy_action = jnp.argmax(jnp.where(legal_mask, w, -1.0))
+
+            def _sample_with_temp():
+                t_safe = jnp.maximum(t, 1e-3)
+                w_masked = jnp.where(legal_mask, w, 0.0)
+                log_w = jnp.log(w_masked + 1e-10)
+                log_w_temp = log_w / t_safe
+                log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
+                log_w_temp = log_w_temp - jnp.max(log_w_temp)
+                w_temp = jnp.exp(log_w_temp)
+                w_temp = jnp.where(legal_mask, w_temp, 0.0)
+                w_prob = w_temp / jnp.maximum(jnp.sum(w_temp), 1e-10)
+                return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
+
+            # t=0 时走贪婪，减少评估噪声
+            return jax.lax.cond(t <= 1e-6, lambda: greedy_action, _sample_with_temp)
         
         sample_keys = jax.random.split(k_sample, batch_size)
         action = jax.vmap(_sample_action)(policy_output.action_weights, temp, sample_keys, state.legal_action_mask)
@@ -829,7 +840,12 @@ def restore_checkpoint(
     }
     
     # 恢复主状态
-    restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
+    try:
+        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
+    except Exception as e:
+        print(f"[Checkpoint] 恢复失败（可能是网络结构已变更）: {e}")
+        print("[Checkpoint] 将从头开始训练。若需继续旧实验，请切回旧网络结构。")
+        return None
     
     params = restored["params"]
     opt_state = restored["opt_state"]

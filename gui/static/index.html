@@ -441,7 +441,7 @@
             const moveHistory = ref([]);  // 走棋历史
             const aiSimulations = ref(512);  // MCTS 模拟次数
             const aiTopK = ref(16);  // Top-K 着法
-            const aiTemperature = ref(0.1);  // 采样温度: 0=贪婪, >0=增加多样性
+            const aiTemperature = ref(0.0);  // 采样温度: 0=贪婪(最强), >0=增加多样性
             
             // 计算属性
             const legalTargets = computed(() => {

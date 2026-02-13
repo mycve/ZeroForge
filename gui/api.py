@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import mctx
 
-from xiangqi.env import XiangqiEnv, XiangqiState
+from xiangqi.env import XiangqiEnv, XiangqiState, NUM_OBSERVATION_CHANNELS
 from xiangqi.rules import get_legal_moves_mask, is_in_check, find_king, BOARD_WIDTH, BOARD_HEIGHT
 from xiangqi.actions import (
     move_to_action, action_to_move, move_to_uci, uci_to_move,
@@ -43,7 +43,7 @@ from networks.alphazero import AlphaZeroNetwork
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 MCTS_QTRANSFORM_VALUE_SCALE = 0.25
-MCTS_GUMBEL_SCALE = 0.3
+MCTS_GUMBEL_SCALE = 0.0  # 实战默认关闭探索噪声，最大化走子强度
 MCTS_QTRANSFORM = partial(
     mctx.qtransform_completed_by_mix_value,
     value_scale=MCTS_QTRANSFORM_VALUE_SCALE,
@@ -277,6 +277,19 @@ class ModelManager:
             channels=channels,
             num_blocks=num_blocks,
         )
+        # 立即做一次前向验证，提前发现 checkpoint 与当前网络结构不兼容的问题
+        try:
+            dummy_obs = jnp.zeros(
+                (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
+            )
+            _ = self.net.apply({'params': params}, dummy_obs, train=False)
+        except Exception as e:
+            self.net = None
+            self.params = None
+            self.last_error = f"Checkpoint 与当前网络结构不兼容: {e}"
+            print(f"[AI] {self.last_error}")
+            return False
+
         self.params = params
         self.step = step
         self.channels = channels
