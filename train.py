@@ -41,19 +41,20 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
-    num_channels: int = 256
-    num_blocks: int = 12
+    num_channels: int = 128
+    num_blocks: int = 8
     network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
     
     # 训练超参数
     learning_rate: float = 1.5e-4
+    # 说明：动态图关系 + 多头损失显存开销显著，默认批次保守设置，避免 OOM
     training_batch_size: int = 4096
     td_lambda: float = 0.90  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 40           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
+    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 16                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
@@ -1059,7 +1060,17 @@ def main():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
             
-            params, opt_state, ploss, vloss, wdl_loss = train_step(params, opt_state, batch, train_keys)
+            try:
+                params, opt_state, ploss, vloss, wdl_loss = train_step(params, opt_state, batch, train_keys)
+            except jax.errors.JaxRuntimeError as e:
+                if "RESOURCE_EXHAUSTED" in str(e):
+                    raise RuntimeError(
+                        "训练显存不足（OOM）。建议进一步降低: "
+                        f"training_batch_size({config.training_batch_size}), "
+                        f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
+                        f"selfplay_batch_size({config.selfplay_batch_size})."
+                    ) from e
+                raise
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
