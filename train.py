@@ -53,8 +53,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 16                      # 根节点候选数，适度增加 tactical 覆盖
+    num_simulations: int = 40           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
