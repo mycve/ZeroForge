@@ -45,7 +45,7 @@ class Config:
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 128
-    num_blocks: int = 12
+    num_blocks: int = 8
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -55,24 +55,24 @@ class Config:
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
     # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
-    training_batch_size: int = 1024
-    td_lambda: float = 0.85  # 更短 credit assignment，降低 value 方差
+    training_batch_size: int = 2048
+    td_lambda: float = 0.99  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 2048
     num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
+    top_k: int = 16                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
     sample_reuse_times: int = 2
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 1.5
     value_huber_delta: float = 0.5
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.1   # 放大 Q 值差异，提升高收益分支被选概率
+    qtransform_value_scale: float = 0.05   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
@@ -82,7 +82,7 @@ class Config:
     temperature_final: float = 0.05
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 120              # 总步数 400 步（200回合）判和
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
