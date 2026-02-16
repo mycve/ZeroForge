@@ -47,7 +47,8 @@ class Config:
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
     num_channels: int = 128
     num_blocks: int = 8
-    network_dtype: str = "float32"  # "float32" 更稳定，避免部分 GPU 的 BF16 Triton 问题
+    # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
+    network_dtype: str = "bfloat16"
     
     # 训练超参数
     learning_rate: float = 1.5e-4
