@@ -65,8 +65,8 @@ class Config:
     # selfplay_micro_batch_size 是“单次自对弈 launch 的并行量”（决定峰值显存）
     # 建议 <= selfplay_batch_size。若要更稳，可以把它调小，再通过总 batch 累积稳定性。
     selfplay_micro_batch_size: int = 512
-    num_simulations: int = 40           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
+    num_simulations: int = 20           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 4                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
