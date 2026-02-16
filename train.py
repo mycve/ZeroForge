@@ -55,14 +55,14 @@ class Config:
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
     # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
-    training_batch_size: int = 512
+    training_batch_size: int = 1024
     td_lambda: float = 0.85  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
-    selfplay_batch_size: int = 4096
-    num_simulations: int = 96           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 16                      # 根节点候选数，适度增加 tactical 覆盖
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
