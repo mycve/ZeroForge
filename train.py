@@ -45,8 +45,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
-    num_channels: int = 128
-    num_blocks: int = 8
+    num_channels: int = 256
+    num_blocks: int = 12
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -61,10 +61,10 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（可较大）
-    selfplay_batch_size: int = 2048
+    selfplay_batch_size: int = 4096
     # selfplay_micro_batch_size 是“单次自对弈 launch 的并行量”（决定峰值显存）
     # 建议 <= selfplay_batch_size。若要更稳，可以把它调小，再通过总 batch 累积稳定性。
-    selfplay_micro_batch_size: int = 512
+    selfplay_micro_batch_size: int = 1024
     num_simulations: int = 20           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 4                      # 根节点候选数，适度增加 tactical 覆盖
     
