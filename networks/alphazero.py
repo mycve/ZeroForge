@@ -4,7 +4,7 @@ AlphaZero network - upgraded graph architecture.
 Key upgrades:
 - Multi-relation graph attention (local + rank + file + global)
 - Factorized policy head (from/to pair scoring) aligned to action encoding
-- Value head with WDL logits + scalar value coupling
+- Attention pooled scalar value head
 """
 
 import math
@@ -264,12 +264,12 @@ class PolicyHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """Attention pooled value head with WDL auxiliary logits."""
+    """Attention pooled scalar value head."""
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
         x = nn.LayerNorm(dtype=self.dtype)(h)
         pool_logits = nn.Dense(1, dtype=self.dtype, name="pool_logits")(x).squeeze(-1)
         pool_weights = nn.softmax(pool_logits, axis=1)
@@ -283,15 +283,8 @@ class ValueHead(nn.Module):
         fused = nn.Dense(self.model_dim, dtype=self.dtype, name="fc2")(fused)
         fused = nn.silu(fused)
 
-        wdl_logits = nn.Dense(3, dtype=self.dtype, name="wdl_out")(fused)
-        wdl_probs = nn.softmax(wdl_logits, axis=-1)
-        expected_value = wdl_probs[:, 0] - wdl_probs[:, 2]
-
-        value_residual = jnp.tanh(nn.Dense(1, dtype=self.dtype, name="value_out")(fused).squeeze(-1))
-        mix_logit = self.param("wdl_mix_logit", nn.initializers.constant(0.0), ())
-        mix = jax.nn.sigmoid(mix_logit)
-        value = jnp.tanh(mix * expected_value + (1.0 - mix) * value_residual)
-        return value, wdl_logits
+        value = jnp.tanh(nn.Dense(1, dtype=self.dtype, name="value_out")(fused).squeeze(-1))
+        return value
 
 
 class AlphaZeroNetwork(nn.Module):
@@ -315,7 +308,7 @@ class AlphaZeroNetwork(nn.Module):
         self.rotate_idx = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
         if x.ndim != 4:
             raise ValueError(f"GNN input must be 4D (B,C,H,W), got ndim={x.ndim}")
         if x.shape[2] != BOARD_HEIGHT or x.shape[3] != BOARD_WIDTH:
@@ -411,5 +404,5 @@ class AlphaZeroNetwork(nn.Module):
             dtype=self.dtype,
         )(h, self.action_from_idx, self.action_to_idx)
 
-        value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
-        return policy_logits.astype(jnp.float32), value.astype(jnp.float32), wdl_logits.astype(jnp.float32)
+        value = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
+        return policy_logits.astype(jnp.float32), value.astype(jnp.float32)

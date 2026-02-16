@@ -411,7 +411,7 @@ def create_mcts_recurrent_fn():
         prev_p = state.current_player
         ns = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(ns)
-        l, v, _ = model_mgr.net.apply({'params': params}, obs, train=False)
+        l, v = model_mgr.net.apply({'params': params}, obs, train=False)
         l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
         l = l - jnp.max(l, axis=-1, keepdims=True)
         l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
@@ -449,7 +449,7 @@ def get_ai_action(
         mcts_recurrent_fn = create_mcts_recurrent_fn()
     
     obs = env.observe(state.jax_state)[None, ...]
-    logits, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+    logits, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
     
     if state.current_player == 1:
         logits = logits[:, _ROTATED_IDX]
