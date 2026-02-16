@@ -55,7 +55,7 @@ class Config:
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
     # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
-    training_batch_size: int = 2048
+    training_batch_size: int = 1024
     td_lambda: float = 0.85  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
