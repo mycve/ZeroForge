@@ -101,14 +101,14 @@ scp -r remote:checkpoints/meta_100 ./checkpoints/
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `num_channels` | 128 | 网络通道数 |
-| `num_blocks` | 8 | 残差块数量 |
-| `num_simulations` | 128 | MCTS 模拟次数 |
-| `selfplay_batch_size` | 1024 | 自对弈并行数 |
+| `num_channels` | 256 | 网络通道数 |
+| `num_blocks` | 12 | 残差块数量 |
+| `num_simulations` | 32 | MCTS 模拟次数 |
+| `selfplay_batch_size` | 4096 | 自对弈并行数（每轮单次调用总并行量） |
 | `training_batch_size` | 1024 | 训练批大小 |
-| `replay_buffer_size` | 500000 | 回放缓冲区容量 |
+| `replay_buffer_size` | 2000000 | 回放缓冲区容量 |
 | `sample_reuse_times` | 4 | 样本复用次数 |
-| `td_steps` | 10 | n-step TD 步数 |
+| `td_lambda` | 0.85 | TD(lambda) 系数 |
 
 ## 项目结构
 

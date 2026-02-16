@@ -44,7 +44,7 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构（轻量化：快速推理 → 更多 MCTS 搜索）
-    num_channels: int = 256
+    num_channels: int = 128
     num_blocks: int = 12
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
@@ -55,21 +55,18 @@ class Config:
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
     # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
-    training_batch_size: int = 1024
+    training_batch_size: int = 512
     td_lambda: float = 0.85  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    # selfplay_batch_size 是“每轮总对局并行量”（可较大）
+    # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 4096
-    # selfplay_micro_batch_size 是“单次自对弈 launch 的并行量”（决定峰值显存）
-    # 建议 <= selfplay_batch_size。若要更稳，可以把它调小，再通过总 batch 累积稳定性。
-    selfplay_micro_batch_size: int = 2048
-    num_simulations: int = 32           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 8                      # 根节点候选数，适度增加 tactical 覆盖
+    num_simulations: int = 96           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 16                      # 根节点候选数，适度增加 tactical 覆盖
     
     # 经验回放配置
     replay_buffer_size: int = 2000000
-    sample_reuse_times: int = 4
+    sample_reuse_times: int = 2
     
     # 损失权重
     value_loss_weight: float = 1.0
@@ -85,7 +82,7 @@ class Config:
     temperature_final: float = 0.05
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 总步数 400 步（200回合）判和
+    max_steps: int = 120              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
@@ -150,15 +147,9 @@ def _shard_batch_for_devices(batch_flat):
 
 # 动态设备数下的批量自动对齐（避免 reshape/device_put_sharded 错误）
 config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_size, "selfplay_batch_size")
-config.selfplay_micro_batch_size = _align_to_device_multiple(config.selfplay_micro_batch_size, "selfplay_micro_batch_size")
 config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
 config.eval_games = _align_to_device_multiple(config.eval_games, "eval_games")
 
-if config.selfplay_micro_batch_size > config.selfplay_batch_size:
-    raise ValueError(
-        f"selfplay_micro_batch_size({config.selfplay_micro_batch_size}) 不能大于 "
-        f"selfplay_batch_size({config.selfplay_batch_size})"
-    )
 if config.min_learning_rate <= 0.0 or config.min_learning_rate > config.learning_rate:
     raise ValueError(
         f"min_learning_rate({config.min_learning_rate}) 需满足 0 < min_lr <= learning_rate({config.learning_rate})"
@@ -167,29 +158,6 @@ if config.lr_warmup_iters < 0 or config.lr_decay_iters <= config.lr_warmup_iters
     raise ValueError(
         f"学习率调度非法：需满足 lr_decay_iters({config.lr_decay_iters}) > lr_warmup_iters({config.lr_warmup_iters}) >= 0"
     )
-
-def _split_to_chunks(total: int, chunk_max: int):
-    """将 total 分块，保证每块都是 num_devices 的整数倍。"""
-    if total <= 0:
-        raise ValueError(f"total 必须 > 0, 实际为 {total}")
-    if chunk_max <= 0:
-        raise ValueError(f"chunk_max 必须 > 0, 实际为 {chunk_max}")
-    if total % num_devices != 0 or chunk_max % num_devices != 0:
-        raise ValueError(
-            f"total({total}) 和 chunk_max({chunk_max}) 必须是 num_devices({num_devices}) 的整数倍"
-        )
-    sizes = []
-    remain = total
-    while remain > 0:
-        sz = min(chunk_max, remain)
-        sz = (sz // num_devices) * num_devices
-        if sz <= 0:
-            raise RuntimeError(
-                f"无法切分 chunk：remain={remain}, chunk_max={chunk_max}, num_devices={num_devices}"
-            )
-        sizes.append(sz)
-        remain -= sz
-    return sizes
 
 # 预计算旋转索引，避免在 JIT 循环内重复计算
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -845,7 +813,7 @@ def main():
     # 初始化模型模板 (用于恢复时的结构参考)
     rng_key = jax.random.PRNGKey(config.seed)
     rng_key, subkey = jax.random.split(rng_key)
-    init_batch_per_device = max(1, config.selfplay_micro_batch_size // num_devices)
+    init_batch_per_device = 1
     dummy_obs = jnp.zeros((init_batch_per_device, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH))
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
@@ -896,78 +864,69 @@ def main():
     
     print("开始训练！")
     
-    selfplay_chunk_sizes = _split_to_chunks(config.selfplay_batch_size, config.selfplay_micro_batch_size)
-    print(f"[Selfplay] total={config.selfplay_batch_size}, chunks={selfplay_chunk_sizes}")
+    print(f"[Selfplay] batch_size={config.selfplay_batch_size}")
 
     while True:
         iteration += 1
         st = time.time()
-        rng_key, _ = jax.random.split(rng_key, 2)
 
-        # 分块自对弈：降低单次显存峰值，支持更大的总 selfplay_batch_size
-        stats_acc = np.zeros(12, dtype=np.int64)
-        length_sum = 0.0
-        length_cnt = 0
+        # 自对弈（每轮单次调用，批大小由 selfplay_batch_size 决定）
         new_frames = 0
 
-        for chunk_size in selfplay_chunk_sizes:
-            rng_key, sk_selfplay = jax.random.split(rng_key)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                selfplay_keys = jax.device_put_sharded(list(jax.random.split(sk_selfplay, num_devices)), devices)
+        rng_key, sk_selfplay = jax.random.split(rng_key)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            selfplay_keys = jax.device_put_sharded(list(jax.random.split(sk_selfplay, num_devices)), devices)
 
-            try:
-                data = selfplay(params, selfplay_keys, chunk_size // num_devices)
-            except jax.errors.JaxRuntimeError as e:
-                msg = str(e).lower()
-                if ("resource_exhausted" in msg) or ("out of memory" in msg):
-                    raise RuntimeError(
-                        "[Selfplay OOM] 自对弈阶段显存不足。"
-                        f"建议优先减小 selfplay_micro_batch_size({config.selfplay_micro_batch_size})；"
-                        f"其次再调小 num_simulations({config.num_simulations}) / "
-                        f"top_k({config.top_k}) / num_channels({config.num_channels}) / "
-                        f"num_blocks({config.num_blocks})。"
-                    ) from e
-                raise
+        try:
+            data = selfplay(params, selfplay_keys, config.selfplay_batch_size // num_devices)
+        except jax.errors.JaxRuntimeError as e:
+            msg = str(e).lower()
+            if ("resource_exhausted" in msg) or ("out of memory" in msg):
+                raise RuntimeError(
+                    "[Selfplay OOM] 自对弈阶段显存不足。"
+                    f"建议优先减小 selfplay_batch_size({config.selfplay_batch_size})；"
+                    f"其次再调小 num_simulations({config.num_simulations}) / "
+                    f"top_k({config.top_k}) / num_channels({config.num_channels}) / "
+                    f"num_blocks({config.num_blocks})。"
+                ) from e
+            raise
 
-            samples = compute_targets(data)
-            replay_buffer.add(samples)
-            new_frames += samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
+        samples = compute_targets(data)
+        replay_buffer.add(samples)
+        new_frames += samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
 
-            # 只取统计信息到 CPU
-            data_np = jax.device_get(data)
-            term = data_np.terminated
-            winner = data_np.winner
-            reasons = data_np.draw_reason
+        # 只取统计信息到 CPU
+        data_np = jax.device_get(data)
+        term = data_np.terminated
+        winner = data_np.winner
+        reasons = data_np.draw_reason
 
-            # 结束原因编码：
-            # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋,
-            # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
-            first_term = (np.cumsum(term, axis=1) == 1) & term
-            stats_chunk = np.array([
-                first_term.sum(),                    # 总对局数
-                (first_term & (winner == 0)).sum(),  # 红胜
-                (first_term & (winner == 1)).sum(),  # 黑胜
-                (first_term & (winner == -1)).sum(), # 和棋
-                (first_term & (reasons == 1)).sum(), # 步数到限
-                (first_term & (reasons == 2)).sum(), # 无吃子到限
-                (first_term & (reasons == 3)).sum(), # 重复局面和棋
-                (first_term & (reasons == 4)).sum(), # 长将判负
-                (first_term & (reasons == 5)).sum(), # 无进攻子力
-                (first_term & (reasons == 6)).sum(), # 长捉判负
-                (first_term & (reasons == 7)).sum(), # 将捉交替判负
-                (first_term & (reasons == 8)).sum(), # 将死/困毙
-            ], dtype=np.int64)
-            stats_acc += stats_chunk
+        # 结束原因编码：
+        # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋,
+        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
+        first_term = (np.cumsum(term, axis=1) == 1) & term
+        stats = np.array([
+            first_term.sum(),                    # 总对局数
+            (first_term & (winner == 0)).sum(),  # 红胜
+            (first_term & (winner == 1)).sum(),  # 黑胜
+            (first_term & (winner == -1)).sum(), # 和棋
+            (first_term & (reasons == 1)).sum(), # 步数到限
+            (first_term & (reasons == 2)).sum(), # 无吃子到限
+            (first_term & (reasons == 3)).sum(), # 重复局面和棋
+            (first_term & (reasons == 4)).sum(), # 长将判负
+            (first_term & (reasons == 5)).sum(), # 无进攻子力
+            (first_term & (reasons == 6)).sum(), # 长捉判负
+            (first_term & (reasons == 7)).sum(), # 将捉交替判负
+            (first_term & (reasons == 8)).sum(), # 将死/困毙
+        ], dtype=np.int64)
 
-            game_lengths = np.where(term, np.arange(config.max_steps)[None, :, None], config.max_steps)
-            final_lengths = np.min(game_lengths, axis=1)
-            length_sum += float(np.sum(final_lengths))
-            length_cnt += int(final_lengths.size)
+        game_lengths = np.where(term, np.arange(config.max_steps)[None, :, None], config.max_steps)
+        final_lengths = np.min(game_lengths, axis=1)
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
-         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats_acc]
-        avg_length = (length_sum / max(length_cnt, 1))
+         d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
+        avg_length = float(np.mean(final_lengths))
         
         # --- 将新样本添加到经验回放缓冲区 ---
         frames += new_frames
@@ -982,7 +941,6 @@ def main():
         rng_key = sample_keys[0]
         
         # 批量训练：采样 → 训练 → 累积损失，最后一次性同步
-        policy_losses, value_losses = [], []
         ploss_acc, vloss_acc = None, None
         
         for i in range(num_updates):
@@ -991,7 +949,7 @@ def main():
             batch = _shard_batch_for_devices(batch_flat)
             
             # 分发训练 Key 到各设备
-            train_key = jax.random.split(sample_keys[i+1], 1)[0]
+            train_key = sample_keys[i+1]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
@@ -999,7 +957,8 @@ def main():
             try:
                 params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             except jax.errors.JaxRuntimeError as e:
-                if "RESOURCE_EXHAUSTED" in str(e):
+                msg = str(e).lower()
+                if ("resource_exhausted" in msg) or ("out of memory" in msg):
                     raise RuntimeError(
                         "训练显存不足（OOM）。建议进一步降低: "
                         f"training_batch_size({config.training_batch_size}), "
@@ -1017,30 +976,30 @@ def main():
         
         # 一次性同步所有累积损失
         if num_updates > 0:
-            policy_losses = [float(ploss_acc.mean() / num_updates)]
-            value_losses = [float(vloss_acc.mean() / num_updates)]
+            policy_loss = float(ploss_acc.mean() / num_updates)
+            value_loss = float(vloss_acc.mean() / num_updates)
         else:
-            policy_losses = [0.0]
-            value_losses = [0.0]
+            policy_loss = 0.0
+            value_loss = 0.0
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
         
         # --- 打印与日志 ---
         iter_time = time.time() - st
-        fps = new_frames / iter_time
+        fps = new_frames / max(iter_time, 1e-9)
         buf_stats = replay_buffer.stats()
         
-        print(f"iter={iteration:3d} | ploss={np.mean(policy_losses):.4f} "
-              f"vloss={np.mean(value_losses):.4f} | "
+        print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
+              f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         current_lr = float(lr_schedule(iteration))
         print(f"[LR] iter={iteration} lr={current_lr:.3e}")
         
         # TensorBoard 记录
-        writer.add_scalar("train/policy_loss", np.mean(policy_losses), iteration)
-        writer.add_scalar("train/value_loss", np.mean(value_losses), iteration)
+        writer.add_scalar("train/policy_loss", policy_loss, iteration)
+        writer.add_scalar("train/value_loss", value_loss, iteration)
         writer.add_scalar("train/lr", current_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
