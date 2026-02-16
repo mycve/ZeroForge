@@ -73,7 +73,7 @@ class Config:
     value_huber_delta: float = 0.5
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.05   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
+    selfplay_gumbel_scale: float = 1.5     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
