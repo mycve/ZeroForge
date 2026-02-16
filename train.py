@@ -87,10 +87,6 @@ class Config:
     temperature_initial: float = 1.0
     temperature_final: float = 0.05
     
-    # 随机开局配置（增加开局多样性，帮助模型学习不同的开局和防守策略）
-    random_opening_steps: tuple = (2, 4, 6, 8)  # 可选的开局随机步数（随机选择一个）
-    random_opening_prob: float = 0.0  # 每局随机开局的概率
-    
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
@@ -290,33 +286,6 @@ class Sample(NamedTuple):
 # 自玩
 # ============================================================================
 
-def _random_opening_step(state, key):
-    """执行一步随机走子（用于随机开局）"""
-    # 从合法动作中均匀随机选择
-    legal_mask = state.legal_action_mask
-    num_legal = jnp.sum(legal_mask)
-    # 将合法动作转为概率分布
-    probs = legal_mask.astype(jnp.float32) / jnp.maximum(num_legal, 1.0)
-    action = jax.random.choice(key, ACTION_SPACE_SIZE, p=probs)
-    return env.step(state, action)
-
-
-def _random_opening(state, key, num_steps):
-    """执行 N 步随机开局（支持动态步数）"""
-    def cond_fn(carry):
-        _, step, target_steps, _ = carry
-        return step < target_steps
-    
-    def body_fn(carry):
-        s, step, target_steps, k = carry
-        k, subkey = jax.random.split(k)
-        s = _random_opening_step(s, subkey)
-        return (s, step + 1, target_steps, k)
-    
-    init_carry = (state, 0, num_steps, key)
-    final_state, _, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-    return final_state
-
 
 @partial(jax.pmap, static_broadcasted_argnums=(2,))
 def selfplay(params, rng_key, batch_size):
@@ -325,10 +294,10 @@ def selfplay(params, rng_key, batch_size):
     - 使用 lax.scan 消除 Python 循环开销
     - Gumbel 算法无需 Dirichlet 噪声 (Gumbel 噪声已提供足够探索)
     - 统一策略（移除强弱差异，节省计算资源）
-    - 支持随机开局增加开局多样性
+    - 仅使用标准初始局面，保证训练目标一致性
     """
     def step_fn(state, key):
-        key_search, key_sample, key_next = jax.random.split(key, 3)
+        key_search, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
         logits, value, _ = forward(params, obs)
         
@@ -408,48 +377,13 @@ def selfplay(params, rng_key, batch_size):
             root_value=root_value,  # MCTS 搜索后的价值估计
         )
         
-        # 重置已结束的游戏，并有一定概率使用随机开局
-        # 将可选步数转为 JAX 数组
-        opening_steps_arr = jnp.array(config.random_opening_steps, dtype=jnp.int32)
-        num_options = len(config.random_opening_steps)
-        
-        def _reset_with_random_opening(s, k):
-            k1, k2, k3, k4 = jax.random.split(k, 4)
-            new_state = env.init(k1)
-            # 以一定概率执行随机开局
-            do_random = jax.random.uniform(k2) < config.random_opening_prob
-            # 从可选步数中随机选择一个
-            selected_steps = opening_steps_arr[jax.random.randint(k3, (), 0, num_options)]
-            new_state = jax.lax.cond(
-                do_random & (selected_steps > 0),
-                lambda: _random_opening(new_state, k4, selected_steps),
-                lambda: new_state
-            )
-            return new_state
-        
+        # 结束后直接重置为标准初始局面
         next_state_reset = jax.vmap(lambda s, k: jax.lax.cond(
-            s.terminated, lambda: _reset_with_random_opening(s, k), lambda: s
-        ))(next_state, jax.random.split(key_next, batch_size))
+            s.terminated, lambda: env.init(k), lambda: s
+        ))(next_state, jax.random.split(key_reset, batch_size))
         return next_state_reset, data
 
-    # 初始状态也有一定概率使用随机开局
-    # 将可选步数转为 JAX 数组（用于初始化）
-    init_opening_steps_arr = jnp.array(config.random_opening_steps, dtype=jnp.int32)
-    init_num_options = len(config.random_opening_steps)
-    
-    def _init_with_random_opening(k):
-        k1, k2, k3, k4 = jax.random.split(k, 4)
-        state = env.init(k1)
-        do_random = jax.random.uniform(k2) < config.random_opening_prob
-        # 从可选步数中随机选择一个
-        selected_steps = init_opening_steps_arr[jax.random.randint(k3, (), 0, init_num_options)]
-        return jax.lax.cond(
-            do_random & (selected_steps > 0),
-            lambda: _random_opening(state, k4, selected_steps),
-            lambda: state
-        )
-    
-    state = jax.vmap(_init_with_random_opening)(jax.random.split(rng_key, batch_size))
+    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
     _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
     return data
 
