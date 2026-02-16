@@ -55,8 +55,8 @@ class Config:
     min_learning_rate: float = 3.0e-5
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
-    # 说明：动态图关系 + 多头损失显存开销显著，默认批次保守设置，避免 OOM
-    training_batch_size: int = 4096
+    # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
+    training_batch_size: int = 1024
     td_lambda: float = 0.90  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
