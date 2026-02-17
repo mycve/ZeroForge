@@ -31,6 +31,25 @@
                             <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
                                  class="block"
                                  :style="boardStyle">
+                            <!-- 箭头定义 -->
+                            <defs>
+                                <marker id="arrowhead-1" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.9"/>
+                                </marker>
+                                <marker id="arrowhead-2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.7"/>
+                                </marker>
+                                <marker id="arrowhead-3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.5"/>
+                                </marker>
+                                <marker id="arrowhead-4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.3"/>
+                                </marker>
+                                <marker id="arrowhead-5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.2"/>
+                                </marker>
+                            </defs>
+                            
                             <!-- 背景 -->
                             <rect width="100%" height="100%" fill="#F5DEB3"/>
                             
@@ -92,6 +111,21 @@
                                     :cy="baseMargin + (9-move[0])*baseCellSize"
                                     r="7" fill="#4CAF50" opacity="0.7"/>
                             
+                            <!-- 策略箭头 -->
+                            <g v-if="policyInfo && policyInfo.top_moves && showPolicyArrows">
+                                <line v-for="(move, idx) in policyInfo.top_moves.slice(0, 5)"
+                                      :key="`arrow-${idx}`"
+                                      :x1="getArrowStartX(move)"
+                                      :y1="getArrowStartY(move)"
+                                      :x2="getArrowEndX(move)"
+                                      :y2="getArrowEndY(move)"
+                                      :stroke="getArrowColor(idx)"
+                                      :stroke-width="getArrowWidth(idx, move.weight)"
+                                      :opacity="getArrowOpacity(idx)"
+                                      :marker-end="`url(#arrowhead-${idx + 1})`"
+                                      stroke-linecap="round"/>
+                            </g>
+                            
                             <!-- 棋子 -->
                             <g v-for="(row, r) in board" :key="r">
                                 <g v-for="(piece, c) in row" :key="`${r}-${c}`">
@@ -152,7 +186,14 @@
                             <!-- 策略分布显示区域 -->
                             <div v-if="policyInfo && policyInfo.top_moves" class="mt-2 bg-blue-50 rounded-lg p-2 border border-blue-200">
                                 <div class="flex justify-between items-center mb-1">
-                                    <span class="text-xs font-semibold text-blue-800">📊 策略分布</span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-semibold text-blue-800">📊 策略分布</span>
+                                        <button @click="showPolicyArrows = !showPolicyArrows" 
+                                                class="text-xs px-2 py-0.5 rounded border hover:bg-blue-100"
+                                                :class="showPolicyArrows ? 'bg-purple-100 border-purple-300 text-purple-700' : 'bg-gray-100 border-gray-300 text-gray-600'">
+                                            {{ showPolicyArrows ? '🏹 箭头' : '🏹' }}
+                                        </button>
+                                    </div>
                                     <button @click="policyInfo = null" class="text-blue-600 hover:text-blue-800 text-xs">✕</button>
                                 </div>
                                 <div class="space-y-0.5">
@@ -464,6 +505,7 @@
             const canForward = ref(false);
             const atLatest = ref(true);
             const policyInfo = ref(null);  // 策略分布信息
+            const showPolicyArrows = ref(true);  // 是否显示策略箭头
             
             // UI 状态
             const selected = ref(null);
@@ -528,6 +570,42 @@
                 message.value = msg;
                 messageType.value = type;
                 setTimeout(() => { message.value = ''; }, 3000);
+            };
+            
+            // 箭头辅助函数（使用API返回的from/to坐标）
+            const getArrowStartX = (move) => {
+                return baseMargin + move.from[1] * baseCellSize;
+            };
+            
+            const getArrowStartY = (move) => {
+                return baseMargin + (9 - move.from[0]) * baseCellSize;
+            };
+            
+            const getArrowEndX = (move) => {
+                return baseMargin + move.to[1] * baseCellSize;
+            };
+            
+            const getArrowEndY = (move) => {
+                return baseMargin + (9 - move.to[0]) * baseCellSize;
+            };
+            
+            const getArrowColor = (idx) => {
+                // 使用紫色系，避免和现有高亮冲突
+                const colors = ['#9C27B0', '#AB47BC', '#BA68C8', '#CE93D8', '#E1BEE7'];
+                return colors[Math.min(idx, 4)];
+            };
+            
+            const getArrowWidth = (idx, weight) => {
+                // 根据排名和权重计算粗细
+                if (idx === 0) return Math.max(4, weight * 8);  // Top-1: 4-8px
+                if (idx === 1) return Math.max(3, weight * 6);  // Top-2: 3-6px
+                return Math.max(2, weight * 4);  // Top-3+: 2-4px
+            };
+            
+            const getArrowOpacity = (idx) => {
+                // 递减透明度
+                const opacities = [0.85, 0.7, 0.55, 0.4, 0.3];
+                return opacities[Math.min(idx, 4)];
             };
             
             const fetchStatus = async () => {
@@ -864,7 +942,7 @@
                 board, currentPlayer, lastMove, lastMoveUci, gameOver, winner,
                 stepCount, isCheck, kingPos, legalMoves, historyLength,
                 aiValue, uciScore, aiLoaded, uciReady, fen,
-                canUndo, canForward, atLatest, policyInfo,
+                canUndo, canForward, atLatest, policyInfo, showPolicyArrows,
                 // UI
                 selected, thinking, paused, loading, activeTab, message, messageType,
                 // 设置
@@ -875,7 +953,10 @@
                 legalTargets, isAITurn, displayAiValue, displayUciScore,
                 // 方法
                 getPieceName, formatUciScore, handleClick, newGame, undo, forward, gotoLatest, togglePause,
-                applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep, requestPolicyAnalysis
+                applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep, requestPolicyAnalysis,
+                // 箭头函数
+                getArrowStartX, getArrowStartY, getArrowEndX, getArrowEndY,
+                getArrowColor, getArrowWidth, getArrowOpacity
             };
         }
     }).mount('#app');

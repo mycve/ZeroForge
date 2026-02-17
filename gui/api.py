@@ -464,12 +464,18 @@ def get_ai_action(
         
         policy_info = None
         if return_policy:
+            fs, ts = action_to_move(action)
+            fs, ts = int(fs), int(ts)
+            fr, fc = fs // 9, fs % 9
+            tr, tc = ts // 9, ts % 9
             policy_info = {
                 "top_moves": [{
                     "action": action,
-                    "uci": move_to_uci(*action_to_move(action)),
+                    "uci": move_to_uci(fs, ts),
                     "weight": 1.0,
                     "prior": 1.0,
+                    "from": [fr, fc],
+                    "to": [tr, tc],
                 }],
                 "is_forced": True,
             }
@@ -526,11 +532,16 @@ def get_ai_action(
         for idx in top_indices:
             if weights[idx] > 1e-6:  # 过滤权重太小的
                 fs, ts = action_to_move(int(idx))
+                fs, ts = int(fs), int(ts)
+                fr, fc = fs // 9, fs % 9
+                tr, tc = ts // 9, ts % 9
                 top_moves.append({
                     "action": int(idx),
-                    "uci": move_to_uci(int(fs), int(ts)),
+                    "uci": move_to_uci(fs, ts),
                     "weight": float(weights[idx]),
                     "prior": float(prior_probs[idx]),
+                    "from": [fr, fc],
+                    "to": [tr, tc],
                 })
         
         policy_info = {
@@ -946,10 +957,15 @@ async def ai_think(req: AIThinkRequest):
         for idx in top_indices:
             if prior_probs[idx] > 1e-6:
                 fs, ts = action_to_move(int(idx))
+                fs, ts = int(fs), int(ts)
+                fr, fc = fs // 9, fs % 9
+                tr, tc = ts // 9, ts % 9
                 top_moves.append({
                     "action": int(idx),
-                    "uci": move_to_uci(int(fs), int(ts)),
+                    "uci": move_to_uci(fs, ts),
                     "prior": float(prior_probs[idx]),
+                    "from": [fr, fc],
+                    "to": [tr, tc],
                 })
         
         # 从Top-K中随机选择
