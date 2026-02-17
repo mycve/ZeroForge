@@ -900,50 +900,82 @@ async def ai_think(req: AIThinkRequest):
     )
     
     if use_opening_random:
-        print(f"[AI] 第{game_state.step_count+1}步，使用开局随机策略")
-        # 开局随机策略：从Top-K候选中随机选择
-        print(f"[AI] 开局随机模式：从Top-{req.opening_top_k}候选中随机选择")
+        print(f"[AI] 第{game_state.step_count+1}步，开局随机模式（使用先验策略，无MCTS模拟）")
         
-        # 先获取策略分布
-        action, value, policy_info = get_ai_action(
-            game_state, req.num_simulations, req.top_k, 
-            return_policy=True
-        )
+        # 检查是否只有一个合法走法
+        legal_mask = np.array(game_state.jax_state.legal_action_mask)
+        legal_actions = np.where(legal_mask)[0]
         
-        if action is None:
-            raise HTTPException(status_code=500, detail="AI failed to find a move")
-        
-        # 如果是强制走法（只有一步），直接返回
-        if policy_info and policy_info.get("is_forced"):
-            game_state.ai_value = value
+        if len(legal_actions) == 1:
+            # 只有一步，直接返回
+            action = int(legal_actions[0])
+            print(f"[AI] 只有一个合法走法，直接应用: action={action}")
+            obs = env.observe(game_state.jax_state)[None, ...]
+            _, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+            search_value = float(value[0])
+            if game_state.current_player == 1:
+                search_value = -search_value
+            game_state.ai_value = search_value
+            
             fs, ts = action_to_move(action)
             return {
                 "action": action,
                 "uci": move_to_uci(int(fs), int(ts)),
-                "value": value,
-                "policy": policy_info,
+                "value": search_value,
                 "opening_random": True,
                 "is_forced": True,
             }
         
-        # 从Top-K中随机选择
-        if policy_info and policy_info.get("top_moves"):
-            top_moves = policy_info["top_moves"][:req.opening_top_k]
-            if len(top_moves) > 1:
-                # 随机选择一个
-                rng_key, sk = jax.random.split(rng_key)
-                chosen_idx = int(jax.random.randint(sk, (), 0, len(top_moves)))
-                chosen_move = top_moves[chosen_idx]
-                action = chosen_move["action"]
-                print(f"[AI] 从{len(top_moves)}个候选中随机选择了第{chosen_idx+1}个: {chosen_move['uci']}")
+        # 获取模型先验策略（直接前向推理，不运行MCTS）
+        obs = env.observe(game_state.jax_state)[None, ...]
+        logits, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
         
-        game_state.ai_value = value
+        # 处理黑方视角
+        if game_state.current_player == 1:
+            logits = logits[:, _ROTATED_IDX]
+        
+        # 计算先验概率
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+        logits = jnp.where(game_state.jax_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        prior_probs = jax.nn.softmax(logits[0])
+        prior_probs = np.array(prior_probs)
+        
+        # 获取Top-K候选
+        top_indices = np.argsort(prior_probs)[::-1][:min(req.opening_top_k, len(legal_actions))]
+        top_moves = []
+        for idx in top_indices:
+            if prior_probs[idx] > 1e-6:
+                fs, ts = action_to_move(int(idx))
+                top_moves.append({
+                    "action": int(idx),
+                    "uci": move_to_uci(int(fs), int(ts)),
+                    "prior": float(prior_probs[idx]),
+                })
+        
+        # 从Top-K中随机选择
+        if len(top_moves) > 0:
+            rng_key, sk = jax.random.split(rng_key)
+            chosen_idx = int(jax.random.randint(sk, (), 0, len(top_moves)))
+            chosen_move = top_moves[chosen_idx]
+            action = chosen_move["action"]
+            print(f"[AI] 从Top-{len(top_moves)}候选中随机选择了第{chosen_idx+1}个: {chosen_move['uci']} (先验={chosen_move['prior']:.3f})")
+        else:
+            # 兜底：随机选择任意合法走法
+            rng_key, sk = jax.random.split(rng_key)
+            action = int(legal_actions[jax.random.randint(sk, (), 0, len(legal_actions))])
+            print(f"[AI] 警告：未找到高概率走法，随机选择")
+        
+        # 计算value（当前行棋方视角）
+        search_value = float(value[0])
+        if game_state.current_player == 1:
+            search_value = -search_value
+        game_state.ai_value = search_value
+        
         fs, ts = action_to_move(action)
         return {
             "action": action,
             "uci": move_to_uci(int(fs), int(ts)),
-            "value": value,
-            "policy": policy_info,
+            "value": search_value,
             "opening_random": True,
             "is_forced": False,
         }
