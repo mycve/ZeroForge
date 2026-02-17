@@ -193,14 +193,30 @@
                                         class="bg-blue-600 text-white py-2.5 rounded font-medium text-sm hover:bg-blue-700 disabled:opacity-50 active:bg-blue-800">
                                     新局
                                 </button>
-                                <button @click="undo" :disabled="thinking || historyLength === 0"
-                                        class="bg-gray-200 text-gray-800 py-2.5 rounded font-medium text-sm hover:bg-gray-300 disabled:opacity-50 active:bg-gray-400">
-                                    悔棋
-                                </button>
                                 <button @click="togglePause" :disabled="!isAITurn"
                                         class="py-2.5 rounded font-medium text-sm disabled:opacity-50"
                                         :class="paused ? 'bg-green-500 text-white hover:bg-green-600 active:bg-green-700' : 'bg-yellow-500 text-white hover:bg-yellow-600 active:bg-yellow-700'">
                                     {{ paused ? '继续' : '暂停' }}
+                                </button>
+                                <button @click="requestPolicyAnalysis" :disabled="thinking || gameOver || !aiLoaded"
+                                        class="bg-purple-600 text-white py-2.5 rounded font-medium text-sm hover:bg-purple-700 disabled:opacity-50 active:bg-purple-800">
+                                    策略
+                                </button>
+                            </div>
+                            
+                            <!-- 历史导航按钮 -->
+                            <div class="grid grid-cols-3 gap-2">
+                                <button @click="undo" :disabled="thinking || !canUndo"
+                                        class="bg-gray-200 text-gray-800 py-2.5 rounded font-medium text-sm hover:bg-gray-300 disabled:opacity-50 active:bg-gray-400">
+                                    ⬅ 后退
+                                </button>
+                                <button @click="forward" :disabled="thinking || !canForward"
+                                        class="bg-gray-200 text-gray-800 py-2.5 rounded font-medium text-sm hover:bg-gray-300 disabled:opacity-50 active:bg-gray-400">
+                                    前进 ➡
+                                </button>
+                                <button @click="gotoLatest" :disabled="thinking || atLatest"
+                                        class="bg-gray-200 text-gray-800 py-2.5 rounded font-medium text-sm hover:bg-gray-300 disabled:opacity-50 active:bg-gray-400">
+                                    最新
                                 </button>
                             </div>
                             
@@ -226,14 +242,22 @@
                                     </div>
                                     <div>
                                         <label class="block text-xs text-gray-600 mb-1">
-                                            温度: {{ aiTemperature.toFixed(2) }}
+                                            开局随机步数: {{ openingRandomMoves }}
                                             <span class="text-gray-400 ml-1">
-                                                {{ aiTemperature === 0 ? '(贪婪)' : aiTemperature < 0.3 ? '(保守)' : aiTemperature < 0.6 ? '(平衡)' : '(多样)' }}
+                                                {{ openingRandomMoves === 0 ? '(关闭)' : '(前'+openingRandomMoves+'步随机)' }}
                                             </span>
                                         </label>
-                                        <input type="range" v-model.number="aiTemperature" min="0" max="1" step="0.05"
+                                        <input type="range" v-model.number="openingRandomMoves" min="0" max="20" step="1"
                                                class="w-full h-2">
-                                        <div class="text-xs text-gray-400 mt-0.5">0=最强 | 0.3-0.5=多样开局 | 1=随机</div>
+                                        <div class="text-xs text-gray-400 mt-0.5">0=关闭 | 5-10=适中 | 20=高多样性</div>
+                                    </div>
+                                    <div v-if="openingRandomMoves > 0">
+                                        <label class="block text-xs text-gray-600 mb-1">
+                                            开局随机Top-K: {{ openingTopK }}
+                                        </label>
+                                        <input type="range" v-model.number="openingTopK" min="1" max="10" step="1"
+                                               class="w-full h-2">
+                                        <div class="text-xs text-gray-400 mt-0.5">从Top-K候选中随机选择 (1-10)</div>
                                     </div>
                                     <div>
                                         <label class="block text-xs text-gray-600 mb-1">
@@ -418,6 +442,10 @@
             const aiLoaded = ref(false);
             const uciReady = ref(false);
             const fen = ref('');
+            const canUndo = ref(false);
+            const canForward = ref(false);
+            const atLatest = ref(true);
+            const policyInfo = ref(null);  // 策略分布信息
             
             // UI 状态
             const selected = ref(null);
@@ -441,7 +469,8 @@
             const moveHistory = ref([]);  // 走棋历史
             const aiSimulations = ref(512);  // MCTS 模拟次数
             const aiTopK = ref(16);  // Top-K 着法
-            const aiTemperature = ref(0.0);  // 采样温度: 0=贪婪(最强), >0=增加多样性
+            const openingRandomMoves = ref(0);  // 开局前N步使用随机策略（0=不使用）
+            const openingTopK = ref(5);  // 开局随机时从Top-K中选择
             
             // 计算属性
             const legalTargets = computed(() => {
@@ -506,6 +535,9 @@
                     aiLoaded.value = data.ai_loaded;
                     uciReady.value = data.uci_ready;
                     fen.value = data.fen;
+                    canUndo.value = data.can_undo || false;
+                    canForward.value = data.can_forward || false;
+                    atLatest.value = data.at_latest !== false;  // 默认true
                     
                     // 获取历史记录
                     await fetchHistory();
@@ -638,7 +670,8 @@
                                 body: JSON.stringify({
                                     num_simulations: aiSimulations.value,
                                     top_k: aiTopK.value,
-                                    temperature: aiTemperature.value
+                                    opening_random_moves: openingRandomMoves.value,
+                                    opening_top_k: openingTopK.value
                                 })
                             });
                             if (!res.ok) throw new Error('AI think failed');
@@ -682,7 +715,9 @@
             };
             
             const undo = async () => {
-                if (historyLength.value === 0) return;
+                if (!canUndo.value) return;
+                thinking.value = true;
+                paused.value = true;  // 后退后自动暂停
                 try {
                     const res = await fetch('/api/undo', { method: 'POST' });
                     if (!res.ok) throw new Error('Undo failed');
@@ -690,6 +725,60 @@
                     selected.value = null;
                 } catch (e) {
                     showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
+                }
+            };
+            
+            const forward = async () => {
+                if (!canForward.value) return;
+                thinking.value = true;
+                try {
+                    const res = await fetch('/api/forward', { method: 'POST' });
+                    if (!res.ok) throw new Error('Forward failed');
+                    await fetchStatus();
+                    selected.value = null;
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
+                }
+            };
+            
+            const gotoLatest = async () => {
+                if (atLatest.value || moveHistory.value.length === 0) return;
+                await gotoStep(moveHistory.value.length);
+                paused.value = false;  // 回到最新状态时取消暂停
+            };
+            
+            const requestPolicyAnalysis = async () => {
+                if (!aiLoaded.value || gameOver.value) return;
+                thinking.value = true;
+                try {
+                    const res = await fetch('/api/policy_analysis', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            num_simulations: aiSimulations.value,
+                            top_k: aiTopK.value
+                        })
+                    });
+                    if (!res.ok) throw new Error('Policy analysis failed');
+                    const data = await res.json();
+                    policyInfo.value = data.policy;
+                    
+                    // 显示策略信息
+                    if (data.policy && data.policy.top_moves) {
+                        const topMoves = data.policy.top_moves.slice(0, 5);
+                        const moveList = topMoves.map((m, i) => 
+                            `${i+1}. ${m.uci} (${(m.weight*100).toFixed(1)}%)`
+                        ).join(' | ');
+                        showMessage(`Top策略: ${moveList}`);
+                    }
+                } catch (e) {
+                    showMessage(e.message, 'error');
+                } finally {
+                    thinking.value = false;
                 }
             };
             
@@ -765,17 +854,18 @@
                 board, currentPlayer, lastMove, lastMoveUci, gameOver, winner,
                 stepCount, isCheck, kingPos, legalMoves, historyLength,
                 aiValue, uciScore, aiLoaded, uciReady, fen,
+                canUndo, canForward, atLatest, policyInfo,
                 // UI
                 selected, thinking, paused, loading, activeTab, message, messageType,
                 // 设置
-                redType, blackType, uciDepth, aiDelay, aiSimulations, aiTopK, aiTemperature, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
+                redType, blackType, uciDepth, aiDelay, aiSimulations, aiTopK, openingRandomMoves, openingTopK, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
                 // 历史
                 moveHistory,
                 // 计算属性
                 legalTargets, isAITurn, displayAiValue, displayUciScore,
                 // 方法
-                getPieceName, formatUciScore, handleClick, newGame, undo, togglePause,
-                applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep
+                getPieceName, formatUciScore, handleClick, newGame, undo, forward, gotoLatest, togglePause,
+                applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep, requestPolicyAnalysis
             };
         }
     }).mount('#app');

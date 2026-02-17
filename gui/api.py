@@ -319,10 +319,11 @@ class GameState:
     winner: int = -1
     step_count: int = 0
     is_check: bool = False
-    history: List = field(default_factory=list)  # 状态历史（用于悔棋）
+    history: List = field(default_factory=list)  # 状态历史（用于悔棋和前进）
     move_history: List = field(default_factory=list)  # 着法历史（用于显示）
     ai_value: float = 0.0
     uci_score: Optional[int] = None
+    current_history_index: int = -1  # 当前在历史中的位置，-1表示在最新状态
 
 
 # 全局游戏状态
@@ -430,20 +431,50 @@ def get_ai_action(
     state: GameState, 
     num_simulations: int = 256, 
     top_k: int = 32,
-    temperature: float = 0.0,  # 0 = 贪婪选择，>0 = 温度采样增加多样性
-) -> Tuple[Optional[int], float]:
-    """获取 AI 最佳着法
+    return_policy: bool = False,  # 是否返回完整策略分布
+) -> Tuple[Optional[int], float, Optional[dict]]:
+    """获取 AI 最佳着法（始终选择最大概率走法）
     
     Args:
         state: 当前游戏状态
         num_simulations: MCTS 模拟次数（越大越准，越慢）
         top_k: 每步考虑的最大着法数（越大越全面，越慢）
-        temperature: 采样温度，0=贪婪选择，>0=增加多样性（开局推荐0.3-0.5）
+        return_policy: 是否返回完整策略分布
+    
+    Returns:
+        (action, value, policy_info) - policy_info 包含策略分布信息，如果return_policy=False则为None
     """
     global rng_key, mcts_recurrent_fn
     
     if not model_mgr.params:
-        return None, 0.0
+        return None, 0.0, None
+    
+    # 优化：只有一个合法走法时直接返回，不需要MCTS搜索
+    legal_mask = np.array(state.jax_state.legal_action_mask)
+    legal_actions = np.where(legal_mask)[0]
+    if len(legal_actions) == 1:
+        action = int(legal_actions[0])
+        print(f"[AI] 只有一个合法走法，直接应用: action={action}")
+        # 仍需获取value估计
+        obs = env.observe(state.jax_state)[None, ...]
+        _, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+        search_value = float(value[0])
+        if state.current_player == 1:
+            search_value = -search_value
+        
+        policy_info = None
+        if return_policy:
+            policy_info = {
+                "top_moves": [{
+                    "action": action,
+                    "uci": move_to_uci(*action_to_move(action)),
+                    "weight": 1.0,
+                    "prior": 1.0,
+                }],
+                "is_forced": True,
+            }
+        
+        return action, search_value, policy_info
     
     if mcts_recurrent_fn is None:
         mcts_recurrent_fn = create_mcts_recurrent_fn()
@@ -457,8 +488,11 @@ def get_ai_action(
     logits = jnp.where(state.jax_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
 
     invalid_mask = ~state.jax_state.legal_action_mask
+    
+    # 计算先验策略分布（用于policy_info）
+    prior_probs = jax.nn.softmax(logits[0])
 
-    rng_key, sk1, sk2 = jax.random.split(rng_key, 3)
+    rng_key, sk1 = jax.random.split(rng_key)
     root = mctx.RootFnOutput(
         prior_logits=logits, value=value,
         embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), state.jax_state)
@@ -480,22 +514,31 @@ def get_ai_action(
     
     weights = np.array(policy_output.action_weights[0])
     
-    # 温度采样增加开局多样性
-    if temperature > 0:
-        legal_mask = np.array(state.jax_state.legal_action_mask)
-        # 对权重进行温度变换
-        log_weights = np.log(weights + 1e-10) / max(temperature, 1e-3)
-        log_weights = np.where(legal_mask, log_weights, -np.inf)
-        log_weights = log_weights - np.max(log_weights)
-        probs = np.exp(log_weights)
-        probs = np.where(legal_mask, probs, 0.0)
-        probs = probs / np.sum(probs)
-        # 随机采样
-        action = int(jax.random.choice(sk2, ACTION_SPACE_SIZE, p=jnp.array(probs)))
-    else:
-        action = int(np.argmax(weights))
+    # 始终选择最大概率走法（贪婪策略）
+    action = int(np.argmax(weights))
     
-    return action, search_value
+    # 构建策略分布信息
+    policy_info = None
+    if return_policy:
+        # 获取Top-K候选着法
+        top_indices = np.argsort(weights)[::-1][:min(10, len(legal_actions))]  # 返回Top10
+        top_moves = []
+        for idx in top_indices:
+            if weights[idx] > 1e-6:  # 过滤权重太小的
+                fs, ts = action_to_move(int(idx))
+                top_moves.append({
+                    "action": int(idx),
+                    "uci": move_to_uci(int(fs), int(ts)),
+                    "weight": float(weights[idx]),
+                    "prior": float(prior_probs[idx]),
+                })
+        
+        policy_info = {
+            "top_moves": top_moves,
+            "is_forced": False,
+        }
+    
+    return action, search_value, policy_info
 
 
 # ============================================================================
@@ -518,7 +561,9 @@ class LoadModelRequest(BaseModel):
 class AIThinkRequest(BaseModel):
     num_simulations: int = 256  # MCTS 模拟次数
     top_k: int = 32             # 考虑的最大着法数
-    temperature: float = 0.0    # 采样温度（0=贪婪，>0增加多样性，开局推荐0.3-0.5）
+    return_policy: bool = False  # 是否返回完整策略分布
+    opening_random_moves: int = 0  # 开局前N步使用随机策略（0=不使用）
+    opening_top_k: int = 5  # 开局随机时从Top-K候选中随机选择
 
 
 class UCIThinkRequest(BaseModel):
@@ -571,6 +616,14 @@ async def get_status():
         r, c = find_king(jb, p)
         king_pos = [int(r), int(c)]
     
+    # 检查是否可以前进/后退
+    # 后退：只要不在初始状态就可以后退
+    can_undo = len(game_state.history) > 1 and (
+        game_state.current_history_index == -1 or game_state.current_history_index > 0
+    )
+    # 前进：只有在历史中（不在最新状态）才能前进
+    can_forward = game_state.current_history_index != -1
+    
     return {
         "board": game_state.board.tolist(),
         "current_player": game_state.current_player,
@@ -588,6 +641,9 @@ async def get_status():
         "ai_loaded": model_mgr.params is not None,
         "uci_ready": uci_engine is not None and uci_engine.ready,
         "history_length": len(game_state.history),
+        "can_undo": can_undo,
+        "can_forward": can_forward,
+        "at_latest": game_state.current_history_index == -1,
     }
 
 
@@ -613,8 +669,22 @@ async def new_game(req: NewGameRequest):
     game_state = GameState(
         board=board,
         current_player=player,
-        jax_state=jax_state
+        jax_state=jax_state,
+        current_history_index=-1
     )
+    
+    # 保存初始状态到历史（第0步）
+    game_state.history.append({
+        'jax_state': jax_state,
+        'last_move': None,
+        'last_move_uci': '',
+        'ai_value': 0.0,
+        'uci_score': None,
+        'board': board.copy(),
+        'current_player': player,
+        'game_over': False,
+        'winner': -1,
+    })
     
     return await get_status()
 
@@ -631,14 +701,14 @@ async def make_move(req: MoveRequest):
     if not game_state.jax_state.legal_action_mask[req.action]:
         raise HTTPException(status_code=400, detail="Illegal move")
     
-    # 保存历史
-    game_state.history.append({
-        'jax_state': game_state.jax_state,
-        'last_move': game_state.last_move,
-        'last_move_uci': game_state.last_move_uci,
-        'ai_value': game_state.ai_value,
-        'uci_score': game_state.uci_score,
-    })
+    # 如果不在最新状态，清除后续历史（创建新分支）
+    if game_state.current_history_index != -1:
+        # 清除当前位置之后的所有历史
+        # current_history_index指向当前显示的状态在history中的位置
+        # 例如：history有5个元素[0,1,2,3,4]，current_history_index=2，则保留[0,1,2]，删除[3,4]
+        game_state.history = game_state.history[:game_state.current_history_index + 1]
+        game_state.move_history = game_state.move_history[:game_state.current_history_index]  # move_history比history少一个（初始状态没有move）
+        game_state.current_history_index = -1  # 回到最新状态
     
     # 执行着法
     fs, ts = action_to_move(req.action)
@@ -665,31 +735,95 @@ async def make_move(req: MoveRequest):
         'player': '红' if player_before == 0 else '黑'
     })
     
+    # 将走完后的状态保存到历史
+    game_state.history.append({
+        'jax_state': new_jax_state,
+        'last_move': (fr, fc, tr, tc),
+        'last_move_uci': uci_move,
+        'ai_value': game_state.ai_value,
+        'uci_score': game_state.uci_score,
+        'board': game_state.board.copy(),
+        'current_player': game_state.current_player,
+        'game_over': game_state.game_over,
+        'winner': game_state.winner,
+    })
+    
     return await get_status()
 
 
 @app.post("/api/undo")
 async def undo_move():
-    """悔棋"""
+    """后退一步（不删除历史）"""
     global game_state
     
     if game_state is None:
         raise HTTPException(status_code=400, detail="No game in progress")
-    if not game_state.history:
-        raise HTTPException(status_code=400, detail="No moves to undo")
+    if len(game_state.history) <= 1:  # 只有初始状态，无法后退
+        raise HTTPException(status_code=400, detail="Already at the beginning")
     
-    h = game_state.history.pop()
-    if game_state.move_history:
-        game_state.move_history.pop()  # 同步移除着法历史
+    # 确定当前位置
+    if game_state.current_history_index == -1:
+        # 在最新状态，后退到倒数第二个
+        game_state.current_history_index = len(game_state.history) - 2
+    else:
+        # 已经在历史中，继续后退
+        if game_state.current_history_index <= 0:
+            raise HTTPException(status_code=400, detail="Already at the beginning")
+        game_state.current_history_index -= 1
+    
+    # 恢复到该状态
+    h = game_state.history[game_state.current_history_index]
     game_state.jax_state = h['jax_state']
-    game_state.board = np.array(h['jax_state'].board)
-    game_state.current_player = int(h['jax_state'].current_player)
+    game_state.board = h['board'].copy()
+    game_state.current_player = h['current_player']
     game_state.last_move = h['last_move']
     game_state.last_move_uci = h['last_move_uci']
     game_state.ai_value = h['ai_value']
     game_state.uci_score = h.get('uci_score')
-    game_state.step_count -= 1
-    game_state.game_over = False
+    game_state.game_over = h['game_over']
+    game_state.winner = h['winner']
+    game_state.step_count = game_state.current_history_index  # history[i]对应第i步
+    
+    return await get_status()
+
+
+@app.post("/api/forward")
+async def forward_move():
+    """前进一步"""
+    global game_state
+    
+    if game_state is None:
+        raise HTTPException(status_code=400, detail="No game in progress")
+    if game_state.current_history_index == -1:
+        raise HTTPException(status_code=400, detail="Already at the latest position")
+    
+    # 前进一步
+    game_state.current_history_index += 1
+    
+    # 检查是否到达最新状态
+    if game_state.current_history_index >= len(game_state.history) - 1:
+        # 到达最新状态
+        game_state.current_history_index = -1
+        # 恢复到history的最后一个元素
+        h = game_state.history[-1]
+    else:
+        h = game_state.history[game_state.current_history_index]
+    
+    # 恢复到该状态
+    game_state.jax_state = h['jax_state']
+    game_state.board = h['board'].copy()
+    game_state.current_player = h['current_player']
+    game_state.last_move = h['last_move']
+    game_state.last_move_uci = h['last_move_uci']
+    game_state.ai_value = h['ai_value']
+    game_state.uci_score = h.get('uci_score')
+    game_state.game_over = h['game_over']
+    game_state.winner = h['winner']
+    
+    if game_state.current_history_index == -1:
+        game_state.step_count = len(game_state.history) - 1
+    else:
+        game_state.step_count = game_state.current_history_index
     
     return await get_status()
 
@@ -700,40 +834,37 @@ class GotoStepRequest(BaseModel):
 
 @app.post("/api/goto_step")
 async def goto_step(req: GotoStepRequest):
-    """回退到指定步数"""
+    """跳转到指定步数"""
     global game_state
     
     if game_state is None:
         raise HTTPException(status_code=400, detail="No game in progress")
     
     target_step = req.step
-    if target_step < 0:
-        raise HTTPException(status_code=400, detail="Invalid step number")
+    max_step = len(game_state.history) - 1  # 最大步数
     
-    # 计算需要回退多少步
-    current_step = game_state.step_count
-    steps_to_undo = current_step - target_step
+    if target_step < 0 or target_step > max_step:
+        raise HTTPException(status_code=400, detail=f"Invalid step number (must be 0-{max_step})")
     
-    if steps_to_undo <= 0:
-        raise HTTPException(status_code=400, detail="Cannot go forward, only backward")
-    if steps_to_undo > len(game_state.history):
-        raise HTTPException(status_code=400, detail="Not enough history")
+    # 如果目标步数是最后一步，设置为-1（最新状态）
+    if target_step == max_step:
+        game_state.current_history_index = -1
+        h = game_state.history[-1]
+    else:
+        game_state.current_history_index = target_step
+        h = game_state.history[target_step]
     
-    # 连续回退
-    for _ in range(steps_to_undo):
-        h = game_state.history.pop()
-        if game_state.move_history:
-            game_state.move_history.pop()  # 同步移除着法历史
-        game_state.jax_state = h['jax_state']
-        game_state.board = np.array(h['jax_state'].board)
-        game_state.current_player = int(h['jax_state'].current_player)
-        game_state.last_move = h['last_move']
-        game_state.last_move_uci = h['last_move_uci']
-        game_state.ai_value = h['ai_value']
-        game_state.uci_score = h.get('uci_score')
-        game_state.step_count -= 1
-    
-    game_state.game_over = False
+    # 恢复到该状态
+    game_state.jax_state = h['jax_state']
+    game_state.board = h['board'].copy()
+    game_state.current_player = h['current_player']
+    game_state.last_move = h['last_move']
+    game_state.last_move_uci = h['last_move_uci']
+    game_state.ai_value = h['ai_value']
+    game_state.uci_score = h.get('uci_score')
+    game_state.game_over = h['game_over']
+    game_state.winner = h['winner']
+    game_state.step_count = target_step
     
     return await get_status()
 
@@ -753,6 +884,8 @@ async def get_history():
 @app.post("/api/ai_think")
 async def ai_think(req: AIThinkRequest):
     """AI 思考并返回最佳着法"""
+    global rng_key
+    
     if game_state is None:
         raise HTTPException(status_code=400, detail="No game in progress")
     if model_mgr.params is None:
@@ -760,20 +893,109 @@ async def ai_think(req: AIThinkRequest):
     if game_state.game_over:
         raise HTTPException(status_code=400, detail="Game is over")
     
-    action, value = get_ai_action(
-        game_state, req.num_simulations, req.top_k, req.temperature
+    # 检查是否在开局随机阶段（优先级高于温度参数）
+    use_opening_random = (
+        req.opening_random_moves > 0 and 
+        game_state.step_count < req.opening_random_moves
     )
-    if action is None:
-        raise HTTPException(status_code=500, detail="AI failed to find a move")
     
-    game_state.ai_value = value
+    if use_opening_random:
+        print(f"[AI] 第{game_state.step_count+1}步，使用开局随机策略")
+        # 开局随机策略：从Top-K候选中随机选择
+        print(f"[AI] 开局随机模式：从Top-{req.opening_top_k}候选中随机选择")
+        
+        # 先获取策略分布
+        action, value, policy_info = get_ai_action(
+            game_state, req.num_simulations, req.top_k, 
+            return_policy=True
+        )
+        
+        if action is None:
+            raise HTTPException(status_code=500, detail="AI failed to find a move")
+        
+        # 如果是强制走法（只有一步），直接返回
+        if policy_info and policy_info.get("is_forced"):
+            game_state.ai_value = value
+            fs, ts = action_to_move(action)
+            return {
+                "action": action,
+                "uci": move_to_uci(int(fs), int(ts)),
+                "value": value,
+                "policy": policy_info,
+                "opening_random": True,
+                "is_forced": True,
+            }
+        
+        # 从Top-K中随机选择
+        if policy_info and policy_info.get("top_moves"):
+            top_moves = policy_info["top_moves"][:req.opening_top_k]
+            if len(top_moves) > 1:
+                # 随机选择一个
+                rng_key, sk = jax.random.split(rng_key)
+                chosen_idx = int(jax.random.randint(sk, (), 0, len(top_moves)))
+                chosen_move = top_moves[chosen_idx]
+                action = chosen_move["action"]
+                print(f"[AI] 从{len(top_moves)}个候选中随机选择了第{chosen_idx+1}个: {chosen_move['uci']}")
+        
+        game_state.ai_value = value
+        fs, ts = action_to_move(action)
+        return {
+            "action": action,
+            "uci": move_to_uci(int(fs), int(ts)),
+            "value": value,
+            "policy": policy_info,
+            "opening_random": True,
+            "is_forced": False,
+        }
+    else:
+        # 正常模式：始终选择最大概率走法
+        action, value, policy_info = get_ai_action(
+            game_state, req.num_simulations, req.top_k,
+            return_policy=req.return_policy
+        )
+        if action is None:
+            raise HTTPException(status_code=500, detail="AI failed to find a move")
+        
+        game_state.ai_value = value
+        
+        fs, ts = action_to_move(action)
+        result = {
+            "action": action,
+            "uci": move_to_uci(int(fs), int(ts)),
+            "value": value,
+            "opening_random": False,
+        }
+        
+        if req.return_policy and policy_info:
+            result["policy"] = policy_info
+        
+        return result
+
+
+@app.post("/api/policy_analysis")
+async def policy_analysis(req: AIThinkRequest):
+    """获取当前局面的策略分析（不执行着法）"""
+    if game_state is None:
+        raise HTTPException(status_code=400, detail="No game in progress")
+    if model_mgr.params is None:
+        raise HTTPException(status_code=400, detail="AI model not loaded")
+    if game_state.game_over:
+        raise HTTPException(status_code=400, detail="Game is over")
+    
+    action, value, policy_info = get_ai_action(
+        game_state, req.num_simulations, req.top_k, 
+        return_policy=True
+    )
+    
+    if action is None or policy_info is None:
+        raise HTTPException(status_code=500, detail="AI failed to analyze position")
     
     fs, ts = action_to_move(action)
     return {
-        "action": action,
-        "uci": move_to_uci(int(fs), int(ts)),
+        "best_action": action,
+        "best_uci": move_to_uci(int(fs), int(ts)),
         "value": value,
-        "temperature": req.temperature,
+        "policy": policy_info,
     }
 
 
