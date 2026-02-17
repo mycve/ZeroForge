@@ -56,7 +56,7 @@ class Config:
     lr_decay_iters: int = 20000
     # 256x12 网络在 7 卡下训练峰值显存较高，默认采用更保守 batch 避免 train_step OOM
     training_batch_size: int = 2048
-    td_lambda: float = 0.85  # 更短 credit assignment，降低 value 方差
+    td_lambda: float = 0.90  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
@@ -72,9 +72,9 @@ class Config:
     value_loss_weight: float = 1.5
     value_huber_delta: float = 0.5
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.05   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.5     # 降低根节点随机性，减少训练目标抖动
-    eval_gumbel_scale: float = 0.0         # 评估关闭 Gumbel 噪声，结果更稳定
+    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
+    eval_gumbel_scale: float = 0.01         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
     temperature_steps: int = 30
