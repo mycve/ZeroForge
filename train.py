@@ -992,7 +992,7 @@ def main():
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         current_lr = float(lr_schedule(iteration))
-        print(f"[LR] iter={iteration} lr={current_lr:.3e}")
+        # print(f"[LR] iter={iteration} lr={current_lr:.3e}")
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
