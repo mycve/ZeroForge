@@ -526,8 +526,8 @@
             const modelInfo = ref(null);
             const fenInput = ref('');
             const moveHistory = ref([]);  // 走棋历史
-            const aiSimulations = ref(512);  // MCTS 模拟次数
-            const aiTopK = ref(16);  // Top-K 着法
+            const aiSimulations = ref(128);  // MCTS 模拟次数
+            const aiTopK = ref(8);  // Top-K 着法
             const openingRandomMoves = ref(0);  // 开局前N步使用随机策略（0=不使用）
             const openingTopK = ref(5);  // 开局随机时从Top-K中选择
             
