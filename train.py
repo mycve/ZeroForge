@@ -50,10 +50,11 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 1.5e-4
-    min_learning_rate: float = 3.0e-5
-    lr_warmup_iters: int = 200
-    lr_decay_iters: int = 20000
+    learning_rate: float = 1e-3       # SGD + momentum 的标准起始 LR
+    lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10
+    lr_drop_factor: float = 0.1       # 每次衰减倍率
+    lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
+    max_grad_norm: float = 1.0
     training_batch_size: int = 2048
     td_lambda: float = 0.98  # 更短 credit assignment，降低 value 方差
     
@@ -148,14 +149,10 @@ config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_siz
 config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
 config.eval_games = _align_to_device_multiple(config.eval_games, "eval_games")
 
-if config.min_learning_rate <= 0.0 or config.min_learning_rate > config.learning_rate:
-    raise ValueError(
-        f"min_learning_rate({config.min_learning_rate}) 需满足 0 < min_lr <= learning_rate({config.learning_rate})"
-    )
-if config.lr_warmup_iters < 0 or config.lr_decay_iters <= config.lr_warmup_iters:
-    raise ValueError(
-        f"学习率调度非法：需满足 lr_decay_iters({config.lr_decay_iters}) > lr_warmup_iters({config.lr_warmup_iters}) >= 0"
-    )
+if config.learning_rate <= 0:
+    raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
+if config.lr_warmup_steps < 0:
+    raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
 
 # 预计算旋转索引，避免在 JIT 循环内重复计算
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -815,18 +812,29 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
     
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=config.min_learning_rate,
-        peak_value=config.learning_rate,
-        warmup_steps=config.lr_warmup_iters,
-        decay_steps=config.lr_decay_iters,
-        end_value=config.min_learning_rate,
-    )
+    # 阶梯式 LR 调度（AlphaZero 标准做法）
+    # 默认衰减点：~60 轮和 ~120 轮（每轮约 400 优化器步）
+    drop_steps = config.lr_drop_steps or [24000, 48000]
+    
+    def lr_schedule(step):
+        """warmup + 阶梯式衰减"""
+        # 预热阶段：线性从 0 升到 peak
+        warmup_factor = jnp.minimum(step / max(config.lr_warmup_steps, 1), 1.0)
+        # 阶梯衰减：每过一个 drop 点，LR 乘以 drop_factor
+        lr = config.learning_rate
+        for ds in drop_steps:
+            lr = jnp.where(step >= ds, lr * config.lr_drop_factor, lr)
+        return lr * warmup_factor
+    
     print(
-        f"[LR] warmup+cosine: min={config.min_learning_rate:.2e}, "
-        f"peak={config.learning_rate:.2e}, warmup={config.lr_warmup_iters}, decay={config.lr_decay_iters}"
+        f"[LR] 阶梯式: peak={config.learning_rate:.1e}, "
+        f"drop×{config.lr_drop_factor} at steps {drop_steps}, "
+        f"warmup={config.lr_warmup_steps}steps"
     )
-    optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.sgd(lr_schedule, momentum=0.9, nesterov=True),
+    )
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -856,10 +864,21 @@ def main():
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
-    writer = SummaryWriter(config.log_dir)
+    # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
+    run_name = (
+        f"ch{config.num_channels}_b{config.num_blocks}"
+        f"_sim{config.num_simulations}_k{config.top_k}"
+        f"_lr{config.learning_rate:.0e}_sgd_bs{config.training_batch_size}"
+        f"_td{config.td_lambda}_vw{config.value_loss_weight}"
+        f"_sp{config.selfplay_batch_size}"
+    )
+    run_log_dir = os.path.join(config.log_dir, run_name)
+    print(f"[Log] TensorBoard 日志: {run_log_dir}")
+    writer = SummaryWriter(run_log_dir)
     start_time_total = time.time()
     
     print("开始训练！")
+    total_opt_steps = 0  # 累计优化器步数（用于查询真实 LR）
     
     print(f"[Selfplay] batch_size={config.selfplay_batch_size}")
 
@@ -971,6 +990,9 @@ def main():
                 ploss_acc = ploss_acc + ploss
                 vloss_acc = vloss_acc + vloss
         
+        # 累计优化器步数
+        total_opt_steps += num_updates
+        
         # 一次性同步所有累积损失
         if num_updates > 0:
             policy_loss = float(ploss_acc.mean() / num_updates)
@@ -991,8 +1013,7 @@ def main():
               f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
-        current_lr = float(lr_schedule(iteration))
-        # print(f"[LR] iter={iteration} lr={current_lr:.3e}")
+        current_lr = float(lr_schedule(total_opt_steps))
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
