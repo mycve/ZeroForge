@@ -50,7 +50,7 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 1e-3       # SGD + momentum 的标准起始 LR
+    learning_rate: float = 1e-4       # AdamW 起始 LR
     lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10
     lr_drop_factor: float = 0.1       # 每次衰减倍率
     lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
@@ -833,7 +833,7 @@ def main():
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
-        optax.sgd(lr_schedule, momentum=0.9, nesterov=True),
+        optax.adamw(lr_schedule, weight_decay=config.weight_decay),
     )
     opt_state_template = optimizer.init(params_template)
     
@@ -868,7 +868,7 @@ def main():
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
-        f"_lr{config.learning_rate:.0e}_sgd_bs{config.training_batch_size}"
+        f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
     )
