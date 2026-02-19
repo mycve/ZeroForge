@@ -55,12 +55,12 @@ class Config:
     lr_warmup_iters: int = 200
     lr_decay_iters: int = 20000
     training_batch_size: int = 2048
-    td_lambda: float = 0.90  # 更短 credit assignment，降低 value 方差
+    td_lambda: float = 0.98  # 更短 credit assignment，降低 value 方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
-    selfplay_batch_size: int = 4096
-    num_simulations: int = 128           # 提升搜索深度，改善策略/value 目标质量
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
@@ -68,8 +68,7 @@ class Config:
     sample_reuse_times: int = 2
     
     # 损失权重
-    value_loss_weight: float = 1.5
-    value_huber_delta: float = 0.5
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.1     # 降低根节点随机性，减少训练目标抖动
@@ -404,8 +403,8 @@ def compute_targets(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：所有样本都参与训练（统一策略，无强弱差异）
-    - 价值损失：拟合 TD(λ) 目标（Huber 降低离群噪声）
+    - 策略损失：交叉熵（所有样本参与训练）
+    - 价值损失：MSE（targets 有界 [-1,1]，无需 Huber 的 outlier 保护）
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
@@ -417,7 +416,6 @@ def loss_fn(params, samples: Sample, rng_key):
     
     logits, value = forward(params, obs, is_training=True)
     
-    # 强制转换为 float32 进行损失计算，避免数值不稳定
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
@@ -427,8 +425,8 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失：Huber 对异常目标更稳
-    value_loss_per = optax.huber_loss(value, value_tgt, delta=config.value_huber_delta)
+    # 价值损失：MSE
+    value_loss_per = jnp.square(value - value_tgt)
     value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
