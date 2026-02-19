@@ -64,7 +64,7 @@ class Config:
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
-    replay_buffer_size: int = 4000000
+    replay_buffer_size: int = 2000000
     sample_reuse_times: int = 2
     
     # 损失权重
