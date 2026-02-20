@@ -50,18 +50,18 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 1e-4       # AdamW 起始 LR
-    lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10
+    learning_rate: float = 3e-4       # AdamW 起始 LR
+    lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10（None → 手动控制）
     lr_drop_factor: float = 0.1       # 每次衰减倍率
     lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
     max_grad_norm: float = 1.0
     training_batch_size: int = 2048
-    td_lambda: float = 0.98  # 更短 credit assignment，降低 value 方差
+    td_lambda: float = 0.995  # 接近 MC，保留弃子战术学习能力；丢子问题随训练自然纠正
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 2048
-    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
+    num_simulations: int = 32           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
@@ -71,8 +71,8 @@ class Config:
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.1     # 降低根节点随机性，减少训练目标抖动
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.05         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略 (更保守的温度衰减，减少臭棋)
@@ -812,9 +812,9 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
     
-    # 阶梯式 LR 调度（AlphaZero 标准做法）
-    # 默认衰减点：~60 轮和 ~120 轮（每轮约 400 优化器步）
-    drop_steps = config.lr_drop_steps or [24000, 48000]
+    # 阶梯式 LR 调度
+    # 开放式训练：不设默认 drop 点，持续高 LR 直到 ELO 停滞再手动降
+    drop_steps = config.lr_drop_steps or []
     
     def lr_schedule(step):
         """warmup + 阶梯式衰减"""
