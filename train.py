@@ -232,12 +232,13 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
     winner: jnp.ndarray
     draw_reason: jnp.ndarray
-    root_value: jnp.ndarray  # MCTS 搜索后的价值估计，用于 n-step TD bootstrap
+    root_value: jnp.ndarray  # MCTS 搜索后的标量价值估计
+    root_wdl: jnp.ndarray    # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
-    value_tgt: jnp.ndarray  # TD(λ) 目标：加权平均的 λ-return
+    wdl_tgt: jnp.ndarray   # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
     mask: jnp.ndarray
 
 # ============================================================================
@@ -257,7 +258,8 @@ def selfplay(params, rng_key, batch_size):
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
-        logits, value, _ = forward(params, obs)
+        logits, value, wdl_logits = forward(params, obs)
+        root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
@@ -332,7 +334,8 @@ def selfplay(params, rng_key, batch_size):
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
             winner=next_state.winner, draw_reason=next_state.draw_reason,
-            root_value=root_value,  # MCTS 搜索后的价值估计
+            root_value=root_value,
+            root_wdl=root_wdl,
         )
         
         # 结束后直接重置为标准初始局面
@@ -347,17 +350,12 @@ def selfplay(params, rng_key, batch_size):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """TD(λ) 目标计算 - 加权平均所有 n-step 回报
+    """WDL TD(λ) 目标计算 - 在 [W, D, L] 三分量上独立做 TD(λ)
     
-    TD(λ) 结合了 TD 和 MC 的优点：
-    - λ=0: 纯 TD(0)，只用一步 bootstrap，收敛快但偏差大
-    - λ=1: 纯 MC，用整局结果，无偏但方差大
-    - λ=0.95: 加权平均，兼顾两者，是最常用的选择
-    
-    递推公式（从后向前）：
-    G_t^λ = r_t + d_t * ((1-λ) * V(s_{t+1}) + λ * G_{t+1}^λ)
-    
-    当游戏结束时 d_t=0，自动截断为 G_t = r_t
+    与标量 TD(λ) 的区别：
+    - bootstrap 用网络原始 WDL 概率（而非 MCTS 标量值）
+    - 视角翻转用 W↔L 互换（而非标量取反）
+    - 游戏结果直接映射为 one-hot WDL
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     lam = config.td_lambda
@@ -365,31 +363,46 @@ def compute_targets(data: SelfplayOutput):
     # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    def scan_fn(carry, inputs):
-        """从后向前计算 λ-return"""
-        reward_t, discount_t, value_next = inputs
-        # G_t^λ = r_t + d_t * ((1-λ) * V(s_{t+1}) + λ * G_{t+1}^λ)
-        # carry 是 G_{t+1}^λ，value_next 是 V(s_{t+1})
-        g_lambda = reward_t + discount_t * ((1.0 - lam) * value_next + lam * carry)
-        return g_lambda, g_lambda
-    
-    # 从最后一步向前扫描
-    # 初始 carry = 0（游戏结束后的价值为 0）
-    # 注意：root_value[t] 是 s_t 的价值估计，我们需要 s_{t+1} 的价值估计来 bootstrap
-    # 所以用 root_value[1:] 作为 value_next，最后一步用 0
-    value_next = jnp.concatenate([data.root_value[1:], jnp.zeros((1, batch_size))], axis=0)
-    
-    _, value_tgt_rev = jax.lax.scan(
-        scan_fn,
-        jnp.zeros(batch_size),  # 初始 carry = 0
-        (data.reward[::-1], data.discount[::-1], value_next[::-1])  # 反转输入
+    # s_{t+1} 的 WDL 预测，用于 bootstrap
+    wdl_next = jnp.concatenate(
+        [data.root_wdl[1:], jnp.zeros((1, batch_size, 3))], axis=0
     )
-    value_tgt = value_tgt_rev[::-1]  # 翻转回正序
+    
+    # 游戏结果 → one-hot WDL（仅在 terminated 时有效）
+    # reward: +1=赢, 0=和, -1=输（从 actor 视角）
+    reward_wdl = jnp.stack([
+        jnp.maximum(data.reward, 0.0),       # W
+        1.0 - jnp.abs(data.reward),           # D
+        jnp.maximum(-data.reward, 0.0),       # L
+    ], axis=-1)  # (max_steps, batch_size, 3)
+    
+    def scan_fn(carry_wdl, inputs):
+        """从后向前计算 WDL λ-return
+        
+        carry_wdl: G_{t+1} WDL，从 step t+1 的 actor 视角
+        非终局：G_t = flip((1-λ) * WDL(s_{t+1}) + λ * G_{t+1})
+        终局：G_t = reward_wdl
+        """
+        reward_wdl_t, terminated_t, wdl_next_t = inputs
+        # 混合 bootstrap 和递推
+        blended = (1.0 - lam) * wdl_next_t + lam * carry_wdl
+        # 视角翻转：对手的 [W, D, L] → 我方的 [L, D, W]
+        flipped = blended[:, ::-1]
+        # 终局用游戏结果，非终局用翻转后的混合值
+        g_wdl = jnp.where(terminated_t[:, None], reward_wdl_t, flipped)
+        return g_wdl, g_wdl
+    
+    _, wdl_tgt_rev = jax.lax.scan(
+        scan_fn,
+        jnp.zeros((batch_size, 3)),
+        (reward_wdl[::-1], data.terminated[::-1], wdl_next[::-1]),
+    )
+    wdl_tgt = wdl_tgt_rev[::-1]
 
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
-        value_tgt=value_tgt,
+        wdl_tgt=wdl_tgt,
         mask=value_mask,
     )
 
@@ -416,18 +429,13 @@ def loss_fn(params, samples: Sample, rng_key):
     logits = logits.astype(jnp.float32)
     wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
-    value_tgt = samples.value_tgt.astype(jnp.float32)
+    wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
     
     # 策略损失
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失：标量 TD(λ) 目标 → soft WDL 分布 → 交叉熵
-    # target ∈ [-1, 1]，映射为: W=max(t,0), L=max(-t,0), D=1-W-L
-    w_tgt = jnp.maximum(value_tgt, 0.0)
-    l_tgt = jnp.maximum(-value_tgt, 0.0)
-    d_tgt = 1.0 - w_tgt - l_tgt
-    wdl_tgt = jnp.stack([w_tgt, d_tgt, l_tgt], axis=-1)  # (B, 3)
+    # 价值损失：WDL 交叉熵（目标已由 compute_targets 正确计算）
     value_loss_per = -jnp.sum(wdl_tgt * jax.nn.log_softmax(wdl_logits, axis=-1), axis=-1)
     value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
@@ -537,7 +545,7 @@ class ReplayBuffer:
         # 全部用 NumPy 数组（CPU 内存）
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
-        self.value_tgt = np.zeros((max_size,), dtype=np.float32)
+        self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)  # WDL 概率分布
         self.mask = np.zeros((max_size,), dtype=np.bool_)
         
         self.ptr = 0
@@ -546,21 +554,19 @@ class ReplayBuffer:
 
     def add(self, samples: Sample):
         """存入样本（从 JAX 自动转 NumPy）"""
-        # jax.device_get 会自动聚合 8 GPU 的分片数据并转成 NumPy
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
-        value_flat = samples_np.value_tgt.reshape(-1)
+        wdl_flat = samples_np.wdl_tgt.reshape(-1, 3)
         mask_flat = samples_np.mask.reshape(-1)
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
         
-        # NumPy 原地更新，永远不会有设备冲突
         self.obs[indices] = obs_flat
         self.policy_tgt[indices] = policy_flat
-        self.value_tgt[indices] = value_flat
+        self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
         
         self.ptr = (self.ptr + n_new) % self.max_size
@@ -578,16 +584,15 @@ class ReplayBuffer:
         # 但我们可以减少 Python 逻辑
         idx = np.random.randint(0, self.size, size=batch_size)
         
-        # 优化：使用切片而非索引，更快
         obs_batch = self.obs[idx]
         policy_batch = self.policy_tgt[idx]
-        value_batch = self.value_tgt[idx]
+        wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
         
         return Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
-            value_tgt=jnp.asarray(value_batch),
+            wdl_tgt=jnp.asarray(wdl_batch),
             mask=jnp.asarray(mask_batch)
         )
     
@@ -600,15 +605,14 @@ class ReplayBuffer:
     def state_dict(self):
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
-            "value_tgt": self.value_tgt, "mask": self.mask,
+            "wdl_tgt": self.wdl_tgt, "mask": self.mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
     def load_state_dict(self, state):
-        # 获取加载的数据
         loaded_obs = np.array(state["obs"])
         loaded_policy = np.array(state["policy_tgt"])
-        loaded_value = np.array(state["value_tgt"])
+        loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
@@ -618,18 +622,16 @@ class ReplayBuffer:
         actual_samples = min(loaded_size, old_max)
         
         if old_max <= self.max_size:
-            # 旧数据能放下，直接复制
             self.obs[:old_max] = loaded_obs
             self.policy_tgt[:old_max] = loaded_policy
-            self.value_tgt[:old_max] = loaded_value
+            self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
-            # 旧数据比新缓冲区大，只保留最新的部分
             self.obs[:] = loaded_obs[:self.max_size]
             self.policy_tgt[:] = loaded_policy[:self.max_size]
-            self.value_tgt[:] = loaded_value[:self.max_size]
+            self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
             self.size = self.max_size
             self.ptr = 0
