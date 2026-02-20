@@ -412,7 +412,7 @@ def create_mcts_recurrent_fn():
         prev_p = state.current_player
         ns = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(ns)
-        l, v = model_mgr.net.apply({'params': params}, obs, train=False)
+        l, v, _ = model_mgr.net.apply({'params': params}, obs, train=False)
         l = jnp.where(ns.current_player[:, None] == 0, l, l[:, _ROTATED_IDX])
         l = l - jnp.max(l, axis=-1, keepdims=True)
         l = jnp.where(ns.legal_action_mask, l, jnp.finfo(l.dtype).min)
@@ -457,7 +457,7 @@ def get_ai_action(
         print(f"[AI] 只有一个合法走法，直接应用: action={action}")
         # 仍需获取value估计
         obs = env.observe(state.jax_state)[None, ...]
-        _, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+        _, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
         search_value = float(value[0])
         if state.current_player == 1:
             search_value = -search_value
@@ -486,7 +486,7 @@ def get_ai_action(
         mcts_recurrent_fn = create_mcts_recurrent_fn()
     
     obs = env.observe(state.jax_state)[None, ...]
-    logits, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+    logits, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
     
     if state.current_player == 1:
         logits = logits[:, _ROTATED_IDX]
@@ -922,7 +922,7 @@ async def ai_think(req: AIThinkRequest):
             action = int(legal_actions[0])
             print(f"[AI] 只有一个合法走法，直接应用: action={action}")
             obs = env.observe(game_state.jax_state)[None, ...]
-            _, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+            _, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
             search_value = float(value[0])
             if game_state.current_player == 1:
                 search_value = -search_value
@@ -939,7 +939,7 @@ async def ai_think(req: AIThinkRequest):
         
         # 获取模型先验策略（直接前向推理，不运行MCTS）
         obs = env.observe(game_state.jax_state)[None, ...]
-        logits, value = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+        logits, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
         
         # 处理黑方视角
         if game_state.current_player == 1:

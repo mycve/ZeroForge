@@ -221,15 +221,18 @@ class PolicyHead(nn.Module):
 # ============================================================================
 
 class ValueHead(nn.Module):
-    """Attention-pooled scalar value head
+    """WDL (Win/Draw/Loss) value head
 
-    三路池化（attention + mean + max）→ MLP → tanh
+    三路池化（attention + mean + max）→ MLP → 3-class softmax
+    输出: (value_scalar, wdl_logits)
+      - value_scalar: W - L ∈ [-1, 1]，供 MCTS 使用
+      - wdl_logits: (B, 3) 原始 logits，供交叉熵 loss 使用
     """
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, h: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         x = nn.LayerNorm(dtype=self.dtype)(h)
         pool_logits = nn.Dense(1, dtype=self.dtype, name="pool_logits")(x).squeeze(-1)
         pool_weights = nn.softmax(pool_logits, axis=1)
@@ -243,8 +246,10 @@ class ValueHead(nn.Module):
         fused = nn.Dense(self.model_dim, dtype=self.dtype, name="fc2")(fused)
         fused = nn.silu(fused)
 
-        value = jnp.tanh(nn.Dense(1, dtype=self.dtype, name="value_out")(fused).squeeze(-1))
-        return value
+        wdl_logits = nn.Dense(3, dtype=self.dtype, name="wdl_out")(fused)  # (B, 3)
+        wdl_probs = nn.softmax(wdl_logits, axis=-1)
+        value = wdl_probs[:, 0] - wdl_probs[:, 2]  # W - L
+        return value, wdl_logits
 
 
 # ============================================================================
@@ -255,9 +260,10 @@ class AlphaZeroNetwork(nn.Module):
     """精简 4 分支 GNN AlphaZero 网络
 
     输入: (B, C, H, W) 观察张量（126 通道 = 9 帧 × 14 棋子类型）
-    输出: (policy_logits, value)
+    输出: (policy_logits, value, wdl_logits)
         - policy_logits: (B, ACTION_SPACE_SIZE)
-        - value: (B,) in [-1, 1]
+        - value: (B,) in [-1, 1]  (= W - L，供 MCTS 使用)
+        - wdl_logits: (B, 3) 原始 logits (供训练 cross-entropy loss)
     """
     action_space_size: int = ACTION_SPACE_SIZE
     channels: int = 128
@@ -313,5 +319,9 @@ class AlphaZeroNetwork(nn.Module):
             dtype=self.dtype,
         )(h, self.action_from_idx, self.action_to_idx)
 
-        value = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
-        return policy_logits.astype(jnp.float32), value.astype(jnp.float32)
+        value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
+        return (
+            policy_logits.astype(jnp.float32),
+            value.astype(jnp.float32),
+            wdl_logits.astype(jnp.float32),
+        )

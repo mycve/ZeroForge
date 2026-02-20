@@ -192,14 +192,14 @@ eval_net = AlphaZeroNetwork(
 )
 
 def forward(params, obs, is_training=False):
-    """前向传播 (LayerNorm 架构，无需 batch_stats)"""
-    logits, value = net.apply({'params': params}, obs, train=is_training)
-    return logits, value
+    """前向传播: 返回 (logits, value_scalar, wdl_logits)"""
+    logits, value, wdl_logits = net.apply({'params': params}, obs, train=is_training)
+    return logits, value, wdl_logits
 
 
 def eval_forward(params, obs):
     """评估前向传播：固定 float32，规避部分 GPU 上 BF16 Triton 编译问题。"""
-    logits, value = eval_net.apply({'params': params}, obs, train=False)
+    logits, value, _wdl = eval_net.apply({'params': params}, obs, train=False)
     return logits, value
 
 
@@ -208,7 +208,7 @@ def recurrent_fn(params, rng_key, action, state):
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
-    logits, value = forward(params, obs)
+    logits, value, _ = forward(params, obs)
     
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
@@ -257,7 +257,7 @@ def selfplay(params, rng_key, batch_size):
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
-        logits, value = forward(params, obs)
+        logits, value, _ = forward(params, obs)
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
@@ -400,8 +400,8 @@ def compute_targets(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵（所有样本参与训练）
-    - 价值损失：MSE（targets 有界 [-1,1]，无需 Huber 的 outlier 保护）
+    - 策略损失：交叉熵
+    - 价值损失：WDL 交叉熵（比标量 MSE 梯度信号更强，精确区分"和棋"与"不确定"）
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
@@ -411,10 +411,10 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
-    logits, value = forward(params, obs, is_training=True)
+    logits, _value, wdl_logits = forward(params, obs, is_training=True)
     
     logits = logits.astype(jnp.float32)
-    value = value.astype(jnp.float32)
+    wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
     
@@ -422,8 +422,13 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失：MSE
-    value_loss_per = jnp.square(value - value_tgt)
+    # 价值损失：标量 TD(λ) 目标 → soft WDL 分布 → 交叉熵
+    # target ∈ [-1, 1]，映射为: W=max(t,0), L=max(-t,0), D=1-W-L
+    w_tgt = jnp.maximum(value_tgt, 0.0)
+    l_tgt = jnp.maximum(-value_tgt, 0.0)
+    d_tgt = 1.0 - w_tgt - l_tgt
+    wdl_tgt = jnp.stack([w_tgt, d_tgt, l_tgt], axis=-1)  # (B, 3)
+    value_loss_per = -jnp.sum(wdl_tgt * jax.nn.log_softmax(wdl_logits, axis=-1), axis=-1)
     value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
