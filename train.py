@@ -55,8 +55,8 @@ class Config:
     lr_drop_factor: float = 0.1       # 每次衰减倍率
     lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
     max_grad_norm: float = 1.0
-    training_batch_size: int = 2048
-    td_lambda: float = 0.995  # 接近 MC，保留弃子战术学习能力；丢子问题随训练自然纠正
+    training_batch_size: int = 2048 + 1024
+    td_lambda: float = 0.95  # 接近 MC，保留弃子战术学习能力；丢子问题随训练自然纠正
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
