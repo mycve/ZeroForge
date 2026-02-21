@@ -50,18 +50,18 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 3e-4       # AdamW 起始 LR
+    learning_rate: float = 1e-4       # AdamW 起始 LR
     lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10（None → 手动控制）
     lr_drop_factor: float = 0.1       # 每次衰减倍率
     lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
     max_grad_norm: float = 1.0
-    training_batch_size: int = 2048 + 1024
+    training_batch_size: int = 2048
     td_lambda: float = 0.95  # 接近 MC，保留弃子战术学习能力；丢子问题随训练自然纠正
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 2048
-    num_simulations: int = 32           # 提升搜索深度，改善策略/value 目标质量
+    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
