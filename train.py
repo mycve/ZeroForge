@@ -50,18 +50,19 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 1e-4       # AdamW 起始 LR
-    lr_drop_steps: list = None        # 阶梯式衰减：在这些优化器步数处 ÷10（None → 手动控制）
-    lr_drop_factor: float = 0.1       # 每次衰减倍率
+    learning_rate: float = 3e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
+    # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
+    lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈750 轮后到最低值
+    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 3e-6
     max_grad_norm: float = 1.0
-    training_batch_size: int = 2048
-    td_lambda: float = 0.95  # 接近 MC，保留弃子战术学习能力；丢子问题随训练自然纠正
+    training_batch_size: int = 2048 + 1024
+    td_lambda: float = 1.0  # 纯 MC：32 次模拟下网络 bootstrap 偏差 > 方差收益
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 2048
-    num_simulations: int = 64           # 提升搜索深度，改善策略/value 目标质量
+    num_simulations: int = 40           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
@@ -75,10 +76,12 @@ class Config:
     selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.05         # 评估关闭 Gumbel 噪声，结果更稳定
     
-    # 探索策略 (更保守的温度衰减，减少臭棋)
-    temperature_steps: int = 20
-    temperature_initial: float = 1.0
-    temperature_final: float = 0.05
+    # 探索策略：三段式温度（开局/中局/残局）
+    temperature_phase1_steps: int = 20    # 0-20 半步（~10回合）: 开局全探索
+    temperature_phase2_steps: int = 60    # 20-60 半步（~30回合）: 中局适度探索
+    temperature_phase1: float = 1.0
+    temperature_phase2: float = 0.5
+    temperature_final: float = 0.1
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 200              # 总步数 400 步（200回合）判和
@@ -301,8 +304,15 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
         
-        temp = jnp.where(state.step_count < config.temperature_steps, 
-                         config.temperature_initial, config.temperature_final)
+        temp = jnp.where(
+            state.step_count < config.temperature_phase1_steps,
+            config.temperature_phase1,
+            jnp.where(
+                state.step_count < config.temperature_phase2_steps,
+                config.temperature_phase2,
+                config.temperature_final,
+            ),
+        )
         
         def _sample_action(w, t, k, legal_mask):
             """温度采样 (log 空间避免数值下溢)"""
@@ -819,23 +829,20 @@ def main():
     variables = net.init(subkey, dummy_obs, train=True)
     params_template = variables['params']
     
-    # 阶梯式 LR 调度
-    # 开放式训练：不设默认 drop 点，持续高 LR 直到 ELO 停滞再手动降
-    drop_steps = config.lr_drop_steps or []
-    
     def lr_schedule(step):
-        """warmup + 阶梯式衰减"""
-        # 预热阶段：线性从 0 升到 peak
+        """warmup + 余弦退火"""
         warmup_factor = jnp.minimum(step / max(config.lr_warmup_steps, 1), 1.0)
-        # 阶梯衰减：每过一个 drop 点，LR 乘以 drop_factor
-        lr = config.learning_rate
-        for ds in drop_steps:
-            lr = jnp.where(step >= ds, lr * config.lr_drop_factor, lr)
-        return lr * warmup_factor
+        decay_progress = jnp.maximum(step - config.lr_warmup_steps, 0.0)
+        decay_progress = jnp.minimum(decay_progress / max(config.lr_cosine_steps, 1), 1.0)
+        cosine_factor = config.lr_min_ratio + (1.0 - config.lr_min_ratio) * 0.5 * (
+            1.0 + jnp.cos(jnp.pi * decay_progress)
+        )
+        return config.learning_rate * warmup_factor * cosine_factor
     
+    final_lr = config.learning_rate * config.lr_min_ratio
     print(
-        f"[LR] 阶梯式: peak={config.learning_rate:.1e}, "
-        f"drop×{config.lr_drop_factor} at steps {drop_steps}, "
+        f"[LR] 余弦退火: {config.learning_rate:.1e} → {final_lr:.1e}, "
+        f"周期={config.lr_cosine_steps}steps(≈{config.lr_cosine_steps // 266}轮), "
         f"warmup={config.lr_warmup_steps}steps"
     )
     optimizer = optax.chain(
