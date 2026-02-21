@@ -84,7 +84,7 @@ class Config:
     temperature_final: float = 0.1
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 总步数 400 步（200回合）判和
+    max_steps: int = 300              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
