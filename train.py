@@ -57,7 +57,7 @@ class Config:
     lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 3e-6
     max_grad_norm: float = 1.0
     training_batch_size: int = 2048 + 1024
-    td_lambda: float = 1.0  # 纯 MC：32 次模拟下网络 bootstrap 偏差 > 方差收益
+    td_lambda: float = 0.90  # 纯 MC：32 次模拟下网络 bootstrap 偏差 > 方差收益
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
