@@ -50,40 +50,37 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 3e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 1000       # 预热步数（~2-3 轮）
+    learning_rate: float = 1e-4       # AdamW 起始 LR
+    lr_warmup_steps: int = 2000       # 预热步数（~2-3 轮）
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈750 轮后到最低值
-    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 3e-6
+    lr_cosine_steps: int = 100000     # 余弦周期（opt steps），≈250 轮后到最低值
+    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-6
     max_grad_norm: float = 1.0
     training_batch_size: int = 2048 + 1024
-    # TD(λ) 动态退火：早期高 λ 信任 MC（网络差），后期低 λ 信任 bootstrap（网络强）
-    td_lambda_start: float = 0.99
-    td_lambda_end: float = 0.60
-    td_lambda_decay_iters: int = 150  # 衰减到最低值的迭代数
+    td_lambda: float = 0.95
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
-    selfplay_batch_size: int = 2048
+    selfplay_batch_size: int = 1024
     num_simulations: int = 32           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
-    replay_buffer_size: int = 4000000
+    replay_buffer_size: int = 8000000
     sample_reuse_times: int = 2
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
+    selfplay_gumbel_scale: float = 1.3     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.05         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
     temperature_phase1_steps: int = 20    # 0-20 半步（~10回合）: 开局全探索
     temperature_phase2_steps: int = 60    # 20-60 半步（~30回合）: 中局适度探索
     temperature_phase1: float = 1.0
-    temperature_phase2: float = 0.5
+    temperature_phase2: float = 0.3
     temperature_final: float = 0.1
     
     # 环境规则（符合象棋竞赛规则）
@@ -362,18 +359,16 @@ def selfplay(params, rng_key, batch_size):
     return data
 
 @jax.pmap
-def compute_targets(data: SelfplayOutput, td_lambda):
+def compute_targets(data: SelfplayOutput):
     """WDL TD(λ) 目标计算 - 在 [W, D, L] 三分量上独立做 TD(λ)
     
     与标量 TD(λ) 的区别：
     - bootstrap 用网络原始 WDL 概率（而非 MCTS 标量值）
     - 视角翻转用 W↔L 互换（而非标量取反）
     - 游戏结果直接映射为 one-hot WDL
-    
-    td_lambda: 每设备一个标量，由外部动态传入（避免闭包捕获导致重编译）
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
-    lam = td_lambda
+    lam = config.td_lambda
     
     # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
@@ -812,15 +807,9 @@ def restore_checkpoint(
 # 主循环
 # ============================================================================
 
-def get_td_lambda(iteration: int) -> float:
-    """动态 TD(λ) 退火：线性从 start 衰减到 end"""
-    progress = min(iteration / max(config.td_lambda_decay_iters, 1), 1.0)
-    return config.td_lambda_start + (config.td_lambda_end - config.td_lambda_start) * progress
-
-
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: 4分支GNN (Local+Row+Col+Global) + Gumbel + TD(λ退火) + 经验回放 + 断点续训")
+    print("特性: 4分支GNN (Local+Row+Col+Global) + Gumbel + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -856,10 +845,7 @@ def main():
         f"周期={config.lr_cosine_steps}steps(≈{config.lr_cosine_steps // 266}轮), "
         f"warmup={config.lr_warmup_steps}steps"
     )
-    print(
-        f"[TD(λ)] 线性退火: {config.td_lambda_start:.2f} → {config.td_lambda_end:.2f}, "
-        f"衰减周期={config.td_lambda_decay_iters}轮"
-    )
+    print(f"[TD(λ)] 固定 λ={config.td_lambda}")
     optimizer = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adamw(lr_schedule, weight_decay=config.weight_decay),
@@ -898,7 +884,7 @@ def main():
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
-        f"_td{config.td_lambda_start}-{config.td_lambda_end}_vw{config.value_loss_weight}"
+        f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
@@ -937,9 +923,7 @@ def main():
                 ) from e
             raise
 
-        current_td_lambda = get_td_lambda(iteration)
-        td_lambda_arr = replicate_to_devices(jnp.array(current_td_lambda, dtype=jnp.float32))
-        samples = compute_targets(data, td_lambda_arr)
+        samples = compute_targets(data)
         replay_buffer.add(samples)
         new_frames += samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
 
@@ -1041,7 +1025,7 @@ def main():
         buf_stats = replay_buffer.stats()
         
         print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
-              f"vloss={value_loss:.4f} λ={current_td_lambda:.3f} | "
+              f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         current_lr = float(lr_schedule(total_opt_steps))
@@ -1050,7 +1034,6 @@ def main():
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
         writer.add_scalar("train/lr", current_lr, iteration)
-        writer.add_scalar("train/td_lambda", current_td_lambda, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
@@ -1115,7 +1098,9 @@ def main():
                     raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
                 wr = (winners_r == 0).sum()
                 wb = (winners_b == 1).sum()
-                score = (wr + wb + 0.5 * (config.eval_games * 2 - wr - wb)) / (config.eval_games * 2)
+                dr = (winners_r == -1).sum()
+                db = (winners_b == -1).sum()
+                score = (wr + wb + 0.5 * (dr + db)) / (config.eval_games * 2)
                 elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
                 iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
                 print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
