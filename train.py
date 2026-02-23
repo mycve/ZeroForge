@@ -54,34 +54,34 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数（~2-3 轮）
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈250 轮后到最低值
-    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-6
+    lr_min_ratio: float = 0.04        # 最低 LR = peak × 0.01 = 1e-6
     max_grad_norm: float = 1.0
-    training_batch_size: int = 2048 + 1024
-    td_lambda: float = 0.95
+    training_batch_size: int = 2048
+    td_lambda: float = 0.99
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
-    selfplay_batch_size: int = 1024
-    num_simulations: int = 128           # 提升搜索深度，改善策略/value 目标质量
-    top_k: int = 8                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 24           # 提升搜索深度，改善策略/value 目标质量
+    top_k: int = 4                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
-    replay_buffer_size: int = 10000000
-    sample_reuse_times: int = 3
+    replay_buffer_size: int = 5000000
+    sample_reuse_times: int = 2
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 0.3
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.3     # 降低根节点随机性，减少训练目标抖动
+    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.05         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
     temperature_phase1_steps: int = 20    # 0-20 半步（~10回合）: 开局全探索
     temperature_phase2_steps: int = 60    # 20-60 半步（~30回合）: 中局适度探索
     temperature_phase1: float = 1.0
-    temperature_phase2: float = 0.3
-    temperature_final: float = 0.1
+    temperature_phase2: float = 0.7
+    temperature_final: float = 0.2
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
