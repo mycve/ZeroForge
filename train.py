@@ -417,6 +417,44 @@ def compute_targets(data: SelfplayOutput):
     )
 
 # ============================================================================
+# 自对弈统计（GPU 端计算，避免传输完整 data 到 CPU）
+# ============================================================================
+
+@jax.pmap
+def compute_selfplay_stats(data: SelfplayOutput):
+    """在 GPU 上计算自对弈统计标量，仅传回 ~100 字节而非 ~3GB 原始数据
+    
+    返回 (stats[12], avg_length) 均为 float32
+    """
+    term = data.terminated       # (max_steps, batch)
+    winner = data.winner
+    reasons = data.draw_reason
+    max_steps = term.shape[0]
+    
+    first_term = (jnp.cumsum(term, axis=0) == 1) & term
+    
+    stats = jnp.stack([
+        first_term.sum(),                            # 总对局数
+        (first_term & (winner == 0)).sum(),          # 红胜
+        (first_term & (winner == 1)).sum(),          # 黑胜
+        (first_term & (winner == -1)).sum(),         # 和棋
+        (first_term & (reasons == 1)).sum(),         # 步数到限
+        (first_term & (reasons == 2)).sum(),         # 无吃子到限
+        (first_term & (reasons == 3)).sum(),         # 重复局面和棋
+        (first_term & (reasons == 4)).sum(),         # 长将判负
+        (first_term & (reasons == 5)).sum(),         # 无进攻子力
+        (first_term & (reasons == 6)).sum(),         # 长捉判负
+        (first_term & (reasons == 7)).sum(),         # 将捉交替判负
+        (first_term & (reasons == 8)).sum(),         # 将死/困毙
+    ]).astype(jnp.float32)
+    
+    step_idx = jnp.arange(max_steps)[:, None]
+    game_lengths = jnp.where(term, step_idx, max_steps).astype(jnp.float32)
+    avg_length = jnp.mean(jnp.min(game_lengths, axis=0))
+    
+    return stats, avg_length
+
+# ============================================================================
 # 训练与评估
 # ============================================================================
 
@@ -902,8 +940,6 @@ def main():
         st = time.time()
 
         # 自对弈（每轮单次调用，批大小由 selfplay_batch_size 决定）
-        new_frames = 0
-
         rng_key, sk_selfplay = jax.random.split(rng_key)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
@@ -923,41 +959,24 @@ def main():
                 ) from e
             raise
 
+        # GPU 上并行计算：TD(λ) 目标 + 统计标量（两个 pmap 共享 data，XLA 自动调度）
         samples = compute_targets(data)
+        gpu_stats = compute_selfplay_stats(data)
+        
+        # data 的 GPU 引用在此之后可被释放，提前回收 ~3GB 显存给训练用
+        del data
+        
         replay_buffer.add(samples)
-        new_frames += samples.obs.reshape(-1, *samples.obs.shape[3:]).shape[0]
+        new_frames = config.max_steps * config.selfplay_batch_size
 
-        # 只取统计信息到 CPU
-        data_np = jax.device_get(data)
-        term = data_np.terminated
-        winner = data_np.winner
-        reasons = data_np.draw_reason
-
-        # 结束原因编码：
-        # 0=未结束, 1=步数到限, 2=无吃子到限, 3=重复局面和棋,
-        # 4=长将判负, 5=无进攻子力, 6=长捉判负, 7=将捉交替判负, 8=将死/困毙
-        first_term = (np.cumsum(term, axis=1) == 1) & term
-        stats = np.array([
-            first_term.sum(),                    # 总对局数
-            (first_term & (winner == 0)).sum(),  # 红胜
-            (first_term & (winner == 1)).sum(),  # 黑胜
-            (first_term & (winner == -1)).sum(), # 和棋
-            (first_term & (reasons == 1)).sum(), # 步数到限
-            (first_term & (reasons == 2)).sum(), # 无吃子到限
-            (first_term & (reasons == 3)).sum(), # 重复局面和棋
-            (first_term & (reasons == 4)).sum(), # 长将判负
-            (first_term & (reasons == 5)).sum(), # 无进攻子力
-            (first_term & (reasons == 6)).sum(), # 长捉判负
-            (first_term & (reasons == 7)).sum(), # 将捉交替判负
-            (first_term & (reasons == 8)).sum(), # 将死/困毙
-        ], dtype=np.int64)
-
-        game_lengths = np.where(term, np.arange(config.max_steps)[None, :, None], config.max_steps)
-        final_lengths = np.min(game_lengths, axis=1)
+        # 只传输统计标量（~100 字节），不再传输完整 data（~3GB）
+        stats_dev, avg_len_dev = gpu_stats
+        stats_np = np.array(jax.device_get(stats_dev))
+        stats = stats_np.sum(axis=0).astype(np.int64)   # 跨设备求和
+        avg_length = float(jax.device_get(avg_len_dev).mean())
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
-        avg_length = float(np.mean(final_lengths))
         
         # --- 将新样本添加到经验回放缓冲区 ---
         frames += new_frames
@@ -966,26 +985,29 @@ def main():
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
-        # 优化：减少训练循环中的同步点
         # 预生成所有采样 key
         sample_keys = jax.random.split(rng_key, num_updates + 1)
         rng_key = sample_keys[0]
         
-        # 批量训练：采样 → 训练 → 累积损失，最后一次性同步
-        ploss_acc, vloss_acc = None, None
-        
-        for i in range(num_updates):
-            sk_sample = sample_keys[i+1]
-            batch_flat = replay_buffer.sample(config.training_batch_size, sk_sample)
+        def _prefetch_batch(key_idx):
+            """CPU 采样 + 异步传输到 GPU（双缓冲预读取）"""
+            batch_flat = replay_buffer.sample(config.training_batch_size, sample_keys[key_idx])
             batch = _shard_batch_for_devices(batch_flat)
-            
-            # 分发训练 Key 到各设备
-            train_key = sample_keys[i+1]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
-                train_keys = jax.device_put_sharded(list(jax.random.split(train_key, num_devices)), devices)
+                keys = jax.device_put_sharded(
+                    list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
+            return batch, keys
+        
+        # 双缓冲流水线：预读取第一个 batch，后续 batch 在 GPU 训练期间并行准备
+        ploss_acc, vloss_acc = None, None
+        next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
+        
+        for i in range(num_updates):
+            batch, train_keys = next_batch, next_keys
             
             try:
+                # 分派 GPU 训练（异步返回，不阻塞 Python）
                 params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             except jax.errors.JaxRuntimeError as e:
                 msg = str(e).lower()
@@ -997,6 +1019,10 @@ def main():
                         f"selfplay_batch_size({config.selfplay_batch_size})."
                     ) from e
                 raise
+            
+            # GPU 训练期间，CPU 立即准备下一个 batch（流水线核心）
+            if i + 1 < num_updates:
+                next_batch, next_keys = _prefetch_batch(i + 2)
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
