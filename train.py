@@ -62,7 +62,7 @@ class Config:
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 1024
-    num_simulations: int = 128           # 提升搜索深度，改善策略/value 目标质量
+    num_simulations: int = 16           # 提升搜索深度，改善策略/value 目标质量
     top_k: int = 64                        # 根节点候选数，象棋好棋通常 3-8 步，8 足够覆盖
     
     # 经验回放配置
