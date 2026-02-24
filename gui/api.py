@@ -518,19 +518,25 @@ def get_ai_action(
     if state.current_player == 1:
         search_value = -search_value
     
-    weights = np.array(policy_output.action_weights[0])
+    # action_weights 是 softmax(logits + completed_q)，因 Q-value 缩放因子
+    # 随访问次数增长（(50+maxvisit)*0.25），导致分布极度集中于最优动作。
+    # 改用 visit_probs（访问次数归一化）作为展示权重，更有分析价值。
+    summary = policy_output.search_tree.summary()
+    visit_probs = np.array(summary.visit_probs[0])
+    improved_policy = np.array(policy_output.action_weights[0])
     
-    # 始终选择最大概率走法（贪婪策略）
-    action = int(np.argmax(weights))
+    # 选择动作仍使用 improved_policy（最强走法）
+    action = int(np.argmax(improved_policy))
     
     # 构建策略分布信息
     policy_info = None
     if return_policy:
-        # 获取Top-K候选着法
-        top_indices = np.argsort(weights)[::-1][:min(10, len(legal_actions))]  # 返回Top10
+        # 按访问次数排序，更直观地展示搜索关注度
+        visit_counts = np.array(summary.visit_counts[0])
+        top_indices = np.argsort(visit_probs)[::-1][:min(10, len(legal_actions))]
         top_moves = []
         for idx in top_indices:
-            if weights[idx] > 1e-6:  # 过滤权重太小的
+            if visit_probs[idx] > 1e-6:
                 fs, ts = action_to_move(int(idx))
                 fs, ts = int(fs), int(ts)
                 fr, fc = fs // 9, fs % 9
@@ -538,8 +544,10 @@ def get_ai_action(
                 top_moves.append({
                     "action": int(idx),
                     "uci": move_to_uci(fs, ts),
-                    "weight": float(weights[idx]),
+                    "weight": float(visit_probs[idx]),
+                    "visits": int(visit_counts[idx]),
                     "prior": float(prior_probs[idx]),
+                    "improved": float(improved_policy[idx]),
                     "from": [fr, fc],
                     "to": [tr, tc],
                 })

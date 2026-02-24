@@ -196,21 +196,30 @@
                                     </div>
                                     <button @click="policyInfo = null" class="text-blue-600 hover:text-blue-800 text-xs">✕</button>
                                 </div>
+                                <!-- 表头 -->
+                                <div class="flex items-center text-xs text-gray-500 mb-0.5 px-0.5">
+                                    <span class="w-14">着法</span>
+                                    <span class="flex-1 text-center">搜索占比</span>
+                                    <span class="w-10 text-right">访问</span>
+                                    <span class="w-12 text-right">先验</span>
+                                </div>
                                 <div class="space-y-0.5">
                                     <div v-for="(move, idx) in policyInfo.top_moves.slice(0, 8)" :key="idx"
-                                         class="flex justify-between items-center text-xs">
-                                        <span class="font-mono" :class="idx === 0 ? 'font-bold text-blue-700' : 'text-gray-700'">
+                                         class="flex items-center text-xs px-0.5">
+                                        <span class="w-14 font-mono" :class="idx === 0 ? 'font-bold text-blue-700' : 'text-gray-700'">
                                             {{ idx + 1 }}. {{ move.uci }}
                                         </span>
-                                        <div class="flex items-center gap-2">
-                                            <div class="w-16 h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                                        <div class="flex-1 flex items-center gap-1">
+                                            <div class="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden">
                                                 <div class="h-full bg-blue-500 rounded-full" 
                                                      :style="{width: (move.weight * 100) + '%'}"></div>
                                             </div>
-                                            <span class="w-12 text-right" :class="idx === 0 ? 'font-bold text-blue-700' : 'text-gray-600'">
+                                            <span class="w-10 text-right" :class="idx === 0 ? 'font-bold text-blue-700' : 'text-gray-600'">
                                                 {{ (move.weight * 100).toFixed(1) }}%
                                             </span>
                                         </div>
+                                        <span class="w-10 text-right text-gray-500">{{ move.visits != null ? move.visits : '-' }}</span>
+                                        <span class="w-12 text-right text-gray-400">{{ (move.prior * 100).toFixed(1) }}%</span>
                                     </div>
                                 </div>
                             </div>
