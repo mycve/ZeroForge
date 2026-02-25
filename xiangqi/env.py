@@ -20,8 +20,7 @@ from xiangqi.actions import (
 )
 from xiangqi.rules import (
     get_initial_board, apply_move, is_legal_move, is_game_over,
-    is_game_over_with_mask, get_legal_moves_mask, get_basic_valid_mask,
-    is_in_check, get_piece_type,
+    is_game_over_with_mask, get_legal_moves_mask, is_in_check, get_piece_type,
 )
 from xiangqi.violation_rules import (
     is_chase_move, count_checking_pieces, check_violation,
@@ -581,15 +580,10 @@ class XiangqiEnv:
     
     @partial(jax.jit, static_argnums=(0,))
     def step_for_search(self, state: XiangqiState, action: jnp.ndarray) -> XiangqiState:
-        """MCTS 搜索专用极致轻量级 step
+        """MCTS 搜索专用轻量级 step
 
-        跳过: 违规检测、Zobrist哈希、重复局面、无吃子计数、送将检测(is_in_check_at)
-        保留: 走子 + 历史更新(observe需要) + 几何合法掩码 + 简化终局 + 奖励
-
-        关键优化: 使用 get_basic_valid_mask 替代 get_legal_moves_mask，
-        跳过 is_in_check_at 送将检测（占原 get_legal_moves_mask ~60% 耗时）。
-        MCTS 搜索树中少量送将走法（~5-10%）会保留在掩码中，
-        但搜索会通过价值回传自动惩罚。根节点仍使用精确掩码。
+        跳过: 违规检测(长将/长捉)、Zobrist哈希、重复局面、无吃子计数
+        保留: 走子 + 历史更新(observe需要) + 精确合法走法 + 终局判断 + 奖励
         """
         def _do_step() -> XiangqiState:
             from_sq, to_sq = action_to_move(action)
@@ -603,22 +597,10 @@ class XiangqiEnv:
             new_player = 1 - state.current_player
             new_step_count = state.step_count + 1
 
-            # 近似合法掩码：只做几何过滤，跳过送将检测
-            new_legal_mask = get_basic_valid_mask(new_board, new_player)
+            new_legal_mask = get_legal_moves_mask(new_board, new_player)
 
-            # 简化终局判断：将帅被吃 + 无几何可走棋 + 步数超限
-            red_king_exists = jnp.any(new_board == R_KING)
-            black_king_exists = jnp.any(new_board == B_KING)
-            red_wins = ~black_king_exists
-            black_wins = ~red_king_exists
-            has_moves = jnp.any(new_legal_mask)
-            no_moves = ~has_moves
-            basic_game_over = red_wins | black_wins | no_moves
-            basic_winner = jnp.where(
-                red_wins, 0,
-                jnp.where(black_wins, 1,
-                          jnp.where(no_moves, 1 - new_player, -1))
-            )
+            basic_game_over, basic_winner = is_game_over_with_mask(
+                new_board, new_player, new_legal_mask)
 
             is_max_steps = new_step_count >= self.max_steps
             game_over = basic_game_over | is_max_steps
@@ -654,7 +636,7 @@ class XiangqiEnv:
             )
 
         return jax.lax.cond(state.terminated, lambda: state, _do_step)
-    
+
     @partial(jax.jit, static_argnums=(0,))
     def observe(self, state: XiangqiState) -> jnp.ndarray:
         """
