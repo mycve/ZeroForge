@@ -82,9 +82,13 @@ class GraphBlock(nn.Module):
     - local: 8 方向邻居，捕捉相邻格交互（马腿、象眼、兵的攻击范围）
     - row: 同行 9 节点分组注意力，捕捉行方向交互（车/炮横向攻击）
     - col: 同列 10 节点分组注意力，捕捉列方向交互（车/炮纵向攻击）
-    - global: 90 节点全局注意力，捕捉长距离战术关联
+    - global: 90 节点全局注意力，捕捉长距离战术关联（可选）
+
+    use_global=False 时跳过 global 分支，节省 ~12% FLOPs/block。
+    gate 使用 sigmoid（各分支独立控制），避免 softmax 导致的分支坍缩。
     """
     hidden_dim: int
+    use_global: bool = True
     num_rows: int = BOARD_HEIGHT   # 10
     num_cols: int = BOARD_WIDTH    # 9
     mlp_ratio: float = 2.0
@@ -105,7 +109,6 @@ class GraphBlock(nn.Module):
         D = self.hidden_dim
         scale = 1.0 / math.sqrt(float(D))
 
-        # 共享 Q/K/V 投影
         x = nn.LayerNorm(dtype=self.dtype, name="ln_attn")(h)
         q = nn.Dense(D, use_bias=False, dtype=self.dtype, name="q_proj")(x)
         k = nn.Dense(D, use_bias=False, dtype=self.dtype, name="k_proj")(x)
@@ -131,7 +134,7 @@ class GraphBlock(nn.Module):
         local_agg = jnp.sum(local_attn[..., None] * (v_neigh + dir_embed), axis=2)
         local_out = nn.Dense(D, dtype=self.dtype, name="local_out")(local_agg)
 
-        # ── Branch 2: Row grouped attention (10 行 × 9 节点) ──
+        # ── Branch 2: Row grouped attention (10 行 x 9 节点) ──
         qr = q.reshape(B, self.num_rows, self.num_cols, D)
         kr = k.reshape(B, self.num_rows, self.num_cols, D)
         vr = v.reshape(B, self.num_rows, self.num_cols, D)
@@ -140,7 +143,7 @@ class GraphBlock(nn.Module):
         row_agg = jnp.einsum("brnm,brmd->brnd", row_attn, vr).reshape(B, -1, D)
         row_out = nn.Dense(D, dtype=self.dtype, name="row_out")(row_agg)
 
-        # ── Branch 3: Col grouped attention (9 列 × 10 节点) ──
+        # ── Branch 3: Col grouped attention (9 列 x 10 节点) ──
         qc = q.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
         kc = k.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
         vc = v.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
@@ -150,16 +153,22 @@ class GraphBlock(nn.Module):
         col_agg = col_agg.transpose(0, 2, 1, 3).reshape(B, -1, D)
         col_out = nn.Dense(D, dtype=self.dtype, name="col_out")(col_agg)
 
-        # ── Branch 4: Global attention (90 × 90) ──
-        global_scores = jnp.einsum("bnd,bmd->bnm", q, k) * scale
-        global_attn = nn.softmax(global_scores, axis=-1)
-        global_agg = jnp.einsum("bnm,bmd->bnd", global_attn, v)
-        global_out = nn.Dense(D, dtype=self.dtype, name="global_out")(global_agg)
+        # ── Branch 4: Global attention (90 x 90, 可选) ──
+        if self.use_global:
+            global_scores = jnp.einsum("bnd,bmd->bnm", q, k) * scale
+            global_attn = nn.softmax(global_scores, axis=-1)
+            global_agg = jnp.einsum("bnm,bmd->bnd", global_attn, v)
+            global_out = nn.Dense(D, dtype=self.dtype, name="global_out")(global_agg)
 
-        # ── Gated mix ──
-        branches = jnp.stack([local_out, row_out, col_out, global_out], axis=2)  # (B,N,4,D)
-        gate_logits = nn.Dense(4, dtype=self.dtype, name="rel_gate")(x)
-        gates = nn.softmax(gate_logits, axis=-1)
+            branches = jnp.stack([local_out, row_out, col_out, global_out], axis=2)
+            num_branches = 4
+        else:
+            branches = jnp.stack([local_out, row_out, col_out], axis=2)
+            num_branches = 3
+
+        # ── Gated mix (sigmoid: 各分支独立控制，防止坍缩) ──
+        gate_logits = nn.Dense(num_branches, dtype=self.dtype, name="rel_gate")(x)
+        gates = nn.sigmoid(gate_logits)
         agg = jnp.sum(branches * gates[..., None], axis=2)
         agg = nn.Dense(D, dtype=self.dtype, name="mix_out")(agg)
 
@@ -289,9 +298,24 @@ class AlphaZeroNetwork(nn.Module):
             )
 
         x = x.astype(self.dtype)
-        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
+        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC, (B, H, W, 126)
         batch_size = x.shape[0]
         num_nodes = BOARD_HEIGHT * BOARD_WIDTH
+
+        # 历史帧时间权重：9 帧各一个可学习标量，初始化为指数衰减
+        # 帧顺序: [当前, t-1, t-2, ..., t-8]，越近权重越大
+        num_frames = 9
+        channels_per_frame = 14
+        frame_weight_raw = self.param(
+            "frame_time_weight",
+            lambda key, shape: jnp.linspace(0.0, -1.5, num_frames),
+            (num_frames,),
+        )
+        # softplus 保证正值，初始约 [1.0, 0.88, ..., 0.24]
+        frame_weight = nn.softplus(frame_weight_raw)
+        # 展开到 126 维: 每帧 14 通道共享同一个权重
+        channel_weight = jnp.repeat(frame_weight, channels_per_frame)  # (126,)
+        x = x * channel_weight[None, None, None, :]  # (B, H, W, 126)
 
         h = x.reshape((batch_size, num_nodes, x.shape[-1]))
         h = nn.Dense(self.channels, dtype=self.dtype)(h)
@@ -304,8 +328,13 @@ class AlphaZeroNetwork(nn.Module):
         h = h + pos_embed[None, :, :]
         h = nn.silu(h)
 
-        for _ in range(self.num_blocks):
-            h = GraphBlock(hidden_dim=self.channels, dtype=self.dtype)(
+        half = self.num_blocks // 2
+        for i in range(self.num_blocks):
+            h = GraphBlock(
+                hidden_dim=self.channels,
+                use_global=(i >= half),
+                dtype=self.dtype,
+            )(
                 h,
                 self.neighbor_idx,
                 self.neighbor_mask,

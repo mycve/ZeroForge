@@ -56,13 +56,13 @@ class Config:
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈700 轮后到最低值
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     max_grad_norm: float = 1.0
-    training_batch_size: int = 3072
+    training_batch_size: int = 4096
     td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 1024
-    num_simulations: int = 40           # 42 sim 已足够产出强策略目标（实测可胜 Pikafish depth 5）
+    num_simulations: int = 42           # 42 sim 已足够产出强策略目标（实测可胜 Pikafish depth 5）
     top_k: int = 8                      # 根节点候选数
     
     # 经验回放配置
@@ -461,7 +461,7 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = samples.policy_tgt
     
     # 随机镜像增强
-    do_mirror = jax.random.bernoulli(rng_key, 0.5)
+    do_mirror = jax.random.bernoulli(rng_key, 0.3)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
