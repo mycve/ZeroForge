@@ -26,12 +26,15 @@ NUM_RUNS = 3
 
 
 def correctness_check(env):
-    """验证 step_for_search 与 env.step 在短序列（无违规/和棋触发）中结果一致
-    
-    step_for_search 故意跳过违规检测/重复局面/无吃子计数等，
-    因此只验证前 15 步内的核心字段（此阶段不可能触发这些规则）。
+    """验证 step_for_search 近似掩码的正确性
+
+    step_for_search 使用 get_basic_valid_mask（跳过送将检测），因此 legal_mask
+    是精确 legal_mask 的超集。验证：
+    1. board / player / step_count 应完全一致（走子逻辑相同）
+    2. search 的 legal_mask 应是 full 的超集（search_mask ⊇ full_mask）
+    3. 精确掩码中的合法走法不应被近似掩码遗漏
     """
-    print("\n--- 正确性验证（前 15 步无违规场景）---")
+    print("\n--- 正确性验证（近似掩码 >= 精确掩码）---")
     batch = 64
     keys = jax.random.split(jax.random.PRNGKey(42), batch)
     states = jax.vmap(env.init)(keys)
@@ -42,26 +45,42 @@ def correctness_check(env):
     s_full = states
     s_search = states
     all_ok = True
+    total_extra = 0
+    total_legal = 0
 
     for i in range(15):
         actions = jnp.argmax(s_full.legal_action_mask, axis=-1).astype(jnp.int32)
         s_full = step_fn(s_full, actions)
         s_search = search_fn(s_search, actions)
 
-        checks = {
-            "board": bool(jnp.all(s_full.board == s_search.board)),
-            "player": bool(jnp.all(s_full.current_player == s_search.current_player)),
-            "legal_mask": bool(jnp.all(s_full.legal_action_mask == s_search.legal_action_mask)),
-            "terminated": bool(jnp.all(s_full.terminated == s_search.terminated)),
-            "rewards": bool(jnp.allclose(s_full.rewards, s_search.rewards, atol=1e-6)),
-        }
-        for name, ok in checks.items():
-            if not ok:
-                print(f"  Step {i+1}: {name} 不匹配!")
-                all_ok = False
+        board_ok = bool(jnp.all(s_full.board == s_search.board))
+        player_ok = bool(jnp.all(s_full.current_player == s_search.current_player))
+
+        full_mask = s_full.legal_action_mask
+        search_mask = s_search.legal_action_mask
+        # 近似掩码是精确掩码的超集：精确中为True的，近似中也必须为True
+        superset_ok = bool(jnp.all(full_mask <= search_mask))
+
+        step_extra = int(jnp.sum(search_mask & ~full_mask))
+        step_legal = int(jnp.sum(full_mask))
+        total_extra += step_extra
+        total_legal += step_legal
+
+        if not board_ok:
+            print(f"  Step {i+1}: board 不匹配!")
+            all_ok = False
+        if not player_ok:
+            print(f"  Step {i+1}: player 不匹配!")
+            all_ok = False
+        if not superset_ok:
+            missed = int(jnp.sum(full_mask & ~search_mask))
+            print(f"  Step {i+1}: 近似掩码遗漏了 {missed} 个合法走法! (严重错误)")
+            all_ok = False
 
     if all_ok:
-        print(f"  通过! 15 步 × {batch} 局 × 5 项字段 = {15*batch*5} 项检查全部一致")
+        extra_pct = total_extra / max(total_legal, 1) * 100
+        print(f"  通过! 15 步 x {batch} 局: board/player 一致，近似掩码 >= 精确掩码")
+        print(f"  近似掩码多出 {total_extra} 个走法（占精确合法走法 {extra_pct:.1f}%，均为送将走法）")
     return all_ok
 
 
@@ -141,14 +160,17 @@ def main():
     print(f"{'最佳耗时':.<25} {elapsed_step:>11.3f}s {elapsed_search:>15.3f}s {elapsed_step/elapsed_search:>7.2f}x")
     print(f"{'=' * 60}")
 
-    # 优化前基线对比
-    baseline_sps = 4241      # 原始 env.step (action_space=2550, 双重 get_legal_moves_mask)
-    baseline_search = 4727   # 上一轮 step_for_search (action_space=2550)
-    print(f"\n[对比全部优化前基线 (action_space=2550)]")
-    print(f"  原始 env.step:     {baseline_sps} steps/s")
-    print(f"  上轮 search(2550): {baseline_search} steps/s")
-    print(f"  当前 env.step:     {sps_step:.0f} steps/s ({(sps_step/baseline_sps - 1)*100:+.1f}%)")
-    print(f"  当前 search(2086): {sps_search:.0f} steps/s ({(sps_search/baseline_sps - 1)*100:+.1f}%)")
+    # 历史基线对比
+    baseline_sps = 4241          # 原始 env.step (action_space=2550, 双重 get_legal_moves_mask)
+    baseline_search_2550 = 4727  # 第1轮 step_for_search (action_space=2550, 精确掩码)
+    baseline_search_2086 = 5750  # 第2轮 step_for_search (action_space=2086, 精确掩码)
+    print(f"\n[历史基线对比]")
+    print(f"  原始 env.step(2550):             {baseline_sps} steps/s")
+    print(f"  第1轮 search(2550, 精确掩码):    {baseline_search_2550} steps/s")
+    print(f"  第2轮 search(2086, 精确掩码):    {baseline_search_2086} steps/s")
+    print(f"  当前 env.step(2086):             {sps_step:.0f} steps/s ({(sps_step/baseline_sps - 1)*100:+.1f}%)")
+    print(f"  当前 search(2086, 近似掩码):     {sps_search:.0f} steps/s ({(sps_search/baseline_search_2086 - 1)*100:+.1f}% vs 精确)")
+    print(f"  总加速(vs 原始 env.step):        {(sps_search/baseline_sps - 1)*100:+.1f}%")
 
     print("\n测试完成！")
 

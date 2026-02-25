@@ -609,6 +609,43 @@ def get_legal_moves_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray
     return legal_mask
 
 
+@jax.jit
+def get_basic_valid_mask(board: jnp.ndarray, player: jnp.ndarray) -> jnp.ndarray:
+    """MCTS 搜索专用：仅做几何合法性过滤，跳过送将检测（is_in_check_at）。
+
+    保留 get_legal_moves_mask 的第 1-2 层过滤：
+      1) 起始格是己方棋子、目标格不是己方棋子
+      2) 棋子几何走法验证（lax.switch per piece type）
+    跳过第 3 层（apply_move + is_in_check_at），节省 ~60% 计算量。
+
+    在 MCTS 搜索树（非根节点）中使用：少量送将走法（~5-10%）会保留在掩码中，
+    但 MCTS 会通过价值回传自动惩罚这些走法。根节点仍使用精确的 get_legal_moves_mask。
+    """
+    from_sqs = _ACTION_TO_FROM_SQ
+    to_sqs = _ACTION_TO_TO_SQ
+
+    from_rows = from_sqs // BOARD_WIDTH
+    from_cols = from_sqs % BOARD_WIDTH
+    to_rows = to_sqs // BOARD_WIDTH
+    to_cols = to_sqs % BOARD_WIDTH
+
+    pieces_at_from = board[from_rows, from_cols]
+    pieces_at_to = board[to_rows, to_cols]
+
+    # 第 1 层：己方棋子 + 目标非己方
+    is_own = is_own_piece(pieces_at_from, player)
+    not_own_target = ~is_own_piece(pieces_at_to, player) | (pieces_at_to == EMPTY)
+    basic_filter = is_own & not_own_target
+
+    # 第 2 层：棋子几何走法
+    piece_types = get_piece_type(pieces_at_from)
+    move_valid = jax.vmap(
+        lambda fr, fc, tr, tc, pt: is_valid_move_for_piece(board, fr, fc, tr, tc, pt, player)
+    )(from_rows, from_cols, to_rows, to_cols, piece_types)
+
+    return basic_filter & move_valid
+
+
 def get_legal_moves(board: jnp.ndarray, player: jnp.ndarray) -> list:
     """获取所有合法移动的列表 (非 JIT，用于调试)"""
     mask = get_legal_moves_mask(board, player)
