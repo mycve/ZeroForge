@@ -579,65 +579,6 @@ class XiangqiEnv:
         return jax.lax.cond(state.terminated, lambda: state, _do_step)
     
     @partial(jax.jit, static_argnums=(0,))
-    def step_for_search(self, state: XiangqiState, action: jnp.ndarray) -> XiangqiState:
-        """MCTS 搜索专用轻量级 step
-
-        跳过: 违规检测(长将/长捉)、Zobrist哈希、重复局面、无吃子计数
-        保留: 走子 + 历史更新(observe需要) + 精确合法走法 + 终局判断 + 奖励
-        """
-        def _do_step() -> XiangqiState:
-            from_sq, to_sq = action_to_move(action)
-
-            new_history = jnp.concatenate([
-                state.board[jnp.newaxis, :, :],
-                state.history[:-1, :, :]
-            ], axis=0)
-
-            new_board = apply_move(state.board, from_sq, to_sq)
-            new_player = 1 - state.current_player
-            new_step_count = state.step_count + 1
-
-            new_legal_mask = get_legal_moves_mask(new_board, new_player)
-
-            basic_game_over, basic_winner = is_game_over_with_mask(
-                new_board, new_player, new_legal_mask)
-
-            is_max_steps = new_step_count >= self.max_steps
-            game_over = basic_game_over | is_max_steps
-            winner = jnp.where(basic_game_over, basic_winner, -1)
-
-            terminal_reward = jnp.where(
-                game_over,
-                jnp.where(
-                    winner == -1, jnp.zeros(2),
-                    jnp.where(winner == 0,
-                              jnp.array([1.0, -1.0]),
-                              jnp.array([-1.0, 1.0]))
-                ),
-                jnp.zeros(2)
-            )
-
-            new_legal_mask = jnp.where(
-                game_over,
-                jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
-                new_legal_mask
-            )
-
-            return state.replace(
-                board=new_board,
-                history=new_history,
-                current_player=new_player,
-                legal_action_mask=new_legal_mask,
-                rewards=terminal_reward,
-                terminated=game_over,
-                step_count=new_step_count,
-                winner=winner,
-                draw_reason=jnp.int32(0),
-            )
-
-        return jax.lax.cond(state.terminated, lambda: state, _do_step)
-
-    @partial(jax.jit, static_argnums=(0,))
     def observe(self, state: XiangqiState) -> jnp.ndarray:
         """
         将状态转换为观察张量 (视角归一化)

@@ -50,29 +50,28 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 1e-4       # AdamW 起始 LR
+    learning_rate: float = 3e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 2000       # 预热步数（~2-3 轮）
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈700 轮后到最低值
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     max_grad_norm: float = 1.0
     training_batch_size: int = 4096
-    td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.90          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
-    # selfplay_batch_size 是“每轮总对局并行量”（当前实现为单次自对弈调用的并行量）
     selfplay_batch_size: int = 1024
     num_simulations: int = 42           # 42 sim 已足够产出强策略目标（实测可胜 Pikafish depth 5）
     top_k: int = 8                      # 根节点候选数
     
     # 经验回放配置
-    replay_buffer_size: int = 8000000
-    sample_reuse_times: int = 2
+    replay_buffer_size: int = 10000000
+    sample_reuse_times: int = 5
     
     # 损失权重
-    value_loss_weight: float = 0.3
+    value_loss_weight: float = 1.2
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.20   # 放大 Q 值差异，提升高收益分支被选概率
+    qtransform_value_scale: float = 0.50   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.05         # 评估关闭 Gumbel 噪声，结果更稳定
     
@@ -217,9 +216,9 @@ def eval_forward(params, obs):
 
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数（使用轻量级 step_for_search 加速搜索）"""
+    """MCTS 递归函数（瓶颈在 forward 推理 ~85%+，env.step 占比极小）"""
     prev_player = state.current_player
-    state = jax.vmap(env.step_for_search)(state, action)
+    state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
     logits, value, _ = forward(params, obs)
     
@@ -461,7 +460,7 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = samples.policy_tgt
     
     # 随机镜像增强
-    do_mirror = jax.random.bernoulli(rng_key, 0.3)
+    do_mirror = jax.random.bernoulli(rng_key, 0.6)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
     
@@ -493,9 +492,8 @@ def evaluate(params_red, params_black, rng_key):
     batch_size = config.eval_games // num_devices
     
     def recurrent_fn_eval(params, rng_key, action, state):
-        """评估递归函数：使用轻量级 step_for_search 加速搜索。"""
         prev_player = state.current_player
-        state = jax.vmap(env.step_for_search)(state, action)
+        state = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(state)
         logits, value = eval_forward(params, obs)
         
