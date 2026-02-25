@@ -639,6 +639,7 @@
                     aiLoaded.value = data.ai_loaded;
                     uciReady.value = data.uci_ready;
                     fen.value = data.fen;
+                    fenInput.value = data.fen;
                     canUndo.value = data.can_undo || false;
                     canForward.value = data.can_forward || false;
                     atLatest.value = data.at_latest !== false;  // 默认true
@@ -889,9 +890,25 @@
                 await newGame();
             };
             
-            const copyFen = () => {
-                navigator.clipboard.writeText(fen.value);
-                showMessage('FEN 已复制');
+            const copyFen = async () => {
+                const text = fen.value;
+                try {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        await navigator.clipboard.writeText(text);
+                    } else {
+                        // 非安全上下文回退：用隐藏 textarea + execCommand
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.style.cssText = 'position:fixed;left:-9999px';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(ta);
+                    }
+                    showMessage('FEN 已复制');
+                } catch (e) {
+                    showMessage('复制失败: ' + e.message, 'error');
+                }
             };
             
             const refreshCheckpoints = async () => {
