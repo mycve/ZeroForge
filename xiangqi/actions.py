@@ -7,7 +7,7 @@
 - 每个位置的可能移动方向根据棋子类型不同而不同
 - 使用 from-to 编码，但只保留实际可能的移动
 
-总动作数: 2550 (几何可达动作总数)
+总动作数: 2086 (几何可达动作总数)
 """
 
 from __future__ import annotations
@@ -78,55 +78,68 @@ PIECE_SYMBOLS = {
 # 为了简化，我们使用 from_square * NUM_DIRECTIONS + direction 的编码方式
 # 但只保留实际可能的动作
 
+# 士的合法位置：红方5个宫格交叉点 + 黑方5个（左右/旋转对称，保证镜像闭合）
+_VALID_ADVISOR_POSITIONS = frozenset([
+    (0, 3), (0, 5), (1, 4), (2, 3), (2, 5),
+    (7, 3), (7, 5), (8, 4), (9, 3), (9, 5),
+])
+
+# 象的合法位置：红方7个田字格点 + 黑方7个（左右/旋转对称，保证镜像闭合）
+_VALID_BISHOP_POSITIONS = frozenset([
+    (0, 2), (0, 6), (2, 0), (2, 4), (2, 8), (4, 2), (4, 6),
+    (5, 2), (5, 6), (7, 0), (7, 4), (7, 8), (9, 2), (9, 6),
+])
+
+
 # 预计算所有合法动作
 def _generate_all_possible_moves():
-    """生成所有可能的移动（不考虑具体棋子，只考虑几何上可能的移动）"""
+    """生成所有可能的移动（几何可达 + 棋子位置约束）
+    
+    优化：士(斜1)和象(田字)走法只保留合法位置间的移动，
+    其余位置这两种走法永远不可能合法（士不出宫、象不离田字格）。
+    直线和马的走法不受影响（车/炮可在任意位置）。
+    2550 → 2086（减少 18.2%）
+    """
     moves = []
     
     for from_sq in range(NUM_SQUARES):
         from_row, from_col = from_sq // BOARD_WIDTH, from_sq % BOARD_WIDTH
         
-        # 直线移动 (车/炮/将/兵)
+        # 直线移动 (车/炮/将/兵) — 不过滤，车/炮可在任意位置
         for delta in range(1, 10):
-            # 上
             to_row, to_col = from_row + delta, from_col
             if 0 <= to_row < BOARD_HEIGHT:
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
-            # 下
             to_row, to_col = from_row - delta, from_col
             if 0 <= to_row < BOARD_HEIGHT:
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
-            # 左
             to_row, to_col = from_row, from_col - delta
             if 0 <= to_col < BOARD_WIDTH:
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
-            # 右
             to_row, to_col = from_row, from_col + delta
             if 0 <= to_col < BOARD_WIDTH:
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
         
-        # 马的移动 (日字)
-        knight_deltas = [
-            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
-            (1, -2), (1, 2), (2, -1), (2, 1)
-        ]
-        for dr, dc in knight_deltas:
+        # 马的移动 (日字) — 不过滤，马可在任意位置
+        for dr, dc in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)]:
             to_row, to_col = from_row + dr, from_col + dc
             if 0 <= to_row < BOARD_HEIGHT and 0 <= to_col < BOARD_WIDTH:
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
         
-        # 象的移动 (田字)
-        bishop_deltas = [(-2, -2), (-2, 2), (2, -2), (2, 2)]
-        for dr, dc in bishop_deltas:
+        # 象的移动 (田字) — 只保留合法象位之间的走法
+        for dr, dc in [(-2,-2),(-2,2),(2,-2),(2,2)]:
             to_row, to_col = from_row + dr, from_col + dc
-            if 0 <= to_row < BOARD_HEIGHT and 0 <= to_col < BOARD_WIDTH:
+            if (0 <= to_row < BOARD_HEIGHT and 0 <= to_col < BOARD_WIDTH
+                    and (from_row, from_col) in _VALID_BISHOP_POSITIONS
+                    and (to_row, to_col) in _VALID_BISHOP_POSITIONS):
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
         
-        # 士的移动 (斜向1格)
-        advisor_deltas = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-        for dr, dc in advisor_deltas:
+        # 士的移动 (斜向1格) — 只保留合法士位之间的走法
+        for dr, dc in [(-1,-1),(-1,1),(1,-1),(1,1)]:
             to_row, to_col = from_row + dr, from_col + dc
-            if 0 <= to_row < BOARD_HEIGHT and 0 <= to_col < BOARD_WIDTH:
+            if (0 <= to_row < BOARD_HEIGHT and 0 <= to_col < BOARD_WIDTH
+                    and (from_row, from_col) in _VALID_ADVISOR_POSITIONS
+                    and (to_row, to_col) in _VALID_ADVISOR_POSITIONS):
                 moves.append((from_sq, to_row * BOARD_WIDTH + to_col))
     
     # 去重并排序
@@ -136,7 +149,7 @@ def _generate_all_possible_moves():
 
 # 预计算动作映射表
 _ALL_MOVES = _generate_all_possible_moves()
-ACTION_SPACE_SIZE = len(_ALL_MOVES)  # 应该为 2550
+ACTION_SPACE_SIZE = len(_ALL_MOVES)  # 应该为 2086
 
 # 创建双向映射
 _MOVE_TO_ACTION = {move: idx for idx, move in enumerate(_ALL_MOVES)}

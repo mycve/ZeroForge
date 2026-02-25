@@ -141,12 +141,14 @@ def main():
     print(f"{'最佳耗时':.<25} {elapsed_step:>11.3f}s {elapsed_search:>15.3f}s {elapsed_step/elapsed_search:>7.2f}x")
     print(f"{'=' * 60}")
 
-    # 优化前基线对比（硬编码初次运行的基线值）
-    baseline_sps = 4241
-    print(f"\n[对比优化前基线]")
-    print(f"  优化前 env.step:   {baseline_sps} steps/s")
-    print(f"  优化后 env.step:   {sps_step:.0f} steps/s ({(sps_step/baseline_sps - 1)*100:+.1f}%)")
-    print(f"  step_for_search:   {sps_search:.0f} steps/s ({(sps_search/baseline_sps - 1)*100:+.1f}%)")
+    # 优化前基线对比
+    baseline_sps = 4241      # 原始 env.step (action_space=2550, 双重 get_legal_moves_mask)
+    baseline_search = 4727   # 上一轮 step_for_search (action_space=2550)
+    print(f"\n[对比全部优化前基线 (action_space=2550)]")
+    print(f"  原始 env.step:     {baseline_sps} steps/s")
+    print(f"  上轮 search(2550): {baseline_search} steps/s")
+    print(f"  当前 env.step:     {sps_step:.0f} steps/s ({(sps_step/baseline_sps - 1)*100:+.1f}%)")
+    print(f"  当前 search(2086): {sps_search:.0f} steps/s ({(sps_search/baseline_sps - 1)*100:+.1f}%)")
 
     print("\n测试完成！")
 
