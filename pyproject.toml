@@ -54,7 +54,7 @@ dependencies = [
 [project.optional-dependencies]
 # CPU 版本 (无 CUDA)
 cpu = [
-    "jax>=0.4.30",
+    "jax>=0.9.0.1",
 ]
 
 dev = [
