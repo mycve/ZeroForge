@@ -664,6 +664,32 @@ def is_game_over(board: jnp.ndarray, player: jnp.ndarray) -> tuple[jnp.ndarray, 
     return is_over, winner
 
 
+@jax.jit
+def is_game_over_with_mask(
+    board: jnp.ndarray, player: jnp.ndarray, legal_mask: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """使用预计算合法走法掩码检查游戏结束（避免重复计算 get_legal_moves_mask）
+
+    与 is_game_over 逻辑完全一致，但接受外部传入的 legal_mask 而非内部重算。
+    """
+    red_king_exists = jnp.any(board == R_KING)
+    black_king_exists = jnp.any(board == B_KING)
+
+    red_wins = ~black_king_exists
+    black_wins = ~red_king_exists
+
+    has_legal_moves = jnp.any(legal_mask)
+    no_moves = ~has_legal_moves
+
+    is_over = red_wins | black_wins | no_moves
+    winner = jnp.where(
+        red_wins, 0,
+        jnp.where(black_wins, 1, jnp.where(no_moves, 1 - player, -1))
+    )
+
+    return is_over, winner
+
+
 # ============================================================================
 # 初始棋盘
 # ============================================================================

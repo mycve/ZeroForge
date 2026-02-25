@@ -217,9 +217,9 @@ def eval_forward(params, obs):
 
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数"""
+    """MCTS 递归函数（使用轻量级 step_for_search 加速搜索）"""
     prev_player = state.current_player
-    state = jax.vmap(env.step)(state, action)
+    state = jax.vmap(env.step_for_search)(state, action)
     obs = jax.vmap(env.observe)(state)
     logits, value, _ = forward(params, obs)
     
@@ -276,39 +276,22 @@ def selfplay(params, rng_key, batch_size):
         
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
-        # 仅有一个走法时不进行模拟（直接执行）
+        # MCTS 搜索（移除了全局 cond 分支，避免编译两套计算图的开销）
+        root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
+        policy_output = mctx.gumbel_muzero_policy(
+            params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+            num_simulations=config.num_simulations,
+            max_num_considered_actions=config.top_k,
+            invalid_actions=~state.legal_action_mask,
+            qtransform=_QTRANSFORM,
+            gumbel_scale=config.selfplay_gumbel_scale,
+        )
+        action_weights = policy_output.action_weights
+        root_value = policy_output.search_tree.node_values[:, 0]
+        
+        # 仅有一个合法走法的局面：直接用唯一走法覆盖 MCTS 结果
         legal_counts = jnp.sum(state.legal_action_mask, axis=-1)
         only_one_move = legal_counts == 1
-        
-        def _mcts_policy():
-            # Gumbel AlphaZero 无需 Dirichlet 噪声，Gumbel 采样本身提供探索
-            root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-            # 统一策略：只执行一次 MCTS 搜索
-            policy_output = mctx.gumbel_muzero_policy(
-                params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
-                num_simulations=config.num_simulations,
-                max_num_considered_actions=config.top_k,
-                invalid_actions=~state.legal_action_mask,
-                qtransform=_QTRANSFORM,
-                gumbel_scale=config.selfplay_gumbel_scale,
-            )
-            aw = policy_output.action_weights
-            rv = policy_output.search_tree.node_values[:, 0]
-            return aw, rv
-        
-        def _direct_policy():
-            action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
-            aw = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
-            rv = value
-            return aw, rv
-        
-        action_weights, root_value = jax.lax.cond(
-            jnp.all(only_one_move),
-            _direct_policy,
-            _mcts_policy,
-        )
-        
-        # 若只有一个合法走法，则覆盖对应样本的 MCTS 结果
         action_idx = jnp.argmax(state.legal_action_mask, axis=-1)
         one_hot = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
@@ -510,9 +493,9 @@ def evaluate(params_red, params_black, rng_key):
     batch_size = config.eval_games // num_devices
     
     def recurrent_fn_eval(params, rng_key, action, state):
-        """评估递归函数：仅用于评估阶段，强制 float32 前向。"""
+        """评估递归函数：使用轻量级 step_for_search 加速搜索。"""
         prev_player = state.current_player
-        state = jax.vmap(env.step)(state, action)
+        state = jax.vmap(env.step_for_search)(state, action)
         obs = jax.vmap(env.observe)(state)
         logits, value = eval_forward(params, obs)
         

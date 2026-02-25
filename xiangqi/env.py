@@ -20,7 +20,7 @@ from xiangqi.actions import (
 )
 from xiangqi.rules import (
     get_initial_board, apply_move, is_legal_move, is_game_over,
-    get_legal_moves_mask, is_in_check, get_piece_type,
+    is_game_over_with_mask, get_legal_moves_mask, is_in_check, get_piece_type,
 )
 from xiangqi.violation_rules import (
     is_chase_move, count_checking_pieces, check_violation,
@@ -413,8 +413,11 @@ class XiangqiEnv:
             
             # ========== 游戏结束判断 ==========
             
-            # 基本结束条件 (将死/困毙)
-            basic_game_over, basic_winner = is_game_over(new_board, new_player)
+            # 一次性计算合法走法掩码（复用于 is_game_over 和新状态，避免重复计算）
+            new_legal_mask_raw = get_legal_moves_mask(new_board, new_player)
+            
+            # 基本结束条件 (将死/困毙) - 使用预计算掩码
+            basic_game_over, basic_winner = is_game_over_with_mask(new_board, new_player, new_legal_mask_raw)
             
             # 和棋条件
             is_max_steps = new_step_count >= self.max_steps
@@ -536,11 +539,11 @@ class XiangqiEnv:
             )
             rewards = terminal_reward
             
-            # 获取新的合法动作
+            # 复用预计算的合法走法掩码（无需再次调用 get_legal_moves_mask）
             new_legal_mask = jnp.where(
                 game_over,
                 jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
-                get_legal_moves_mask(new_board, new_player)
+                new_legal_mask_raw
             )
             
             return XiangqiState(
@@ -571,6 +574,71 @@ class XiangqiEnv:
                 check_in_no_capture=new_check_in_no_capture,
                 # 搜索辅助
                 search_model_index=state.search_model_index,
+            )
+        
+        return jax.lax.cond(state.terminated, lambda: state, _do_step)
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def step_for_search(self, state: XiangqiState, action: jnp.ndarray) -> XiangqiState:
+        """MCTS 搜索专用轻量级 step
+        
+        跳过: 违规检测(长将/长捉)、Zobrist哈希、重复局面、无吃子计数
+        保留: 走子 + 历史更新(observe需要) + 合法走法(一次) + 终局判断 + 奖励
+        相比完整 step 减少约 50%+ 计算量
+        """
+        def _do_step() -> XiangqiState:
+            from_sq, to_sq = action_to_move(action)
+            
+            # 更新历史（observe 需要历史帧生成观察张量）
+            new_history = jnp.concatenate([
+                state.board[jnp.newaxis, :, :],
+                state.history[:-1, :, :]
+            ], axis=0)
+            
+            new_board = apply_move(state.board, from_sq, to_sq)
+            new_player = 1 - state.current_player
+            new_step_count = state.step_count + 1
+            
+            # 一次性计算合法走法掩码
+            new_legal_mask = get_legal_moves_mask(new_board, new_player)
+            
+            # 终局判断（复用预计算掩码）
+            basic_game_over, basic_winner = is_game_over_with_mask(
+                new_board, new_player, new_legal_mask)
+            
+            is_max_steps = new_step_count >= self.max_steps
+            game_over = basic_game_over | is_max_steps
+            winner = jnp.where(basic_game_over, basic_winner, -1)
+            
+            # 奖励
+            terminal_reward = jnp.where(
+                game_over,
+                jnp.where(
+                    winner == -1, jnp.zeros(2),
+                    jnp.where(winner == 0,
+                              jnp.array([1.0, -1.0]),
+                              jnp.array([-1.0, 1.0]))
+                ),
+                jnp.zeros(2)
+            )
+            
+            new_legal_mask = jnp.where(
+                game_over,
+                jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
+                new_legal_mask
+            )
+            
+            # replace 只更新指定字段，其余保持原值（违规计数等不更新但也不读取）
+            return state.replace(
+                board=new_board,
+                history=new_history,
+                current_player=new_player,
+                legal_action_mask=new_legal_mask,
+                rewards=terminal_reward,
+                terminated=game_over,
+                step_count=new_step_count,
+                winner=winner,
+                draw_reason=jnp.int32(0),
             )
         
         return jax.lax.cond(state.terminated, lambda: state, _do_step)
