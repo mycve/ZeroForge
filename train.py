@@ -98,6 +98,7 @@ class Config:
     ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
     max_to_keep: int = 20            # 最多保留 N 个 checkpoint
     keep_period: int = 50           # 每 N 次迭代永久保留一个 checkpoint
+    save_replay_buffer: bool = True  # 是否保存经验池（大 buffer 可能耗时）
 
 config = Config()
 _QTRANSFORM = partial(
@@ -764,6 +765,7 @@ class TrainState(NamedTuple):
     rng_key: jnp.ndarray           # 随机数状态
     history_models: dict            # 历史模型 (用于 ELO 评估)
     iteration_elos: dict            # ELO 记录
+    total_opt_steps: int            # 累计优化步数（用于 LR 调度）
 
 
 def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
@@ -820,12 +822,30 @@ def save_checkpoint(
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     
-    # 保存 ELO 和历史模型索引 (转换为 Python 原生类型，避免 JSON 序列化错误)
+    # 保存 ELO、历史模型索引、total_opt_steps
     with open(os.path.join(meta_dir, "metadata.json"), "w") as f:
         json.dump({
             "iteration_elos": {str(k): float(v) for k, v in train_state.iteration_elos.items()},
             "history_model_keys": [int(k) for k in train_state.history_models.keys()],
+            "total_opt_steps": train_state.total_opt_steps,
         }, f)
+    
+    # 保存经验池
+    if config.save_replay_buffer:
+        try:
+            rb_state = replay_buffer.state_dict()
+            np.savez_compressed(
+                os.path.join(meta_dir, "replay_buffer.npz"),
+                obs=rb_state["obs"],
+                policy_tgt=rb_state["policy_tgt"],
+                wdl_tgt=rb_state["wdl_tgt"],
+                mask=rb_state["mask"],
+                ptr=np.array(rb_state["ptr"]),
+                size=np.array(rb_state["size"]),
+                total_added=np.array(rb_state["total_added"]),
+            )
+        except Exception as e:
+            print(f"[Checkpoint] 经验池保存失败（可设 save_replay_buffer=False）: {e}")
     
     # 保存历史模型参数
     for k, v in train_state.history_models.items():
@@ -845,7 +865,7 @@ def restore_checkpoint(
     
     Returns:
         None 如果没有 checkpoint
-        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
+        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps) 如果成功恢复
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
@@ -874,11 +894,31 @@ def restore_checkpoint(
     history_models = {}
     iteration_elos = {}
     
+    total_opt_steps = 0
     if os.path.exists(meta_dir):
         with open(os.path.join(meta_dir, "metadata.json"), "r") as f:
             meta = json.load(f)
             iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
             history_model_keys = meta["history_model_keys"]
+            total_opt_steps = int(meta.get("total_opt_steps", 0))
+        
+        # 恢复经验池
+        replay_path = os.path.join(meta_dir, "replay_buffer.npz")
+        if config.save_replay_buffer and os.path.exists(replay_path):
+            try:
+                data = np.load(replay_path)
+                replay_buffer.load_state_dict({
+                    "obs": data["obs"],
+                    "policy_tgt": data["policy_tgt"],
+                    "wdl_tgt": data["wdl_tgt"],
+                    "mask": data["mask"],
+                    "ptr": int(data["ptr"]),
+                    "size": int(data["size"]),
+                    "total_added": int(data["total_added"]),
+                })
+                print(f"[Checkpoint] 经验池已恢复: size={replay_buffer.size}")
+            except Exception as e:
+                print(f"[Checkpoint] 经验池恢复失败: {e}")
         
         tree_struct = jax.tree.structure(params_template)
         for k in history_model_keys:
@@ -888,14 +928,17 @@ def restore_checkpoint(
                 leaves = [data[f"arr_{i}"] for i in range(len(data.files))]
                 history_models[k] = jax.tree.unflatten(tree_struct, leaves)
         
+    if total_opt_steps == 0:
+        total_opt_steps = (frames * config.sample_reuse_times) // config.training_batch_size
+    
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
         latest_elo = iteration_elos[latest_elo_iter]
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
     else:
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}")
     
-    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
+    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps
 
 
 # ============================================================================
@@ -949,7 +992,7 @@ def main():
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template, replay_buffer)
     
     if restored is not None:
-        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps = restored
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         params = params_template
@@ -958,6 +1001,7 @@ def main():
         frames = 0
         history_models = {0: jax.device_get(params)}
         iteration_elos = {0: 1500.0}
+        total_opt_steps = 0
 
     params = replicate_to_devices(params)
     opt_state = replicate_to_devices(opt_state)
@@ -982,7 +1026,56 @@ def main():
     start_time_total = time.time()
     
     print("开始训练！")
-    total_opt_steps = 0  # 累计优化器步数（用于查询真实 LR）
+    
+    # 恢复后若轮到评估（如崩溃在 ckpt 保存后、eval 前），补跑评估
+    if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
+        available_iters = sorted(k for k in history_models.keys() if k < iteration)
+        if available_iters:
+            print(f"[断点续训] 补跑 iteration={iteration} 的评估...")
+            rated_iters = [k for k in available_iters if k in iteration_elos]
+            ref_iter = max(rated_iters, key=lambda k: iteration_elos[k]) if rated_iters else available_iters[-1]
+            ref_reason = "best_elo" if rated_iters else "latest_ckpt"
+            past_params = replicate_to_devices(history_models[ref_iter])
+            rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
+            batch_per_eval = config.eval_games
+            states_r = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=True)
+            states_b = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=False)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
+                eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
+                states_r = jax.device_put_sharded([jax.tree.map(lambda x: x[i], states_r) for i in range(num_devices)], devices)
+                states_b = jax.device_put_sharded([jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices)
+            try:
+                winners_r = evaluate(params, past_params, states_r, eval_keys_r)
+                winners_b = evaluate(past_params, params, states_b, eval_keys_b)
+            except Exception as e:
+                print(f"[评估错误] 补跑评估失败: {e}")
+                raise RuntimeError("断点续训补跑评估异常") from e
+            wins_red = int((winners_r == 0).sum())
+            draws_red = int((winners_r == -1).sum())
+            losses_red = int((winners_r == 1).sum())
+            wins_black = int((winners_b == 1).sum())
+            draws_black = int((winners_b == -1).sum())
+            losses_black = int((winners_b == 0).sum())
+            wins = wins_red + wins_black
+            draws = draws_red + draws_black
+            losses = losses_red + losses_black
+            total_games = int(config.eval_games * 2)
+            score = (wins + 0.5 * draws) / total_games
+            decisive_games = wins + losses
+            decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
+            elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
+            iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
+            decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
+            print(f"评估 vs Iter {ref_iter} ({ref_reason}): W/D/L {wins}/{draws}/{losses} | 得分率 {score:.2%} | ELO {iteration_elos[iteration]:.0f}")
+            writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
+            writer.add_scalar("eval/win_rate", wins / total_games, iteration)
+            writer.add_scalar("eval/draw_rate", draws / total_games, iteration)
+            writer.add_scalar("eval/loss_rate", losses / total_games, iteration)
+            writer.add_scalar("eval/score", score, iteration)
+            if decisive_games > 0:
+                writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
     
     print(f"[Selfplay] batch_size={config.selfplay_batch_size}")
 
@@ -1144,6 +1237,7 @@ def main():
                 rng_key=rng_key,
                 history_models=history_models,
                 iteration_elos=iteration_elos,
+                total_opt_steps=total_opt_steps,
             )
             save_checkpoint(ckpt_manager, train_state, replay_buffer, iteration)
         
