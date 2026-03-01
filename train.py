@@ -55,24 +55,29 @@ class Config:
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈700 轮后到最低值
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
+    # 退化检测后自动降 LR（在现有 schedule 基础上再乘倍率）
+    lr_decay_factor: float = 0.5
+    lr_min_multiplier: float = 0.1
+    degrade_score_threshold: float = 0.5
+    degrade_patience_evals: int = 3
     max_grad_norm: float = 1.0
     training_batch_size: int = 4096
     td_lambda: float = 0.70          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 20
+    num_simulations: int = 32
     top_k: int = 4                      # 根节点候选数
     
     # 经验回放配置
-    replay_buffer_size: int = 5000000
+    replay_buffer_size: int = 10000000
     sample_reuse_times: int = 2
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.5     # 降低根节点随机性，减少训练目标抖动
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
@@ -155,6 +160,12 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
+if not (0.0 < config.lr_decay_factor <= 1.0):
+    raise ValueError(f"lr_decay_factor 必须在 (0,1]，当前值: {config.lr_decay_factor}")
+if not (0.0 < config.lr_min_multiplier <= 1.0):
+    raise ValueError(f"lr_min_multiplier 必须在 (0,1]，当前值: {config.lr_min_multiplier}")
+if config.degrade_patience_evals < 1:
+    raise ValueError(f"degrade_patience_evals 必须 >= 1，当前值: {config.degrade_patience_evals}")
 
 # 预计算旋转索引，避免在 JIT 循环内重复计算
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -679,6 +690,7 @@ class TrainState(NamedTuple):
     iteration: int                  # 当前迭代次数
     frames: int                     # 总帧数
     rng_key: jnp.ndarray           # 随机数状态
+    lr_multiplier: float           # 动态学习率倍率（用于自动降 LR）
     history_models: dict            # 历史模型 (用于 ELO 评估)
     iteration_elos: dict            # ELO 记录
 
@@ -728,6 +740,7 @@ def save_checkpoint(
         "iteration": np.array(train_state.iteration),
         "frames": np.array(train_state.frames),
         "rng_key": rng_key_np,
+        "lr_multiplier": np.array(train_state.lr_multiplier, dtype=np.float32),
     }
     
     # 保存主状态
@@ -762,7 +775,7 @@ def restore_checkpoint(
     
     Returns:
         None 如果没有 checkpoint
-        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
+        (params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos) 如果成功恢复
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
@@ -777,14 +790,27 @@ def restore_checkpoint(
         "iteration": np.array(0),
         "frames": np.array(0),
         "rng_key": jax.random.PRNGKey(0),
+        "lr_multiplier": np.array(1.0, dtype=np.float32),
     }
     
-    restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
+    try:
+        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
+    except Exception:
+        # 兼容旧 checkpoint（无 lr_multiplier 字段）
+        legacy_target = {
+            "params": params_template,
+            "opt_state": opt_state_template,
+            "iteration": np.array(0),
+            "frames": np.array(0),
+            "rng_key": jax.random.PRNGKey(0),
+        }
+        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(legacy_target))
     params = restored["params"]
     opt_state = restored["opt_state"]
     iteration = int(restored["iteration"])
     frames = int(restored["frames"])
     rng_key = restored["rng_key"]
+    lr_multiplier = float(restored.get("lr_multiplier", np.array(1.0, dtype=np.float32)))
     
     # 恢复 metadata
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{latest_step}")
@@ -809,11 +835,14 @@ def restore_checkpoint(
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
         latest_elo = iteration_elos[latest_elo_iter]
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
+        print(
+            f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, "
+            f"ELO={latest_elo:.0f} (iter {latest_elo_iter}), lr_mult={lr_multiplier:.4f}"
+        )
     else:
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, lr_mult={lr_multiplier:.4f}")
     
-    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
+    return params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos
 
 
 # ============================================================================
@@ -870,23 +899,27 @@ def main():
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template, replay_buffer)
     
     if restored is not None:
-        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
+        params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos = restored
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         params = params_template
         opt_state = opt_state_template
         iteration = 0
         frames = 0
+        lr_multiplier = 1.0
         history_models = {0: jax.device_get(params)}
         iteration_elos = {0: 1500.0}
+
+    degrade_streak = 0
     
     params = replicate_to_devices(params)
     opt_state = replicate_to_devices(opt_state)
     
     @partial(jax.pmap, axis_name='i')
-    def train_step(params, opt_state, samples, rng_key):
+    def train_step(params, opt_state, samples, rng_key, lr_mult):
         grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
+        updates = jax.tree.map(lambda u: u * lr_mult.astype(u.dtype), updates)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
@@ -974,13 +1007,16 @@ def main():
         # 双缓冲流水线：预读取第一个 batch，后续 batch 在 GPU 训练期间并行准备
         ploss_acc, vloss_acc = None, None
         next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
+        lr_mult_sharded = jax.device_put_sharded(
+            [jnp.asarray(lr_multiplier, dtype=jnp.float32) for _ in devices], devices
+        )
         
         for i in range(num_updates):
             batch, train_keys = next_batch, next_keys
             
             try:
                 # 分派 GPU 训练（异步返回，不阻塞 Python）
-                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
+                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys, lr_mult_sharded)
             except jax.errors.JaxRuntimeError as e:
                 msg = str(e).lower()
                 if ("resource_exhausted" in msg) or ("out of memory" in msg):
@@ -1026,12 +1062,14 @@ def main():
               f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
-        current_lr = float(lr_schedule(total_opt_steps))
+        base_lr = float(lr_schedule(total_opt_steps))
+        current_lr = base_lr * lr_multiplier
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
         writer.add_scalar("train/lr", current_lr, iteration)
+        writer.add_scalar("train/lr_multiplier", lr_multiplier, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
@@ -1063,19 +1101,26 @@ def main():
                 iteration=iteration,
                 frames=frames,
                 rng_key=rng_key,
+                lr_multiplier=lr_multiplier,
                 history_models=history_models,
                 iteration_elos=iteration_elos,
             )
             save_checkpoint(ckpt_manager, train_state, replay_buffer, iteration)
         
         if iteration % config.eval_interval == 0:
-            # 找到最近的可用历史模型
-            past_iter = max(0, iteration - config.past_model_offset)
-            available_iters = sorted(history_models.keys())
-            past_iter = max([k for k in available_iters if k <= past_iter], default=0)
-            
-            if past_iter in history_models:
-                past_params = replicate_to_devices(history_models[past_iter])
+            # 评估对手优先选择“历史最佳模型”（按 iteration_elos），
+            # 若无可用 ELO 记录，则退化为最近历史 checkpoint。
+            available_iters = sorted(k for k in history_models.keys() if k < iteration)
+            if available_iters:
+                rated_iters = [k for k in available_iters if k in iteration_elos]
+                if rated_iters:
+                    ref_iter = max(rated_iters, key=lambda k: iteration_elos[k])
+                    ref_reason = "best_elo"
+                else:
+                    ref_iter = available_iters[-1]
+                    ref_reason = "latest_ckpt"
+
+                past_params = replicate_to_devices(history_models[ref_iter])
                 rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
                 # 分发评估 Key 到各设备
                 with warnings.catch_warnings():
@@ -1091,15 +1136,73 @@ def main():
                     print(f"[评估错误] params dtype: {jax.tree.leaves(params)[0].dtype}")
                     print(f"[评估错误] past_params dtype: {jax.tree.leaves(past_params)[0].dtype}")
                     raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
-                wr = (winners_r == 0).sum()
-                wb = (winners_b == 1).sum()
-                dr = (winners_r == -1).sum()
-                db = (winners_b == -1).sum()
-                score = (wr + wb + 0.5 * (dr + db)) / (config.eval_games * 2)
+
+                # 当前模型先手（红）与后手（黑）拆分统计，避免“和棋被误判为输”。
+                wins_red = int((winners_r == 0).sum())
+                draws_red = int((winners_r == -1).sum())
+                losses_red = int((winners_r == 1).sum())
+                wins_black = int((winners_b == 1).sum())
+                draws_black = int((winners_b == -1).sum())
+                losses_black = int((winners_b == 0).sum())
+
+                wins = wins_red + wins_black
+                draws = draws_red + draws_black
+                losses = losses_red + losses_black
+                total_games = int(config.eval_games * 2)
+
+                win_rate = wins / total_games
+                draw_rate = draws / total_games
+                loss_rate = losses / total_games
+                score = (wins + 0.5 * draws) / total_games
+                decisive_games = wins + losses
+                decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
+
                 elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
-                iteration_elos[iteration] = iteration_elos.get(past_iter, 1500.0) + elo_diff
-                print(f"评估 vs Iter {past_iter}: 胜率 {score:.2%}, ELO {iteration_elos[iteration]:.0f}")
+                iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
+                decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
+                print(
+                    f"评估 vs Iter {ref_iter} ({ref_reason}): "
+                    f"W/D/L {wins}/{draws}/{losses} | "
+                    f"胜率 {win_rate:.2%} 和率 {draw_rate:.2%} 负率 {loss_rate:.2%} | "
+                    f"得分率 {score:.2%} | 决胜局胜率 {decisive_text} | "
+                    f"ELO {iteration_elos[iteration]:.0f}"
+                )
+                print(
+                    f"  先手(当前红) W/D/L {wins_red}/{draws_red}/{losses_red} | "
+                    f"后手(当前黑) W/D/L {wins_black}/{draws_black}/{losses_black}"
+                )
                 writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
+                writer.add_scalar("eval/win_rate", win_rate, iteration)
+                writer.add_scalar("eval/draw_rate", draw_rate, iteration)
+                writer.add_scalar("eval/loss_rate", loss_rate, iteration)
+                writer.add_scalar("eval/score", score, iteration)
+                if decisive_games > 0:
+                    writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
+
+                # 自动退化检测：连续评估低于阈值时降 LR（保持连续更新策略不变）
+                if score < config.degrade_score_threshold:
+                    degrade_streak += 1
+                else:
+                    degrade_streak = 0
+                writer.add_scalar("eval/degrade_streak", degrade_streak, iteration)
+
+                if degrade_streak >= config.degrade_patience_evals:
+                    old_mult = lr_multiplier
+                    lr_multiplier = max(
+                        config.lr_min_multiplier,
+                        lr_multiplier * config.lr_decay_factor,
+                    )
+                    degrade_streak = 0
+                    if lr_multiplier < old_mult:
+                        print(
+                            f"[AutoLR] 连续{config.degrade_patience_evals}次评估得分率<{config.degrade_score_threshold:.2f}，"
+                            f"学习率倍率 {old_mult:.4f} -> {lr_multiplier:.4f}，"
+                            f"当前有效LR≈{base_lr * lr_multiplier:.2e}"
+                        )
+                    else:
+                        print(
+                            f"[AutoLR] 连续退化但已到最小学习率倍率 {lr_multiplier:.4f}，不再继续下调"
+                        )
             else:
                 print(f"[警告] 无可用历史模型，跳过本次评估")
 
