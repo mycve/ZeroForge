@@ -33,6 +33,20 @@ def mirror_board(board: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.jit
+def mirror_board_swap_colors(board: jnp.ndarray) -> jnp.ndarray:
+    """
+    左右镜像并交换红黑方（用于评估时先后手轮换）
+    
+    Args:
+        board: 棋盘状态 (10, 9) 或 (batch, 10, 9)
+        
+    Returns:
+        镜像且红黑互换后的棋盘
+    """
+    return -jnp.flip(board, axis=-1)
+
+
+@jax.jit
 def mirror_history(history: jnp.ndarray) -> jnp.ndarray:
     """
     镜像历史棋盘

@@ -9,7 +9,7 @@ import time
 import json
 import warnings
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, List, Tuple
 
 # 显存分配策略：减少碎片导致的大块申请失败（需在 import jax 前设置）
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
@@ -30,6 +30,7 @@ os.makedirs(cache_dir, exist_ok=True)
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
 from xiangqi.mirror import mirror_observation, mirror_policy
+from xiangqi.fen import load_fens_from_file, parse_fen
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
 
@@ -51,23 +52,17 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 2000       # 预热步数（~2-3 轮）
+    lr_warmup_steps: int = 4000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 200000     # 余弦周期（opt steps），≈700 轮后到最低值
+    lr_cosine_steps: int = 500000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
-    # 退化检测后自动降 LR（在现有 schedule 基础上再乘倍率）
-    lr_decay_factor: float = 0.5
-    lr_min_multiplier: float = 0.1
-    degrade_score_threshold: float = 0.5
-    degrade_patience_evals: int = 3
-    max_grad_norm: float = 1.0
     training_batch_size: int = 4096
-    td_lambda: float = 0.70          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.55          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
     num_simulations: int = 32
-    top_k: int = 4                      # 根节点候选数
+    top_k: int = 8                      # 根节点候选数
     
     # 经验回放配置
     replay_buffer_size: int = 10000000
@@ -83,9 +78,9 @@ class Config:
     # 探索策略：三段式温度（开局/中局/残局）
     temperature_phase1_steps: int = 10    # 0-10 半步（~5回合）: 开局全探索
     temperature_phase2_steps: int = 60    # 10-60 半步（~30回合）: 中局适度探索
-    temperature_phase1: float = 1.5
-    temperature_phase2: float = 1.0
-    temperature_final: float = 0.5
+    temperature_phase1: float = 1.2
+    temperature_phase2: float = 0.8
+    temperature_final: float = 0.01
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
@@ -97,6 +92,7 @@ class Config:
     eval_interval: int = 20
     eval_games: int = 100
     past_model_offset: int = 20
+    eval_fen_file: Optional[str] = "openings_generated.txt"  # 若指定，从该文件批量加载 FEN 作为起始局面，先后手轮换
     
     # Checkpoint 配置
     ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
@@ -160,13 +156,6 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
-if not (0.0 < config.lr_decay_factor <= 1.0):
-    raise ValueError(f"lr_decay_factor 必须在 (0,1]，当前值: {config.lr_decay_factor}")
-if not (0.0 < config.lr_min_multiplier <= 1.0):
-    raise ValueError(f"lr_min_multiplier 必须在 (0,1]，当前值: {config.lr_min_multiplier}")
-if config.degrade_patience_evals < 1:
-    raise ValueError(f"degrade_patience_evals 必须 >= 1，当前值: {config.degrade_patience_evals}")
-
 # 预计算旋转索引，避免在 JIT 循环内重复计算
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
@@ -484,14 +473,97 @@ def loss_fn(params, samples: Sample, rng_key):
     total_loss = policy_loss + config.value_loss_weight * value_loss
     return total_loss, (policy_loss, value_loss)
 
+def _build_eval_initial_states(
+    fen_file: Optional[str],
+    batch_size: int,
+    rng_key,
+    for_current_red: bool,
+) -> "XiangqiState":
+    """
+    构建评估用初始状态，支持 FEN 批量导入与先后手轮换。
+    
+    Args:
+        fen_file: FEN 文件路径，None 则用标准初始局面
+        batch_size: 每侧局数（current=red 或 current=black 各 batch_size 局）
+        rng_key: 随机 key（用于标准局面时的 init）
+        for_current_red: True=当前模型执红，False=当前模型执黑
+        
+    Returns:
+        已按设备分片的 XiangqiState，可直接传入 evaluate
+    """
+    batch_per_device = batch_size // num_devices
+    if batch_per_device * num_devices != batch_size:
+        raise ValueError(f"batch_size {batch_size} 必须整除 num_devices {num_devices}")
+    
+    if fen_file and os.path.exists(fen_file):
+        # 从 FEN 文件加载，先后手轮换
+        fens = load_fens_from_file(fen_file)
+        if not fens:
+            raise ValueError(f"FEN 文件为空: {fen_file}")
+        if for_current_red:
+            print(f"[评估] FEN 文件 {fen_file} 共 {len(fens)} 条局面，先后手轮换")
+        # 先后手轮换：偶数索引→current=red，奇数索引→current=black
+        boards_r, players_r = [], []
+        boards_b, players_b = [], []
+        for i, (board, player) in enumerate(fens):
+            if i % 2 == 0:
+                # 当前模型执红：需红方行棋，否则镜像
+                if player == 0:
+                    boards_r.append(board)
+                    players_r.append(0)
+                else:
+                    b_mirror = np.array(-np.flip(board, axis=-1), dtype=np.int8)
+                    boards_r.append(b_mirror)
+                    players_r.append(0)
+            else:
+                # 当前模型执黑：需黑方行棋，否则镜像
+                if player == 1:
+                    boards_b.append(board)
+                    players_b.append(1)
+                else:
+                    b_mirror = np.array(-np.flip(board, axis=-1), dtype=np.int8)
+                    boards_b.append(b_mirror)
+                    players_b.append(1)
+        # 选对应侧并补齐到 batch_size
+        if for_current_red:
+            boards, players = boards_r, players_r
+        else:
+            boards, players = boards_b, players_b
+        # 用标准局面补齐
+        std_board, _ = parse_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w")
+        while len(boards) < batch_size:
+            boards.append(std_board)
+            players.append(0 if for_current_red else 1)
+        boards = np.stack(boards[:batch_size], axis=0).astype(np.int8)
+        players = np.array(players[:batch_size], dtype=np.int32)
+        boards_jax = jnp.array(boards)
+        players_jax = jnp.array(players)
+        states_flat = jax.vmap(env.init_from_board)(boards_jax, players_jax)
+    elif fen_file:
+        print(f"[评估] FEN 文件不存在 {fen_file}，改用标准初始局面")
+        keys = jax.random.split(rng_key, batch_size)
+        states_flat = jax.vmap(env.init)(keys)
+    else:
+        # 标准初始局面
+        keys = jax.random.split(rng_key, batch_size)
+        states_flat = jax.vmap(env.init)(keys)
+    
+    # 按设备分片供 pmap 使用
+    def _shard(x):
+        return x.reshape(num_devices, batch_per_device, *x.shape[1:])
+    
+    return jax.tree.map(_shard, states_flat)
+
+
 @jax.pmap
-def evaluate(params_red, params_black, rng_key):
+def evaluate(params_red, params_black, initial_states, rng_key):
     """高性能评估算子：双模型对战
     
     评估策略：
     - 全程贪婪走子，降低评估噪声，提升版本可比性
+    - initial_states: 已按设备分片的初始状态
     """
-    batch_size = config.eval_games // num_devices
+    batch_size = initial_states.board.shape[1]
     
     def recurrent_fn_eval(params, rng_key, action, state):
         prev_player = state.current_player
@@ -558,7 +630,7 @@ def evaluate(params_red, params_black, rng_key):
         next_state = jax.vmap(env.step)(state, action)
         return next_state, next_state.terminated
 
-    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
+    state = initial_states
     terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
     
     def body_fn(args):
@@ -690,7 +762,6 @@ class TrainState(NamedTuple):
     iteration: int                  # 当前迭代次数
     frames: int                     # 总帧数
     rng_key: jnp.ndarray           # 随机数状态
-    lr_multiplier: float           # 动态学习率倍率（用于自动降 LR）
     history_models: dict            # 历史模型 (用于 ELO 评估)
     iteration_elos: dict            # ELO 记录
 
@@ -740,7 +811,6 @@ def save_checkpoint(
         "iteration": np.array(train_state.iteration),
         "frames": np.array(train_state.frames),
         "rng_key": rng_key_np,
-        "lr_multiplier": np.array(train_state.lr_multiplier, dtype=np.float32),
     }
     
     # 保存主状态
@@ -775,7 +845,7 @@ def restore_checkpoint(
     
     Returns:
         None 如果没有 checkpoint
-        (params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos) 如果成功恢复
+        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos) 如果成功恢复
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
@@ -790,27 +860,13 @@ def restore_checkpoint(
         "iteration": np.array(0),
         "frames": np.array(0),
         "rng_key": jax.random.PRNGKey(0),
-        "lr_multiplier": np.array(1.0, dtype=np.float32),
     }
-    
-    try:
-        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
-    except Exception:
-        # 兼容旧 checkpoint（无 lr_multiplier 字段）
-        legacy_target = {
-            "params": params_template,
-            "opt_state": opt_state_template,
-            "iteration": np.array(0),
-            "frames": np.array(0),
-            "rng_key": jax.random.PRNGKey(0),
-        }
-        restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(legacy_target))
+    restored = ckpt_manager.restore(latest_step, args=ocp.args.StandardRestore(restore_target))
     params = restored["params"]
     opt_state = restored["opt_state"]
     iteration = int(restored["iteration"])
     frames = int(restored["frames"])
     rng_key = restored["rng_key"]
-    lr_multiplier = float(restored.get("lr_multiplier", np.array(1.0, dtype=np.float32)))
     
     # 恢复 metadata
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{latest_step}")
@@ -835,14 +891,11 @@ def restore_checkpoint(
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
         latest_elo = iteration_elos[latest_elo_iter]
-        print(
-            f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, "
-            f"ELO={latest_elo:.0f} (iter {latest_elo_iter}), lr_mult={lr_multiplier:.4f}"
-        )
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
     else:
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, lr_mult={lr_multiplier:.4f}")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}")
     
-    return params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos
+    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos
 
 
 # ============================================================================
@@ -888,10 +941,7 @@ def main():
         f"warmup={config.lr_warmup_steps}steps"
     )
     print(f"[TD(λ)] 固定 λ={config.td_lambda}")
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adamw(lr_schedule, weight_decay=config.weight_decay),
-    )
+    optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -899,27 +949,23 @@ def main():
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template, replay_buffer)
     
     if restored is not None:
-        params, opt_state, iteration, frames, rng_key, lr_multiplier, history_models, iteration_elos = restored
+        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos = restored
         print(f"[断点续训] 从 iteration={iteration} 继续训练")
     else:
         params = params_template
         opt_state = opt_state_template
         iteration = 0
         frames = 0
-        lr_multiplier = 1.0
         history_models = {0: jax.device_get(params)}
         iteration_elos = {0: 1500.0}
 
-    degrade_streak = 0
-    
     params = replicate_to_devices(params)
     opt_state = replicate_to_devices(opt_state)
     
     @partial(jax.pmap, axis_name='i')
-    def train_step(params, opt_state, samples, rng_key, lr_mult):
+    def train_step(params, opt_state, samples, rng_key):
         grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        updates = jax.tree.map(lambda u: u * lr_mult.astype(u.dtype), updates)
         return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
@@ -1007,16 +1053,13 @@ def main():
         # 双缓冲流水线：预读取第一个 batch，后续 batch 在 GPU 训练期间并行准备
         ploss_acc, vloss_acc = None, None
         next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
-        lr_mult_sharded = jax.device_put_sharded(
-            [jnp.asarray(lr_multiplier, dtype=jnp.float32) for _ in devices], devices
-        )
         
         for i in range(num_updates):
             batch, train_keys = next_batch, next_keys
             
             try:
                 # 分派 GPU 训练（异步返回，不阻塞 Python）
-                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys, lr_mult_sharded)
+                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
             except jax.errors.JaxRuntimeError as e:
                 msg = str(e).lower()
                 if ("resource_exhausted" in msg) or ("out of memory" in msg):
@@ -1063,13 +1106,11 @@ def main():
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         base_lr = float(lr_schedule(total_opt_steps))
-        current_lr = base_lr * lr_multiplier
         
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
-        writer.add_scalar("train/lr", current_lr, iteration)
-        writer.add_scalar("train/lr_multiplier", lr_multiplier, iteration)
+        writer.add_scalar("train/lr", base_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
@@ -1101,7 +1142,6 @@ def main():
                 iteration=iteration,
                 frames=frames,
                 rng_key=rng_key,
-                lr_multiplier=lr_multiplier,
                 history_models=history_models,
                 iteration_elos=iteration_elos,
             )
@@ -1121,16 +1161,29 @@ def main():
                     ref_reason = "latest_ckpt"
 
                 past_params = replicate_to_devices(history_models[ref_iter])
-                rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
-                # 分发评估 Key 到各设备
+                rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
+                batch_per_eval = config.eval_games
+                # 构建初始状态（支持 FEN 批量导入 + 先后手轮换）
+                states_r = _build_eval_initial_states(
+                    config.eval_fen_file, batch_per_eval, sk7, for_current_red=True
+                )
+                states_b = _build_eval_initial_states(
+                    config.eval_fen_file, batch_per_eval, sk7, for_current_red=False
+                )
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
                     eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
                     eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
+                    states_r = jax.device_put_sharded(
+                        [jax.tree.map(lambda x: x[i], states_r) for i in range(num_devices)], devices
+                    )
+                    states_b = jax.device_put_sharded(
+                        [jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices
+                    )
                 
                 try:
-                    winners_r = evaluate(params, past_params, eval_keys_r)
-                    winners_b = evaluate(past_params, params, eval_keys_b)
+                    winners_r = evaluate(params, past_params, states_r, eval_keys_r)
+                    winners_b = evaluate(past_params, params, states_b, eval_keys_b)
                 except Exception as e:
                     print(f"[评估错误] 当前模型 dtype={config.network_dtype}, action_size={ACTION_SPACE_SIZE}")
                     print(f"[评估错误] params dtype: {jax.tree.leaves(params)[0].dtype}")
@@ -1178,31 +1231,6 @@ def main():
                 writer.add_scalar("eval/score", score, iteration)
                 if decisive_games > 0:
                     writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
-
-                # 自动退化检测：连续评估低于阈值时降 LR（保持连续更新策略不变）
-                if score < config.degrade_score_threshold:
-                    degrade_streak += 1
-                else:
-                    degrade_streak = 0
-                writer.add_scalar("eval/degrade_streak", degrade_streak, iteration)
-
-                if degrade_streak >= config.degrade_patience_evals:
-                    old_mult = lr_multiplier
-                    lr_multiplier = max(
-                        config.lr_min_multiplier,
-                        lr_multiplier * config.lr_decay_factor,
-                    )
-                    degrade_streak = 0
-                    if lr_multiplier < old_mult:
-                        print(
-                            f"[AutoLR] 连续{config.degrade_patience_evals}次评估得分率<{config.degrade_score_threshold:.2f}，"
-                            f"学习率倍率 {old_mult:.4f} -> {lr_multiplier:.4f}，"
-                            f"当前有效LR≈{base_lr * lr_multiplier:.2e}"
-                        )
-                    else:
-                        print(
-                            f"[AutoLR] 连续退化但已到最小学习率倍率 {lr_multiplier:.4f}，不再继续下调"
-                        )
             else:
                 print(f"[警告] 无可用历史模型，跳过本次评估")
 

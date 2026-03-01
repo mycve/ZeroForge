@@ -321,6 +321,49 @@ class XiangqiEnv:
         )
     
     @partial(jax.jit, static_argnums=(0,))
+    def init_from_board(self, board: jnp.ndarray, current_player: jnp.int32) -> XiangqiState:
+        """
+        从给定棋盘和行棋方初始化状态（用于 FEN 批量评估）
+        
+        Args:
+            board: 棋盘 (10, 9) int8，红正黑负
+            current_player: 0=红方, 1=黑方
+            
+        Returns:
+            游戏状态
+        """
+        history = jnp.zeros((NUM_HISTORY_STEPS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int8)
+        legal_mask = get_legal_moves_mask(board, current_player)
+        init_hash = compute_position_hash(board, current_player)
+        position_hashes = jnp.zeros(POSITION_HISTORY_SIZE, dtype=jnp.int32)
+        position_hashes = position_hashes.at[0].set(init_hash)
+        
+        return XiangqiState(
+            board=board,
+            history=history,
+            current_player=current_player,
+            legal_action_mask=legal_mask,
+            rewards=jnp.zeros(2, dtype=jnp.float32),
+            terminated=jnp.bool_(False),
+            step_count=jnp.int32(0),
+            no_capture_count=jnp.int32(0),
+            winner=jnp.int32(-1),
+            draw_reason=jnp.int32(0),
+            position_hashes=position_hashes,
+            hash_count=jnp.int32(1),
+            red_check_count=jnp.int32(0),
+            red_chase_count=jnp.int32(0),
+            red_alt_count=jnp.int32(0),
+            red_max_check_pieces=jnp.int32(0),
+            black_check_count=jnp.int32(0),
+            black_chase_count=jnp.int32(0),
+            black_alt_count=jnp.int32(0),
+            black_max_check_pieces=jnp.int32(0),
+            check_in_no_capture=jnp.int32(0),
+            search_model_index=jnp.int32(0),
+        )
+    
+    @partial(jax.jit, static_argnums=(0,))
     def step(self, state: XiangqiState, action: jnp.ndarray) -> XiangqiState:
         """
         执行一步动作
