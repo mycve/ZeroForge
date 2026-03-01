@@ -107,22 +107,12 @@ class UCIEngine:
             self.process.stdin.write(f"{cmd}\n")
             self.process.stdin.flush()
 
-    def new_game(self):
-        """新开局，清空 hash 表"""
+    def restart(self) -> bool:
+        """重启引擎进程，彻底清空 hash 等状态"""
         with self.lock:
-            self.send("ucinewgame")
-            self.send("isready")
-            # 等待 readyok
-            start = time.time()
-            while time.time() - start < 2:
-                try:
-                    line = self.output_queue.get(timeout=0.1)
-                    if "readyok" in line:
-                        print("[UCI] Hash 已清空 (ucinewgame)")
-                        return True
-                except queue.Empty:
-                    continue
-            return False
+            self.stop()
+            time.sleep(0.2)  # 等待进程完全退出
+            return self.start()
 
     def get_best_move(self, fen: str, depth: int = 10) -> Tuple[Optional[str], Optional[int]]:
         """获取最佳着法和评估分数"""
@@ -671,9 +661,9 @@ async def new_game(req: NewGameRequest):
     """开始新游戏"""
     global game_state, rng_key
     
-    # 清空 UCI 引擎 hash
+    # 重启 UCI 引擎进程，彻底清空 hash
     if uci_engine and uci_engine.ready:
-        uci_engine.new_game()
+        uci_engine.restart()
     
     board, player = parse_fen(req.fen)
     rng_key, sk = jax.random.split(rng_key)

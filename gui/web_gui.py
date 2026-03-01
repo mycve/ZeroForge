@@ -7,7 +7,7 @@ ZeroForge Web GUI - 启动入口
 
 特性:
 - UCI 引擎 (Pikafish) 全局单例，自动启动
-- 每次新局自动清空 UCI hash
+- 每次新局重启 UCI 引擎进程，彻底清空 hash
 - 支持 ZeroForge AI 和 UCI 引擎对弈
 """
 
