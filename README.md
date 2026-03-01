@@ -81,8 +81,7 @@ checkpoints/
 ├── 20/
 ├── meta_10/         # 额外元数据
 │   ├── metadata.json       # ELO 记录
-│   ├── history_*.npz       # 历史模型（用于 ELO 评估）
-│   └── replay_buffer.npz   # 经验回放缓冲区
+│   └── history_*.npz       # 历史模型（用于 ELO 评估）
 └── meta_20/
 ```
 

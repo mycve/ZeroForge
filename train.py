@@ -98,7 +98,6 @@ class Config:
     ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
     max_to_keep: int = 20            # 最多保留 N 个 checkpoint
     keep_period: int = 50           # 每 N 次迭代永久保留一个 checkpoint
-    save_replay_buffer: bool = True  # 是否保存经验池（大 buffer 可能耗时）
 
 config = Config()
 _QTRANSFORM = partial(
@@ -794,12 +793,11 @@ def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
 def save_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     train_state: TrainState,
-    replay_buffer: ReplayBuffer,
     step: int,
 ):
     """保存完整训练状态
     
-    包含：模型参数、优化器状态、迭代计数、随机数状态、历史模型、ELO、回放缓冲区
+    包含：模型参数、优化器状态、迭代计数、随机数状态、历史模型、ELO
     """
     # 从设备获取参数（只取第一个设备的副本）
     params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.params))
@@ -818,7 +816,7 @@ def save_checkpoint(
     # 保存主状态
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
     
-    # 单独保存 metadata (history_models keys, elos) 和 replay buffer
+    # 单独保存 metadata (history_models keys, elos)
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     
@@ -829,23 +827,6 @@ def save_checkpoint(
             "history_model_keys": [int(k) for k in train_state.history_models.keys()],
             "total_opt_steps": train_state.total_opt_steps,
         }, f)
-    
-    # 保存经验池
-    if config.save_replay_buffer:
-        try:
-            rb_state = replay_buffer.state_dict()
-            np.savez_compressed(
-                os.path.join(meta_dir, "replay_buffer.npz"),
-                obs=rb_state["obs"],
-                policy_tgt=rb_state["policy_tgt"],
-                wdl_tgt=rb_state["wdl_tgt"],
-                mask=rb_state["mask"],
-                ptr=np.array(rb_state["ptr"]),
-                size=np.array(rb_state["size"]),
-                total_added=np.array(rb_state["total_added"]),
-            )
-        except Exception as e:
-            print(f"[Checkpoint] 经验池保存失败（可设 save_replay_buffer=False）: {e}")
     
     # 保存历史模型参数
     for k, v in train_state.history_models.items():
@@ -859,7 +840,6 @@ def restore_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     params_template: dict,
     opt_state_template: dict,
-    replay_buffer: ReplayBuffer,
 ) -> Optional[tuple]:
     """恢复训练状态
     
@@ -901,24 +881,6 @@ def restore_checkpoint(
             iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
             history_model_keys = meta["history_model_keys"]
             total_opt_steps = int(meta.get("total_opt_steps", 0))
-        
-        # 恢复经验池
-        replay_path = os.path.join(meta_dir, "replay_buffer.npz")
-        if config.save_replay_buffer and os.path.exists(replay_path):
-            try:
-                data = np.load(replay_path)
-                replay_buffer.load_state_dict({
-                    "obs": data["obs"],
-                    "policy_tgt": data["policy_tgt"],
-                    "wdl_tgt": data["wdl_tgt"],
-                    "mask": data["mask"],
-                    "ptr": int(data["ptr"]),
-                    "size": int(data["size"]),
-                    "total_added": int(data["total_added"]),
-                })
-                print(f"[Checkpoint] 经验池已恢复: size={replay_buffer.size}")
-            except Exception as e:
-                print(f"[Checkpoint] 经验池恢复失败: {e}")
         
         tree_struct = jax.tree.structure(params_template)
         for k in history_model_keys:
@@ -989,7 +951,7 @@ def main():
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
     ckpt_manager = create_checkpoint_manager(config.ckpt_dir)
-    restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template, replay_buffer)
+    restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template)
     
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps = restored
@@ -1239,7 +1201,7 @@ def main():
                 iteration_elos=iteration_elos,
                 total_opt_steps=total_opt_steps,
             )
-            save_checkpoint(ckpt_manager, train_state, replay_buffer, iteration)
+            save_checkpoint(ckpt_manager, train_state, iteration)
         
         if iteration % config.eval_interval == 0:
             # 评估对手优先选择“历史最佳模型”（按 iteration_elos），
