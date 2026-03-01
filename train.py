@@ -563,7 +563,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
     - 全程贪婪走子，降低评估噪声，提升版本可比性
     - initial_states: 已按设备分片的初始状态
     """
-    batch_size = initial_states.board.shape[1]
+    batch_size = initial_states.board.shape[0]  # shape[0]=batch, shape[1]=10(行)
     
     def recurrent_fn_eval(params, rng_key, action, state):
         prev_player = state.current_player
