@@ -61,8 +61,8 @@ class Config:
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 32
-    top_k: int = 8                      # 根节点候选数
+    num_simulations: int = 16
+    top_k: int = 4                      # 根节点候选数
     
     # 经验回放配置
     replay_buffer_size: int = 10000000
@@ -71,7 +71,7 @@ class Config:
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    qtransform_value_scale: float = 0.30   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
