@@ -69,10 +69,10 @@ class Config:
     sample_reuse_times: int = 1
     
     # 损失权重
-    value_loss_weight: float = 0.1
+    value_loss_weight: float = 0.25
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.5
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.2
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
