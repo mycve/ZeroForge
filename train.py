@@ -52,27 +52,27 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 4000       # 预热步数
+    lr_warmup_steps: int = 1000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 500000     # 余弦周期（opt steps）
+    lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.55          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.75          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
     selfplay_batch_size: int = 2048
-    num_simulations: int = 16
-    top_k: int = 4                      # 根节点候选数
+    num_simulations: int = 32
+    top_k: int = 2                      # 根节点候选数
     
     # 经验回放配置
-    replay_buffer_size: int = 10000000
-    sample_reuse_times: int = 2
+    replay_buffer_size: int = 1_000_000
+    sample_reuse_times: int = 1
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 0.1
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.30   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0     # 降低根节点随机性，减少训练目标抖动
+    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.5
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
