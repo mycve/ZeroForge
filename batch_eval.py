@@ -34,8 +34,11 @@ from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass, field
 
 # 需在 import jax 前设置
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+if "--cpu" in sys.argv:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+else:
+    os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
@@ -587,7 +590,15 @@ def main():
         default=42,
         help="随机种子",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="强制使用 CPU（无 GPU 时或调试用）",
+    )
     args = parser.parse_args()
+    
+    if args.cpu:
+        log.info("强制使用 CPU 模式（若已加载 JAX 则需重启脚本）")
     
     # 解析 runs 配置
     if args.runs.endswith(".json"):
