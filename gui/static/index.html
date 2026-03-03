@@ -26,6 +26,14 @@
                 <!-- 棋盘区域 -->
                 <div class="flex-shrink-0 board-container w-full lg:w-auto">
                     <div class="bg-white rounded-lg shadow-lg p-1 sm:p-4">
+                        <div class="flex justify-end mb-1">
+                            <button @click="boardFlipped = !boardFlipped"
+                                    class="text-xs px-2 py-1 rounded border hover:bg-gray-100"
+                                    :class="boardFlipped ? 'bg-gray-200 border-gray-400 text-gray-700' : 'bg-white border-gray-300 text-gray-600'"
+                                    title="翻转棋盘">
+                                {{ boardFlipped ? '↩ 黑方视角' : '↪ 翻转' }}
+                            </button>
+                        </div>
                         <!-- 响应式 SVG 棋盘 -->
                         <div :style="boardContainerStyle" class="overflow-hidden">
                             <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
@@ -89,26 +97,26 @@
                             <template v-if="lastMove">
                                 <circle v-for="pos in [[lastMove[0], lastMove[1]], [lastMove[2], lastMove[3]]]"
                                         :cx="baseMargin + pos[1]*baseCellSize" 
-                                        :cy="baseMargin + (9-pos[0])*baseCellSize"
+                                        :cy="displayY(pos[0])"
                                         :r="basePieceRadius + 3" fill="none" stroke="#03A9F4" stroke-width="2.5"/>
                             </template>
                             
                             <!-- 选中高亮 -->
                             <circle v-if="selected"
                                     :cx="baseMargin + selected[1]*baseCellSize"
-                                    :cy="baseMargin + (9-selected[0])*baseCellSize"
+                                    :cy="displayY(selected[0])"
                                     :r="basePieceRadius + 3" fill="none" stroke="#FFD600" stroke-width="2.5"/>
                             
                             <!-- 将军高亮 -->
                             <circle v-if="isCheck && kingPos"
                                     :cx="baseMargin + kingPos[1]*baseCellSize"
-                                    :cy="baseMargin + (9-kingPos[0])*baseCellSize"
+                                    :cy="displayY(kingPos[0])"
                                     :r="basePieceRadius + 3" fill="none" stroke="#F44336" stroke-width="2.5"/>
                             
                             <!-- 合法落点 -->
                             <circle v-for="move in legalTargets"
                                     :cx="baseMargin + move[1]*baseCellSize"
-                                    :cy="baseMargin + (9-move[0])*baseCellSize"
+                                    :cy="displayY(move[0])"
                                     r="7" fill="#4CAF50" opacity="0.7"/>
                             
                             <!-- 策略箭头 -->
@@ -131,11 +139,11 @@
                                 <g v-for="(piece, c) in row" :key="`${r}-${c}`">
                                     <template v-if="piece !== 0">
                                         <circle :cx="baseMargin + c*baseCellSize" 
-                                                :cy="baseMargin + (9-r)*baseCellSize"
+                                                :cy="displayY(r)"
                                                 :r="basePieceRadius" fill="#FDF5E6" 
                                                 :stroke="piece > 0 ? '#D32F2F' : '#212121'" stroke-width="1.5"/>
                                         <text :x="baseMargin + c*baseCellSize" 
-                                              :y="baseMargin + (9-r)*baseCellSize + 7"
+                                              :y="displayY(r) + 7"
                                               font-size="21" :fill="piece > 0 ? '#D32F2F' : '#212121'" 
                                               text-anchor="middle" font-weight="bold" class="piece">
                                             {{ getPieceName(piece) }}
@@ -144,11 +152,11 @@
                                 </g>
                             </g>
                             
-                            <!-- 点击区域（扩大触摸范围）-->
+                            <!-- 点击区域（扩大触摸范围）；翻转时 rect 位置随棋盘翻转 -->
                             <template v-for="r in 10" :key="`row-${r}`">
                                 <rect v-for="c in 9" :key="`click-${r-1}-${c-1}`"
                                       :x="baseMargin + (c-1)*baseCellSize - baseCellSize/2"
-                                      :y="baseMargin + (10-r)*baseCellSize - baseCellSize/2"
+                                      :y="baseMargin + (boardFlipped ? (r-1) : (10-r)) * baseCellSize - baseCellSize/2"
                                       :width="baseCellSize" :height="baseCellSize"
                                       fill="transparent" style="cursor:pointer"
                                       @click="handleClick(r-1, c-1)"
@@ -516,6 +524,7 @@
             const atLatest = ref(true);
             const policyInfo = ref(null);  // 策略分布信息
             const showPolicyArrows = ref(true);  // 是否显示策略箭头
+            const boardFlipped = ref(false);  // 是否翻转棋盘（黑方视角）
             
             // UI 状态
             const selected = ref(null);
@@ -566,6 +575,8 @@
             
             // 方法
             const getPieceName = (piece) => pieceNames[piece] || '';
+            // 行号转显示 Y 坐标（翻转时 row0 在上方）
+            const displayY = (r) => baseMargin + (boardFlipped.value ? r : (9 - r)) * baseCellSize;
             
             const formatUciScore = (score) => {
                 if (score === null) return '';
@@ -587,17 +598,9 @@
                 return baseMargin + move.from[1] * baseCellSize;
             };
             
-            const getArrowStartY = (move) => {
-                return baseMargin + (9 - move.from[0]) * baseCellSize;
-            };
-            
-            const getArrowEndX = (move) => {
-                return baseMargin + move.to[1] * baseCellSize;
-            };
-            
-            const getArrowEndY = (move) => {
-                return baseMargin + (9 - move.to[0]) * baseCellSize;
-            };
+            const getArrowStartY = (move) => displayY(move.from[0]);
+            const getArrowEndX = (move) => baseMargin + move.to[1] * baseCellSize;
+            const getArrowEndY = (move) => displayY(move.to[0]);
             
             const getArrowColor = (idx) => {
                 // 使用紫色系，避免和现有高亮冲突
@@ -968,7 +971,7 @@
                 board, currentPlayer, lastMove, lastMoveUci, gameOver, winner,
                 stepCount, isCheck, kingPos, legalMoves, historyLength,
                 aiValue, uciScore, aiLoaded, uciReady, fen,
-                canUndo, canForward, atLatest, policyInfo, showPolicyArrows,
+                canUndo, canForward, atLatest, policyInfo, showPolicyArrows, boardFlipped,
                 // UI
                 selected, thinking, paused, loading, activeTab, message, messageType,
                 // 设置
@@ -978,7 +981,7 @@
                 // 计算属性
                 legalTargets, isAITurn, displayAiValue, displayUciScore,
                 // 方法
-                getPieceName, formatUciScore, handleClick, newGame, undo, forward, gotoLatest, togglePause,
+                getPieceName, displayY, formatUciScore, handleClick, newGame, undo, forward, gotoLatest, togglePause,
                 applyFen, copyFen, refreshCheckpoints, loadModel, gotoStep, requestPolicyAnalysis,
                 // 箭头函数
                 getArrowStartX, getArrowStartY, getArrowEndX, getArrowEndY,
