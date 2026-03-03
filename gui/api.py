@@ -515,29 +515,24 @@ def get_ai_action(
     if state.current_player == 1:
         search_value = -search_value
     
-    # action_weights 是 softmax(logits + completed_q)，因 Q-value 缩放因子
-    # 随访问次数增长（(50+maxvisit)*0.25），导致分布极度集中于最优动作。
-    # 改用 visit_probs（访问次数归一化）作为展示权重，更有分析价值。
+    # improved_policy (action_weights): 含 Q 的 softmax，实际选择依据
+    # visit_probs: 访问次数归一化，反映搜索关注度
     summary = policy_output.search_tree.summary()
     visit_probs = np.array(summary.visit_probs[0])
     improved_policy = np.array(policy_output.action_weights[0])
     
-    # 选择动作仍使用 improved_policy（最强走法）
+    # 选择动作使用 improved_policy（按 Q 改进的策略）
     action = int(np.argmax(improved_policy))
     
     # 构建策略分布信息
     policy_info = None
     if return_policy:
-        # 按访问次数排序，更直观地展示搜索关注度
-        # 注意：返回数量 = 有 visit 的动作数，由 MCTS 的 max_num_considered_actions(top_k) 决定
+        # 按 improved_policy（选择概率）排序，使显示与实际选择一致，idx=0 即为实际会选的着法
         visit_counts = np.array(summary.visit_counts[0])
-        num_with_visits = int(np.sum(visit_probs > 1e-6))
-        print(f"[AI] get_ai_action: top_k={top_k}, num_simulations={num_simulations}, "
-              f"有访问的动作数={num_with_visits}, 合法动作数={len(legal_actions)}")
-        top_indices = np.argsort(visit_probs)[::-1][:min(top_k, len(legal_actions))]
+        top_indices = np.argsort(improved_policy)[::-1][:min(top_k, len(legal_actions))]
         top_moves = []
         for idx in top_indices:
-            if visit_probs[idx] > 1e-6:
+            if improved_policy[idx] > 1e-6:
                 fs, ts = action_to_move(int(idx))
                 fs, ts = int(fs), int(ts)
                 fr, fc = fs // 9, fs % 9
@@ -545,10 +540,9 @@ def get_ai_action(
                 top_moves.append({
                     "action": int(idx),
                     "uci": move_to_uci(fs, ts),
-                    "weight": float(visit_probs[idx]),
+                    "weight": float(improved_policy[idx]),  # 选择概率（含 Q），与箭头一致
                     "visits": int(visit_counts[idx]),
                     "prior": float(prior_probs[idx]),
-                    "improved": float(improved_policy[idx]),
                     "from": [fr, fc],
                     "to": [tr, tc],
                 })
@@ -1033,7 +1027,6 @@ async def ai_think(req: AIThinkRequest):
 @app.post("/api/policy_analysis")
 async def policy_analysis(req: AIThinkRequest):
     """获取当前局面的策略分析（不执行着法）"""
-    print(f"[API] policy_analysis 收到请求: num_simulations={req.num_simulations}, top_k={req.top_k}")
     if game_state is None:
         raise HTTPException(status_code=400, detail="No game in progress")
     if model_mgr.params is None:
