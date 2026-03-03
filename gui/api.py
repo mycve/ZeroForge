@@ -500,6 +500,7 @@ def get_ai_action(
         embedding=jax.tree.map(lambda x: jnp.expand_dims(x, 0), state.jax_state)
     )
     
+    # max_num_considered_actions 限制根节点展开的动作数，只有被展开的动作才会有 visit
     policy_output = mctx.gumbel_muzero_policy(
         params=model_mgr.params, rng_key=sk1, root=root,
         recurrent_fn=mcts_recurrent_fn,
@@ -528,8 +529,12 @@ def get_ai_action(
     policy_info = None
     if return_policy:
         # 按访问次数排序，更直观地展示搜索关注度
+        # 注意：返回数量 = 有 visit 的动作数，由 MCTS 的 max_num_considered_actions(top_k) 决定
         visit_counts = np.array(summary.visit_counts[0])
-        top_indices = np.argsort(visit_probs)[::-1][:min(10, len(legal_actions))]
+        num_with_visits = int(np.sum(visit_probs > 1e-6))
+        print(f"[AI] get_ai_action: top_k={top_k}, num_simulations={num_simulations}, "
+              f"有访问的动作数={num_with_visits}, 合法动作数={len(legal_actions)}")
+        top_indices = np.argsort(visit_probs)[::-1][:min(top_k, len(legal_actions))]
         top_moves = []
         for idx in top_indices:
             if visit_probs[idx] > 1e-6:
@@ -550,6 +555,7 @@ def get_ai_action(
         
         policy_info = {
             "top_moves": top_moves,
+            "top_k": top_k,  # 便于前端核对实际使用的 top_k
             "is_forced": False,
         }
     
@@ -1027,6 +1033,7 @@ async def ai_think(req: AIThinkRequest):
 @app.post("/api/policy_analysis")
 async def policy_analysis(req: AIThinkRequest):
     """获取当前局面的策略分析（不执行着法）"""
+    print(f"[API] policy_analysis 收到请求: num_simulations={req.num_simulations}, top_k={req.top_k}")
     if game_state is None:
         raise HTTPException(status_code=400, detail="No game in progress")
     if model_mgr.params is None:

@@ -188,6 +188,7 @@
                                 <div class="flex justify-between items-center mb-1">
                                     <div class="flex items-center gap-2">
                                         <span class="text-xs font-semibold text-blue-800">📊 策略分布</span>
+                                        <span v-if="policyInfo.top_k" class="text-xs text-gray-500">(Top-K={{ policyInfo.top_k }}, 返回{{ policyInfo.top_moves.length }}个)</span>
                                         <button @click="showPolicyArrows = !showPolicyArrows" 
                                                 class="text-xs px-2 py-0.5 rounded border hover:bg-blue-100"
                                                 :class="showPolicyArrows ? 'bg-purple-100 border-purple-300 text-purple-700' : 'bg-gray-100 border-gray-300 text-gray-600'">
