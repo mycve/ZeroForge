@@ -114,18 +114,24 @@ class UCIEngine:
             time.sleep(0.2)  # 等待进程完全退出
             return self.start()
 
-    def get_best_move(self, fen: str, depth: int = 10) -> Tuple[Optional[str], Optional[int]]:
-        """获取最佳着法和评估分数"""
+    def get_best_move(self, fen: str, movetime_ms: int = 1000) -> Tuple[Optional[str], Optional[int]]:
+        """获取最佳着法和评估分数，按时间限制（ms）"""
+        movetime_ms = max(100, movetime_ms)
+        go_cmd = f"go movetime {movetime_ms}"
+        wait_seconds = movetime_ms / 1000.0 + 2.0  # 时间限制 + 2 秒缓冲
+        
         with self.lock:
             # 清空队列
             while not self.output_queue.empty():
-                self.output_queue.get()
+                try:
+                    self.output_queue.get_nowait()
+                except queue.Empty:
+                    break
             
             self.send(f"position fen {fen}")
-            self.send(f"go depth {depth}")
+            self.send(go_cmd)
             
             start_time = time.time()
-            wait_seconds = max(2.0, depth * 0.5)
             last_score = None
             
             while time.time() - start_time < wait_seconds:
@@ -576,7 +582,7 @@ class AIThinkRequest(BaseModel):
 
 
 class UCIThinkRequest(BaseModel):
-    depth: int = 10
+    movetime_ms: int = 1000
 
 
 # ============================================================================
@@ -1056,7 +1062,7 @@ async def uci_think(req: UCIThinkRequest):
         raise HTTPException(status_code=400, detail="Game is over")
     
     fen = board_to_fen(game_state.board, game_state.current_player)
-    bestmove, score = uci_engine.get_best_move(fen, req.depth)
+    bestmove, score = uci_engine.get_best_move(fen, req.movetime_ms)
     
     if not bestmove or bestmove in ("(none)", "0000"):
         raise HTTPException(status_code=500, detail="UCI engine failed to find a move")
