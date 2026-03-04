@@ -71,15 +71,15 @@ class Config:
     # 损失权重
     value_loss_weight: float = 0.25
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.2
+    qtransform_value_scale: float = 0.20   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 探索策略：三段式温度（开局/中局/残局）
     temperature_phase1_steps: int = 10    # 0-10 半步（~5回合）: 开局全探索
-    temperature_phase2_steps: int = 60    # 10-60 半步（~30回合）: 中局适度探索
+    temperature_phase2_steps: int = 30
     temperature_phase1: float = 1.2
-    temperature_phase2: float = 0.8
+    temperature_phase2: float = 1.2
     temperature_final: float = 0.01
     
     # 环境规则（符合象棋竞赛规则）
