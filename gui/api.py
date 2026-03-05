@@ -43,7 +43,7 @@ from networks.alphazero import AlphaZeroNetwork
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 MCTS_QTRANSFORM_VALUE_SCALE = 0.25
-MCTS_GUMBEL_SCALE = 0.0  # 实战默认关闭探索噪声，最大化走子强度
+MCTS_GUMBEL_SCALE = 0.0  # 实战：关闭 Gumbel 噪声，根节点 argmax，最大化走子强度
 MCTS_QTRANSFORM = partial(
     mctx.qtransform_completed_by_mix_value,
     value_scale=MCTS_QTRANSFORM_VALUE_SCALE,
@@ -908,7 +908,7 @@ async def ai_think(req: AIThinkRequest):
     if game_state.game_over:
         raise HTTPException(status_code=400, detail="Game is over")
     
-    # 检查是否在开局随机阶段（优先级高于温度参数）
+    # 检查是否在开局随机阶段
     use_opening_random = (
         req.opening_random_moves > 0 and 
         game_state.step_count < req.opening_random_moves

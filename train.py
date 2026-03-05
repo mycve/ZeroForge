@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 ZeroForge - 中国象棋 Gumbel AlphaZero
-现代化极简顶级架构：算力随机化 + 视角归一化 + 镜像增强 + 标准 ELO
+现代化极简架构：Gumbel-Top-k MCTS（搜索内探索，根节点 argmax 无温度/无采样）
++ 视角归一化 + 镜像增强 + 标准 ELO
 """
 
 import os
@@ -52,35 +53,28 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 1000       # 预热步数
+    lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
     td_lambda: float = 0.95          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
-    # 自对弈与搜索 (Gumbel 优势：低算力也能产生强信号)
+    # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
     selfplay_batch_size: int = 256
-    num_simulations: int = 32 * 4
-    top_k: int = 32                      # 根节点候选数
+    num_simulations: int = 128
+    top_k: int = 16                      # 根节点候选数，不宜过小（建议 >= 16）否则探索不足
     
     # 经验回放配置
     replay_buffer_size: int = 1_500_000
-    sample_reuse_times: int = 1
+    sample_reuse_times: int = 4
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 0.5
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.20   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.2
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
-    
-    # 探索策略：三段式温度（开局/中局/残局）
-    temperature_phase1_steps: int = 12
-    temperature_phase2_steps: int = 50
-    temperature_phase1: float = 1.0
-    temperature_phase2: float = 0.5
-    temperature_final: float = 0.1
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
@@ -152,6 +146,8 @@ config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_siz
 config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
 config.eval_games = _align_to_device_multiple(config.eval_games, "eval_games")
 
+if config.top_k < 8:
+    raise ValueError(f"top_k 不宜过小（建议 >= 16），当前值: {config.top_k}")
 if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
@@ -237,6 +233,7 @@ class SelfplayOutput(NamedTuple):
     draw_reason: jnp.ndarray
     root_value: jnp.ndarray  # MCTS 搜索后的标量价值估计
     root_wdl: jnp.ndarray    # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
+    root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵 (max_steps, batch)，用于监控探索程度
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
@@ -253,13 +250,12 @@ class Sample(NamedTuple):
 def selfplay(params, rng_key, batch_size):
     """
     高性能自玩算子：
-    - 使用 lax.scan 消除 Python 循环开销
-    - Gumbel 算法无需 Dirichlet 噪声 (Gumbel 噪声已提供足够探索)
-    - 统一策略（移除强弱差异，节省计算资源）
-    - 仅使用标准初始局面，保证训练目标一致性
+    - lax.scan 消除 Python 循环开销
+    - Gumbel-Top-k：探索在搜索内完成，无需 Dirichlet/温度/根节点采样，根节点直接 argmax
+    - 统一策略、标准初始局面
     """
     def step_fn(state, key):
-        key_search, key_sample, key_reset = jax.random.split(key, 3)
+        key_search, key_reset = jax.random.split(key, 2)
         obs = jax.vmap(env.observe)(state)
         logits, value, wdl_logits = forward(params, obs)
         root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
@@ -287,31 +283,10 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
         
-        temp = jnp.where(
-            state.step_count < config.temperature_phase1_steps,
-            config.temperature_phase1,
-            jnp.where(
-                state.step_count < config.temperature_phase2_steps,
-                config.temperature_phase2,
-                config.temperature_final,
-            ),
-        )
-        
-        def _sample_action(w, t, k, legal_mask):
-            """温度采样 (log 空间避免数值下溢)"""
-            t = jnp.maximum(t, 1e-3)
-            w_masked = jnp.where(legal_mask, w, 0.0)
-            log_w = jnp.log(w_masked + 1e-10)
-            log_w_temp = log_w / t
-            log_w_temp = jnp.where(legal_mask, log_w_temp, -jnp.inf)
-            log_w_temp = log_w_temp - jnp.max(log_w_temp)
-            w_temp = jnp.exp(log_w_temp)
-            w_temp = jnp.where(legal_mask, w_temp, 0.0)
-            w_prob = w_temp / jnp.maximum(jnp.sum(w_temp), 1e-10)
-            return jax.random.choice(k, ACTION_SPACE_SIZE, p=w_prob)
-        
-        sample_keys = jax.random.split(key_sample, batch_size)
-        action = jax.vmap(_sample_action)(action_weights, temp, sample_keys, state.legal_action_mask)
+        # Gumbel 探索已在搜索内完成，根节点直接取 visit 权重最高的合法动作（无需采样）
+        _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
+        action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
+        action = jnp.argmax(action_weights_masked, axis=-1)
         
         actor = state.current_player
         
@@ -321,6 +296,12 @@ def selfplay(params, rng_key, batch_size):
         normalized_action_weights = jnp.where(state.current_player[:, None] == 0, 
                                               action_weights, action_weights[:, _ROTATED_IDX])
         
+        # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
+        w_masked = jnp.where(state.legal_action_mask, action_weights, 0.0)
+        total = jnp.sum(w_masked, axis=-1, keepdims=True) + 1e-10
+        p = jnp.where(state.legal_action_mask, w_masked / total, 0.0)
+        root_visit_entropy = -jnp.sum(p * jnp.log(p + 1e-10), axis=-1)
+        
         data = SelfplayOutput(
             obs=obs, action_weights=normalized_action_weights,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
@@ -329,6 +310,7 @@ def selfplay(params, rng_key, batch_size):
             winner=next_state.winner, draw_reason=next_state.draw_reason,
             root_value=root_value,
             root_wdl=root_wdl,
+            root_visit_entropy=root_visit_entropy,
         )
         
         # 结束后直接重置为标准初始局面
@@ -337,8 +319,9 @@ def selfplay(params, rng_key, batch_size):
         ))(next_state, jax.random.split(key_reset, batch_size))
         return next_state_reset, data
 
-    state = jax.vmap(env.init)(jax.random.split(rng_key, batch_size))
-    _, data = jax.lax.scan(step_fn, state, jax.random.split(rng_key, config.max_steps))
+    key_init, key_scan = jax.random.split(rng_key, 2)
+    state = jax.vmap(env.init)(jax.random.split(key_init, batch_size))
+    _, data = jax.lax.scan(step_fn, state, jax.random.split(key_scan, config.max_steps))
     return data
 
 @jax.pmap
@@ -407,7 +390,7 @@ def compute_targets(data: SelfplayOutput):
 def compute_selfplay_stats(data: SelfplayOutput):
     """在 GPU 上计算自对弈统计标量，仅传回 ~100 字节而非 ~3GB 原始数据
     
-    返回 (stats[12], avg_length) 均为 float32
+    返回 (stats[12], avg_length, root_visit_entropy_mean) 均为 float32
     """
     term = data.terminated       # (max_steps, batch)
     winner = data.winner
@@ -435,7 +418,9 @@ def compute_selfplay_stats(data: SelfplayOutput):
     game_lengths = jnp.where(term, step_idx, max_steps).astype(jnp.float32)
     avg_length = jnp.mean(jnp.min(game_lengths, axis=0))
     
-    return stats, avg_length
+    root_visit_entropy_mean = jnp.mean(data.root_visit_entropy)
+    
+    return stats, avg_length, root_visit_entropy_mean
 
 # ============================================================================
 # 训练与评估
@@ -909,7 +894,7 @@ def restore_checkpoint(
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: 4分支GNN (Local+Row+Col+Global) + Gumbel + TD(λ) + 经验回放 + 断点续训")
+    print("特性: 4分支GNN (Local+Row+Col+Global) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -1076,10 +1061,11 @@ def main():
         new_frames = config.max_steps * config.selfplay_batch_size
 
         # 只传输统计标量（~100 字节），不再传输完整 data（~3GB）
-        stats_dev, avg_len_dev = gpu_stats
+        stats_dev, avg_len_dev, entropy_dev = gpu_stats
         stats_np = np.array(jax.device_get(stats_dev))
         stats = stats_np.sum(axis=0).astype(np.int64)   # 跨设备求和
         avg_length = float(jax.device_get(avg_len_dev).mean())
+        root_visit_entropy = float(jax.device_get(entropy_dev).mean())
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
@@ -1159,6 +1145,7 @@ def main():
         print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
               f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
+              f"ent={root_visit_entropy:.3f} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         base_lr = float(lr_schedule(total_opt_steps))
         
@@ -1168,6 +1155,7 @@ def main():
         writer.add_scalar("train/lr", base_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
+        writer.add_scalar("stats/root_visit_entropy", root_visit_entropy, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
         
         # 胜负和统计 (数量)

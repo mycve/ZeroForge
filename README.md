@@ -4,8 +4,8 @@
 
 ## 核心特性
 
-- **Gumbel AlphaZero**: DeepMind 的 Gumbel-Top-k 策略改善算法，低模拟次数（128 次）即可产生强训练信号
-- **经验回放**: 样本平均复用 4 次，提高数据利用效率
+- **Gumbel AlphaZero**: Gumbel-Top-k MCTS，探索在搜索内完成；根节点按 visit 权重 argmax，无温度、无采样
+- **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint 的完整状态保存，支持无差别恢复
 - **n-step TD**: MuZero 风格的 n-step 时序差分目标，平衡方差与偏差
 - **视角归一化**: 始终以当前玩家为中心观察，简化网络学习
@@ -98,16 +98,17 @@ scp -r remote:checkpoints/meta_100 ./checkpoints/
 
 ## 默认配置
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `num_channels` | 256 | 网络通道数 |
-| `num_blocks` | 12 | 残差块数量 |
-| `num_simulations` | 32 | MCTS 模拟次数 |
-| `selfplay_batch_size` | 4096 | 自对弈并行数（每轮单次调用总并行量） |
-| `training_batch_size` | 1024 | 训练批大小 |
-| `replay_buffer_size` | 2000000 | 回放缓冲区容量 |
-| `sample_reuse_times` | 4 | 样本复用次数 |
-| `td_lambda` | 0.85 | TD(lambda) 系数 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `num_channels` | 128 | 网络通道数 |
+| `num_blocks` | 10 | 残差块数量 |
+| `num_simulations` | 128 | MCTS 模拟次数 |
+| `selfplay_batch_size` | 256 | 自对弈并行数 |
+| `training_batch_size` | 4096 | 训练批大小 |
+| `replay_buffer_size` | 1500000 | 回放缓冲区容量 |
+| `sample_reuse_times` | 1 | 样本复用次数 |
+| `td_lambda` | 0.95 | TD(λ) 系数 |
+| `top_k` | 32 | Gumbel 根节点候选动作数 |
 
 ## 项目结构
 
