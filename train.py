@@ -66,7 +66,7 @@ class Config:
     top_k: int = 16                      # 根节点候选数，不宜过小（建议 >= 16）否则探索不足
     
     # 经验回放配置
-    replay_buffer_size: int = 1_500_000
+    replay_buffer_size: int = 500_000
     sample_reuse_times: int = 4
     
     # 损失权重
