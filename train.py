@@ -61,7 +61,7 @@ class Config:
     td_lambda: float = 0.95          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
-    selfplay_batch_size: int = 256
+    selfplay_batch_size: int = 512
     num_simulations: int = 128
     top_k: int = 16                      # 根节点候选数，不宜过小（建议 >= 16）否则探索不足
     
