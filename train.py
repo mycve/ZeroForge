@@ -61,12 +61,12 @@ class Config:
     td_lambda: float = 0.95          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
-    selfplay_batch_size: int = 512
-    num_simulations: int = 128
-    top_k: int = 16                      # 根节点候选数，不宜过小（建议 >= 16）否则探索不足
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 6                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置
-    replay_buffer_size: int = 500_000
+    replay_buffer_size: int = 1_200_000
     sample_reuse_times: int = 4
     
     # 损失权重
@@ -146,8 +146,8 @@ config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_siz
 config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
 config.eval_games = _align_to_device_multiple(config.eval_games, "eval_games")
 
-if config.top_k < 8:
-    raise ValueError(f"top_k 不宜过小（建议 >= 16），当前值: {config.top_k}")
+if config.top_k < 2:
+    raise ValueError(f"top_k 至少为 2，当前值: {config.top_k}")
 if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
