@@ -197,25 +197,19 @@ class ModelManager:
         self.last_error = ""
 
     def _infer_channels(self, params) -> Optional[int]:
-        # GNN 结构：首个 Dense_0 的输出维度即 channels
+        # 当前 GNN 结构：首层 input_proj 的输出维度即 channels
         try:
-            if hasattr(params, "get") and params.get("Dense_0") is not None:
-                dense0 = params.get("Dense_0")
-                return int(dense0["kernel"].shape[-1])
-            if "Dense_0" in params:
-                dense0 = params["Dense_0"]
-                return int(dense0["kernel"].shape[-1])
+            if "input_proj" in params:
+                proj = params["input_proj"]
+                return int(proj["kernel"].shape[-1])
         except Exception:
             pass
-        # 兜底：扫描 Dense_* 的 kernel 形状
+        # 兜底：GraphBlock_0/q_proj
         try:
-            for k in params.keys():
-                if str(k).startswith("Dense_"):
-                    kernel = params[k]["kernel"]
-                    if kernel.ndim == 2:
-                        return int(kernel.shape[-1])
+            if "GraphBlock_0" in params and "q_proj" in params["GraphBlock_0"]:
+                return int(params["GraphBlock_0"]["q_proj"]["kernel"].shape[-1])
         except Exception:
-            return None
+            pass
         return None
 
     def _infer_num_blocks(self, params) -> int:
