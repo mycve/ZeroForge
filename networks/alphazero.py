@@ -24,6 +24,20 @@ from xiangqi.actions import (
     ACTION_SPACE_SIZE,
     _ACTION_TO_FROM_SQ,
     _ACTION_TO_TO_SQ,
+    R_KING,
+    R_ADVISOR,
+    R_BISHOP,
+    R_KNIGHT,
+    R_ROOK,
+    R_CANNON,
+    R_PAWN,
+    B_KING,
+    B_ADVISOR,
+    B_BISHOP,
+    B_KNIGHT,
+    B_ROOK,
+    B_CANNON,
+    B_PAWN,
 )
 
 
@@ -197,7 +211,9 @@ class PolicyHead(nn.Module):
     """Factorized from/to policy head
 
     将动作分解为 (from_square, to_square) 对，用点积评分:
-    score(a) = q_from[from(a)] · k_to[to(a)] + bias_from[from(a)] + bias_to[to(a)] + global
+    score(a) = base_factorized(a) + correction_delta(a) + global
+
+    correction 分支为小型残差打分器，补偿纯 from/to 因子化的表达上限。
     """
     action_space_size: int
     model_dim: int
@@ -219,6 +235,21 @@ class PolicyHead(nn.Module):
             + from_bias[:, from_idx]
             + to_bias[:, to_idx]
         )
+
+        # Lightweight correction branch: delta(a) from projected (from,to) node features.
+        corr_dim = max(self.model_dim // 16, 8)
+        corr_from = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_from_proj")(x)
+        corr_to = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_to_proj")(x)
+        corr_from_act = corr_from[:, from_idx, :]
+        corr_to_act = corr_to[:, to_idx, :]
+        corr_feat = jnp.concatenate(
+            [corr_from_act * corr_to_act, jnp.abs(corr_from_act - corr_to_act)], axis=-1
+        )
+        corr_hidden = nn.Dense(corr_dim, dtype=self.dtype, name="corr_fc1")(corr_feat)
+        corr_hidden = nn.silu(corr_hidden)
+        corr_delta = nn.Dense(1, dtype=self.dtype, name="corr_fc2")(corr_hidden).squeeze(-1)
+        corr_scale = self.param("corr_scale", nn.initializers.constant(0.0), ())
+        logits = logits + corr_scale * corr_delta
 
         global_ctx = jnp.mean(x, axis=1)
         logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
@@ -286,6 +317,14 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
         self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
         self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
+        # Must match env.observe channel order:
+        # [R_KING..R_PAWN, B_PAWN..B_KING]
+        piece_types = np.array([
+            R_KING, R_ADVISOR, R_BISHOP, R_KNIGHT, R_ROOK, R_CANNON, R_PAWN,
+            B_PAWN, B_CANNON, B_ROOK, B_KNIGHT, B_BISHOP, B_ADVISOR, B_KING,
+        ], dtype=np.int32)
+        self.piece_role_idx = jnp.array(np.abs(piece_types) - 1, dtype=jnp.int32)  # 0..6
+        self.piece_side_idx = jnp.array((piece_types < 0).astype(np.int32), dtype=jnp.int32)  # 0=self,1=opp
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -302,23 +341,62 @@ class AlphaZeroNetwork(nn.Module):
         batch_size = x.shape[0]
         num_nodes = BOARD_HEIGHT * BOARD_WIDTH
 
-        # 历史帧时间权重：9 帧各一个可学习标量，初始化为指数衰减
-        # 帧顺序: [当前, t-1, t-2, ..., t-8]，越近权重越大
+        # 输入因子化编码: piece(role+side) embedding + frame embedding
+        # 目标: 让同类棋子共享统计结构，提高跨局面泛化与样本效率
         num_frames = 9
         channels_per_frame = 14
+        if x.shape[-1] != num_frames * channels_per_frame:
+            raise ValueError(
+                f"通道数不匹配，期望 {num_frames * channels_per_frame}，实际 {x.shape[-1]}"
+            )
+
+        piece_embed_dim = max(self.channels // 8, 16)
+        role_embed = self.param(
+            "piece_role_embed",
+            nn.initializers.normal(stddev=0.02),
+            (7, piece_embed_dim),
+        )
+        side_embed = self.param(
+            "piece_side_embed",
+            nn.initializers.normal(stddev=0.02),
+            (2, piece_embed_dim),
+        )
+        piece_channel_bias = self.param(
+            "piece_channel_bias",
+            nn.initializers.zeros,
+            (channels_per_frame, piece_embed_dim),
+        )
+        piece_embed_table = (
+            role_embed[self.piece_role_idx]
+            + side_embed[self.piece_side_idx]
+            + piece_channel_bias
+        ).astype(self.dtype)  # (14, Dp)
+
+        x = x.reshape((batch_size, BOARD_HEIGHT, BOARD_WIDTH, num_frames, channels_per_frame))
+
+        # 历史帧时间权重：9 帧各一个可学习标量，初始化为指数衰减
+        # 帧顺序: [当前, t-1, t-2, ..., t-8]，越近权重越大
         frame_weight_raw = self.param(
             "frame_time_weight",
             lambda key, shape: jnp.linspace(0.0, -1.5, num_frames),
             (num_frames,),
         )
-        # softplus 保证正值，初始约 [1.0, 0.88, ..., 0.24]
-        frame_weight = nn.softplus(frame_weight_raw)
-        # 展开到 126 维: 每帧 14 通道共享同一个权重
-        channel_weight = jnp.repeat(frame_weight, channels_per_frame)  # (126,)
-        x = x * channel_weight[None, None, None, :]  # (B, H, W, 126)
+        frame_weight = nn.softplus(frame_weight_raw).astype(self.dtype)
+        frame_embed = self.param(
+            "frame_embed",
+            nn.initializers.normal(stddev=0.02),
+            (num_frames, piece_embed_dim),
+        ).astype(self.dtype)
 
-        h = x.reshape((batch_size, num_nodes, x.shape[-1]))
-        h = nn.Dense(self.channels, dtype=self.dtype)(h)
+        # (B, H, W, F, 14) x (14, Dp) -> (B, H, W, F, Dp)
+        piece_feat = jnp.einsum("bhwfp,pd->bhwfd", x, piece_embed_table)
+        piece_presence = jnp.sum(x, axis=-1, keepdims=True)  # 0/1 occupancy per frame
+        piece_feat = piece_feat + piece_presence * frame_embed[None, None, None, :, :]
+        piece_feat = piece_feat * frame_weight[None, None, None, :, None]
+
+        # 保留时间维度再投影，避免直接求和造成时序信息丢失
+        h = piece_feat.reshape((batch_size, num_nodes, num_frames * piece_embed_dim))
+        h = nn.Dense(self.channels, dtype=self.dtype, name="input_proj")(h)
 
         pos_embed = self.param(
             "pos_embed",

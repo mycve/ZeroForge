@@ -68,6 +68,10 @@ class Config:
     # 经验回放配置
     replay_buffer_size: int = 1_200_000
     sample_reuse_times: int = 4
+    replay_prioritized_ratio: float = 0.70  # 混合采样: 70% 优先 + 30% 均匀
+    replay_priority_alpha: float = 0.80     # 优先级分布平滑指数
+    replay_priority_eps: float = 1e-3       # 优先级下限，防止概率为 0
+    replay_priority_update_eta: float = 0.25  # 在线更新平滑系数（越大越跟随当前loss）
     
     # 损失权重
     value_loss_weight: float = 0.5
@@ -456,7 +460,9 @@ def loss_fn(params, samples: Sample, rng_key):
     value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
-    return total_loss, (policy_loss, value_loss)
+    # 在线优先采样信号：当前网络在该样本上的联合损失（仅有效样本）
+    sample_priority = (policy_ce + config.value_loss_weight * value_loss_per) * samples.mask.astype(jnp.float32)
+    return total_loss, (policy_loss, value_loss, sample_priority)
 
 def _build_eval_initial_states(
     fen_file: Optional[str],
@@ -635,20 +641,70 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 # ============================================================================
 
 class ReplayBuffer:
-    """纯 NumPy 环形缓冲区 - 零设备冲突，极简稳定"""
+    """纯 NumPy 环形缓冲区 + 混合优先采样"""
     
-    def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        obs_shape: tuple,
+        action_size: int,
+        prioritized_ratio: float = 0.70,
+        priority_alpha: float = 0.80,
+        priority_eps: float = 1e-3,
+        priority_update_eta: float = 0.25,
+    ):
         self.max_size = max_size
+        self.prioritized_ratio = float(np.clip(prioritized_ratio, 0.0, 1.0))
+        self.priority_alpha = float(max(priority_alpha, 0.0))
+        self.priority_eps = float(max(priority_eps, 1e-8))
+        self.priority_update_eta = float(np.clip(priority_update_eta, 0.0, 1.0))
         
         # 全部用 NumPy 数组（CPU 内存）
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)  # WDL 概率分布
         self.mask = np.zeros((max_size,), dtype=np.bool_)
+        self.priority = np.full((max_size,), self.priority_eps, dtype=np.float32)
         
         self.ptr = 0
         self.size = 0
         self.total_added = 0
+
+    @staticmethod
+    def _build_rng(rng_key):
+        key_np = np.asarray(rng_key, dtype=np.uint32).reshape(-1)
+        if key_np.size >= 2:
+            seed = (np.uint64(key_np[0]) << np.uint64(32)) ^ np.uint64(key_np[1])
+        elif key_np.size == 1:
+            seed = np.uint64(key_np[0])
+        else:
+            seed = np.uint64(np.random.randint(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+        return np.random.default_rng(int(seed))
+
+    def _estimate_priority(
+        self,
+        policy_flat: np.ndarray,
+        wdl_flat: np.ndarray,
+        mask_flat: np.ndarray,
+    ) -> np.ndarray:
+        """估计战术优先级（向量化）.
+
+        组成:
+        - policy_focus: MCTS 策略越尖锐，优先级越高
+        - wdl_decisive: W/L 差距越大，优先级越高
+        """
+        eps = 1e-8
+        action_dim = float(policy_flat.shape[-1])
+        policy_entropy = -np.sum(policy_flat * np.log(policy_flat + eps), axis=-1)
+        policy_focus = 1.0 - (policy_entropy / np.log(action_dim + eps))
+        policy_focus = np.clip(policy_focus, 0.0, 1.0)
+
+        wdl_decisive = np.abs(wdl_flat[:, 0] - wdl_flat[:, 2])
+        wdl_decisive = np.clip(wdl_decisive, 0.0, 1.0)
+
+        priority = 0.60 * policy_focus + 0.40 * wdl_decisive
+        priority = np.where(mask_flat, priority, 0.0)
+        return np.maximum(priority.astype(np.float32), self.priority_eps)
 
     def add(self, samples: Sample):
         """存入样本（从 JAX 自动转 NumPy）"""
@@ -666,44 +722,107 @@ class ReplayBuffer:
         self.policy_tgt[indices] = policy_flat
         self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
+        self.priority[indices] = self._estimate_priority(policy_flat, wdl_flat, mask_flat)
         
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
     
-    def sample(self, batch_size: int, rng_key) -> Sample:
+    def sample(self, batch_size: int, rng_key):
         """采样后转回 JAX 数组
         
         优化：obs 保持 uint8 传输，减少 4x CPU→GPU 带宽
         在 GPU 上的 loss_fn 中再转为 float32
         """
-        # 使用 JAX 随机数生成索引（保持计算图完整性）
-        # 注意：这里仍需要用 NumPy，因为 buffer 本身在 CPU
-        # 但我们可以减少 Python 逻辑
-        idx = np.random.randint(0, self.size, size=batch_size)
+        if self.size <= 0:
+            raise ValueError("ReplayBuffer 为空，无法采样")
+
+        rng = self._build_rng(rng_key)
+        valid_size = self.size
+        pool_mask = self.mask[:valid_size]
+        pool_idx = np.flatnonzero(pool_mask)
+        if pool_idx.size == 0:
+            pool_idx = np.arange(valid_size, dtype=np.int64)
+
+        n_prioritized = int(batch_size * self.prioritized_ratio)
+        n_uniform = batch_size - n_prioritized
+
+        parts = []
+        if n_prioritized > 0:
+            probs = self.priority[pool_idx].astype(np.float64)
+            probs = np.power(np.maximum(probs, self.priority_eps), self.priority_alpha)
+            prob_sum = probs.sum()
+            if not np.isfinite(prob_sum) or prob_sum <= 0.0:
+                p = None
+            else:
+                p = probs / prob_sum
+            parts.append(rng.choice(pool_idx, size=n_prioritized, replace=True, p=p))
+        if n_uniform > 0:
+            parts.append(rng.choice(pool_idx, size=n_uniform, replace=True))
+
+        idx = np.concatenate(parts, axis=0)
+        rng.shuffle(idx)
         
         obs_batch = self.obs[idx]
         policy_batch = self.policy_tgt[idx]
         wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
         
-        return Sample(
+        sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             wdl_tgt=jnp.asarray(wdl_batch),
             mask=jnp.asarray(mask_batch)
         )
+        return sample, idx.astype(np.int64)
+
+    def update_priorities(self, indices: np.ndarray, sample_priority: np.ndarray):
+        """在线更新优先级：用当前 batch 的单样本训练难度回写 priority。"""
+        if indices.size == 0:
+            return
+
+        idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        pr = np.asarray(sample_priority, dtype=np.float32).reshape(-1)
+        if idx.shape[0] != pr.shape[0]:
+            raise ValueError(f"indices 与 sample_priority 长度不一致: {idx.shape[0]} vs {pr.shape[0]}")
+
+        valid = (idx >= 0) & (idx < self.size) & np.isfinite(pr)
+        if not np.any(valid):
+            return
+        idx = idx[valid]
+        pr = pr[valid]
+
+        pr = np.maximum(pr, 0.0)
+        pr_mean = float(np.mean(pr))
+        if pr_mean > 0:
+            pr = pr / (pr_mean + 1e-6)
+        pr = np.clip(pr, self.priority_eps, 10.0)
+
+        # 允许重复采样索引，聚合为 max，强化当前最难样本
+        uniq, inv = np.unique(idx, return_inverse=True)
+        agg = np.zeros_like(uniq, dtype=np.float32)
+        np.maximum.at(agg, inv, pr)
+
+        old = self.priority[uniq]
+        eta = self.priority_update_eta
+        self.priority[uniq] = (1.0 - eta) * old + eta * agg
     
     def cleanup(self):
         pass
     
     def stats(self):
-        return {"size": self.size, "total_added": self.total_added, "ptr": self.ptr}
+        live_priority = self.priority[:self.size] if self.size > 0 else self.priority[:1]
+        return {
+            "size": self.size,
+            "total_added": self.total_added,
+            "ptr": self.ptr,
+            "priority_mean": float(np.mean(live_priority)),
+        }
 
     def state_dict(self):
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
-            "wdl_tgt": self.wdl_tgt, "mask": self.mask,
+            "wdl_tgt": self.wdl_tgt, "mask": self.mask, "priority": self.priority,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
@@ -712,6 +831,7 @@ class ReplayBuffer:
         loaded_policy = np.array(state["policy_tgt"])
         loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
+        loaded_priority = np.array(state["priority"]) if "priority" in state else None
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
         
@@ -724,6 +844,12 @@ class ReplayBuffer:
             self.policy_tgt[:old_max] = loaded_policy
             self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
+            if loaded_priority is not None:
+                self.priority[:old_max] = loaded_priority
+            else:
+                self.priority[:old_max] = self._estimate_priority(
+                    self.policy_tgt[:old_max], self.wdl_tgt[:old_max], self.mask[:old_max]
+                )
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
@@ -731,6 +857,12 @@ class ReplayBuffer:
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
+            if loaded_priority is not None:
+                self.priority[:] = loaded_priority[:self.max_size]
+            else:
+                self.priority[:] = self._estimate_priority(
+                    self.policy_tgt, self.wdl_tgt, self.mask
+                )
             self.size = self.max_size
             self.ptr = 0
         
@@ -903,7 +1035,11 @@ def main():
     replay_buffer = ReplayBuffer(
         max_size=config.replay_buffer_size,
         obs_shape=(NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH),
-        action_size=ACTION_SPACE_SIZE
+        action_size=ACTION_SPACE_SIZE,
+        prioritized_ratio=config.replay_prioritized_ratio,
+        priority_alpha=config.replay_priority_alpha,
+        priority_eps=config.replay_priority_eps,
+        priority_update_eta=config.replay_priority_update_eta,
     )
     
     # 初始化模型模板 (用于恢复时的结构参考)
@@ -955,9 +1091,9 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        grads, (ploss, vloss, sample_priority) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, ploss, vloss
+        return optax.apply_updates(params, updates), opt_state, ploss, vloss, sample_priority
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1083,24 +1219,24 @@ def main():
         
         def _prefetch_batch(key_idx):
             """CPU 采样 + 异步传输到 GPU（双缓冲预读取）"""
-            batch_flat = replay_buffer.sample(config.training_batch_size, sample_keys[key_idx])
+            batch_flat, sampled_idx = replay_buffer.sample(config.training_batch_size, sample_keys[key_idx])
             batch = _shard_batch_for_devices(batch_flat)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 keys = jax.device_put_sharded(
                     list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
-            return batch, keys
+            return batch, keys, sampled_idx
         
         # 双缓冲流水线：预读取第一个 batch，后续 batch 在 GPU 训练期间并行准备
         ploss_acc, vloss_acc = None, None
-        next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
+        next_batch, next_keys, next_idx = _prefetch_batch(1) if num_updates > 0 else (None, None, None)
         
         for i in range(num_updates):
-            batch, train_keys = next_batch, next_keys
+            batch, train_keys, sample_idx = next_batch, next_keys, next_idx
             
             try:
                 # 分派 GPU 训练（异步返回，不阻塞 Python）
-                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
+                params, opt_state, ploss, vloss, sample_priority = train_step(params, opt_state, batch, train_keys)
             except jax.errors.JaxRuntimeError as e:
                 msg = str(e).lower()
                 if ("resource_exhausted" in msg) or ("out of memory" in msg):
@@ -1111,10 +1247,14 @@ def main():
                         f"selfplay_batch_size({config.selfplay_batch_size})."
                     ) from e
                 raise
+
+            # 在线更新优先级（根据当前网络在该 batch 的单样本训练难度）
+            priority_np = np.array(jax.device_get(sample_priority), dtype=np.float32).reshape(-1)
+            replay_buffer.update_priorities(sample_idx, priority_np)
             
             # GPU 训练期间，CPU 立即准备下一个 batch（流水线核心）
             if i + 1 < num_updates:
-                next_batch, next_keys = _prefetch_batch(i + 2)
+                next_batch, next_keys, next_idx = _prefetch_batch(i + 2)
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
@@ -1141,10 +1281,11 @@ def main():
         iter_time = time.time() - st
         fps = new_frames / max(iter_time, 1e-9)
         buf_stats = replay_buffer.stats()
+        priority_mean = buf_stats["priority_mean"]
         
         print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
               f"vloss={value_loss:.4f} | "
-              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
+              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k prio={priority_mean:.3f} train={num_updates} | "
               f"ent={root_visit_entropy:.3f} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         base_lr = float(lr_schedule(total_opt_steps))
