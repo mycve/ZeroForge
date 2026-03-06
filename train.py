@@ -66,7 +66,7 @@ class Config:
     top_k: int = 6                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置
-    replay_buffer_size: int = 1_200_000
+    replay_buffer_size: int = 1_800_000
     sample_reuse_times: int = 4
     replay_prioritized_ratio: float = 0.70  # 混合采样: 70% 优先 + 30% 均匀
     replay_priority_alpha: float = 0.80     # 优先级分布平滑指数
@@ -74,7 +74,7 @@ class Config:
     replay_priority_update_eta: float = 0.25  # 在线更新平滑系数（越大越跟随当前loss）
     
     # 损失权重
-    value_loss_weight: float = 0.5
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0
