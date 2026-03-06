@@ -24,20 +24,6 @@ from xiangqi.actions import (
     ACTION_SPACE_SIZE,
     _ACTION_TO_FROM_SQ,
     _ACTION_TO_TO_SQ,
-    R_KING,
-    R_ADVISOR,
-    R_BISHOP,
-    R_KNIGHT,
-    R_ROOK,
-    R_CANNON,
-    R_PAWN,
-    B_KING,
-    B_ADVISOR,
-    B_BISHOP,
-    B_KNIGHT,
-    B_ROOK,
-    B_CANNON,
-    B_PAWN,
 )
 
 
@@ -317,14 +303,6 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
         self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
         self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
-        # Must match env.observe channel order:
-        # [R_KING..R_PAWN, B_PAWN..B_KING]
-        piece_types = np.array([
-            R_KING, R_ADVISOR, R_BISHOP, R_KNIGHT, R_ROOK, R_CANNON, R_PAWN,
-            B_PAWN, B_CANNON, B_ROOK, B_KNIGHT, B_BISHOP, B_ADVISOR, B_KING,
-        ], dtype=np.int32)
-        self.piece_role_idx = jnp.array(np.abs(piece_types) - 1, dtype=jnp.int32)  # 0..6
-        self.piece_side_idx = jnp.array((piece_types < 0).astype(np.int32), dtype=jnp.int32)  # 0=self,1=opp
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -366,9 +344,18 @@ class AlphaZeroNetwork(nn.Module):
             nn.initializers.zeros,
             (channels_per_frame, piece_embed_dim),
         )
+        # Must match env.observe channel order:
+        # [R_KING..R_PAWN, B_PAWN..B_KING]
+        # Use local constants + jnp.take to avoid tracer->numpy conversion in nested JAX loops.
+        piece_role_idx = jnp.asarray(
+            [0, 1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 0], dtype=jnp.int32
+        )
+        piece_side_idx = jnp.asarray(
+            [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1], dtype=jnp.int32
+        )
         piece_embed_table = (
-            role_embed[self.piece_role_idx]
-            + side_embed[self.piece_side_idx]
+            jnp.take(role_embed, piece_role_idx, axis=0)
+            + jnp.take(side_embed, piece_side_idx, axis=0)
             + piece_channel_bias
         ).astype(self.dtype)  # (14, Dp)
 
