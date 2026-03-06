@@ -74,7 +74,7 @@ class Config:
     replay_priority_update_eta: float = 0.25  # 在线更新平滑系数（越大越跟随当前loss）
     
     # 损失权重
-    value_loss_weight: float = 0.5
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0
