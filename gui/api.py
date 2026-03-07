@@ -184,39 +184,19 @@ def init_uci_engine():
 
 
 # ============================================================================
-# AI 模型管理
+# AI 模型管理（固定网络配置，与 train.py 一致）
 # ============================================================================
+
+NET_CHANNELS = 128
+NET_BLOCKS = 10
+
 
 class ModelManager:
     def __init__(self):
         self.params = None
         self.net = None
         self.step = 0
-        self.channels = 0
-        self.num_blocks = 0
         self.last_error = ""
-
-    def _infer_channels(self, params) -> Optional[int]:
-        # 当前 GNN 结构：首层 input_proj 的输出维度即 channels
-        try:
-            if "input_proj" in params:
-                proj = params["input_proj"]
-                return int(proj["kernel"].shape[-1])
-        except Exception:
-            pass
-        # 兜底：GraphBlock_0/q_proj
-        try:
-            if "GraphBlock_0" in params and "q_proj" in params["GraphBlock_0"]:
-                return int(params["GraphBlock_0"]["q_proj"]["kernel"].shape[-1])
-        except Exception:
-            pass
-        return None
-
-    def _infer_num_blocks(self, params) -> int:
-        try:
-            return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
-        except Exception:
-            return 0
 
     def load(self, ckpt_dir: str, step: int) -> bool:
         self.last_error = ""
@@ -228,63 +208,34 @@ class ModelManager:
             self.last_error = f"未找到 checkpoint: {ckpt_dir}"
             return False
 
-        restored = None
-        try:
-            restored = ckpt_manager.restore(step)
-        except Exception:
-            try:
-                ckpt_path = os.path.join(ckpt_dir, str(step))
-                restored = ocp.StandardCheckpointer().restore(ckpt_path)
-            except Exception as e:
-                self.last_error = f"Checkpoint 恢复失败: {e}"
-                print(f"[AI] {self.last_error}")
-                return False
-
-        params = None
-        if isinstance(restored, dict) or hasattr(restored, "keys"):
-            if "params" in restored:
-                params = restored["params"]
-            elif "default" in restored and isinstance(restored["default"], dict):
-                params = restored["default"].get("params")
-
-        if params is None:
-            self.last_error = "Checkpoint 中未找到 params"
-            print(f"[AI] {self.last_error}")
-            return False
-
-        channels = self._infer_channels(params)
-        num_blocks = self._infer_num_blocks(params)
-        if not channels or num_blocks <= 0:
-            self.last_error = (
-                f"模型结构推断失败: channels={channels}, num_blocks={num_blocks} "
-                "(可能是旧 CNN checkpoint 或参数格式不匹配)"
-            )
-            print(f"[AI] {self.last_error}")
-            return False
-
-        self.net = AlphaZeroNetwork(
+        # 固定网络结构，与 train.py 完全一致
+        net = AlphaZeroNetwork(
             action_space_size=ACTION_SPACE_SIZE,
-            channels=channels,
-            num_blocks=num_blocks,
+            channels=NET_CHANNELS,
+            num_blocks=NET_BLOCKS,
         )
-        # 立即做一次前向验证，提前发现 checkpoint 与当前网络结构不兼容的问题
+        dummy_obs = jnp.zeros(
+            (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
+        )
+        variables = net.init(jax.random.PRNGKey(0), dummy_obs, train=False)
+        params_template = variables["params"]
+
+        restore_target = {"params": params_template}
+        restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
+        params = restored["params"]
+
+        # 前向验证
         try:
-            dummy_obs = jnp.zeros(
-                (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
-            )
-            _ = self.net.apply({'params': params}, dummy_obs, train=False)
+            _ = net.apply({"params": params}, dummy_obs, train=False)
         except Exception as e:
-            self.net = None
-            self.params = None
-            self.last_error = f"Checkpoint 与当前网络结构不兼容: {e}"
+            self.last_error = f"Checkpoint 加载失败: {e}"
             print(f"[AI] {self.last_error}")
             return False
 
+        self.net = net
         self.params = params
         self.step = step
-        self.channels = channels
-        self.num_blocks = num_blocks
-        print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}")
+        print(f"[AI] 模型加载完成: step={step}")
         return True
 
 
@@ -1106,8 +1057,8 @@ async def load_model(req: LoadModelRequest):
         return {
             "success": True,
             "step": model_mgr.step,
-            "channels": model_mgr.channels,
-            "num_blocks": model_mgr.num_blocks,
+            "channels": NET_CHANNELS,
+            "num_blocks": NET_BLOCKS,
         }
     else:
         detail = model_mgr.last_error or "Failed to load model"
@@ -1122,8 +1073,8 @@ async def get_model_info():
     return {
         "loaded": True,
         "step": model_mgr.step,
-        "channels": model_mgr.channels,
-        "num_blocks": model_mgr.num_blocks,
+        "channels": NET_CHANNELS,
+        "num_blocks": NET_BLOCKS,
     }
 
 
