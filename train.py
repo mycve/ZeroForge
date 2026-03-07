@@ -77,7 +77,7 @@ class Config:
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0
+    selfplay_gumbel_scale: float = 1.5   # 提高以维持探索，ent 过低(<0.5)时适当增大
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 环境规则（符合象棋竞赛规则）
