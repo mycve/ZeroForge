@@ -443,7 +443,10 @@ class AlphaZeroNetwork(nn.Module):
             nn.initializers.normal(stddev=0.02),
             (5, self.channels),  # 红九宫/黑九宫/河界/红半场/黑半场
         )
-        h = h + pos_embed[None, :, :] + region_embed[None, self.region_id, :]
+        # Use jnp.take instead of advanced indexing to avoid tracer->numpy conversion
+        # under JIT/fori_loop (e.g. mctx search recurrent_fn).
+        region_bias = jnp.take(region_embed, self.region_id, axis=0)[None, :, :]
+        h = h + pos_embed[None, :, :] + region_bias
         h = nn.silu(h)
 
         for i in range(self.num_blocks):
