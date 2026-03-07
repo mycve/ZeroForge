@@ -45,7 +45,7 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构（4分支GNN：无合法走法计算，推理快 → 搜索质量高）
+    # 网络架构（3分支GNN：Local+Row+Col，无Global，Local含马象多跳）
     num_channels: int = 128
     num_blocks: int = 10
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
@@ -58,21 +58,21 @@ class Config:
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.95          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.75          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
     selfplay_batch_size: int = 2048
     num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 6                       # 根节点候选数，Gumbel 无需高 top_k
+    top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_800_000
     sample_reuse_times: int = 1
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 0.3
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.20   # 放大 Q 值差异，提升高收益分支被选概率
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.5   # 提高以维持探索，ent 过低(<0.5)时适当增大
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
@@ -190,9 +190,17 @@ eval_net = AlphaZeroNetwork(
     dtype=jnp.float32,
 )
 
-def forward(params, obs, is_training=False):
-    """前向传播: 返回 (logits, value_scalar, wdl_logits)"""
-    logits, value, wdl_logits = net.apply({'params': params}, obs, train=is_training)
+def forward(params, obs, is_training=False, rng_key=None):
+    """前向传播: 返回 (logits, value_scalar, wdl_logits)
+
+    训练时需传入 rng_key 以支持 GraphBlock 内 dropout。
+    """
+    if is_training and rng_key is not None:
+        logits, value, wdl_logits = net.apply(
+            {'params': params}, obs, train=True, rngs={'dropout': rng_key}
+        )
+    else:
+        logits, value, wdl_logits = net.apply({'params': params}, obs, train=is_training)
     return logits, value, wdl_logits
 
 
@@ -434,13 +442,14 @@ def loss_fn(params, samples: Sample, rng_key):
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
-    
+
     # 随机镜像增强
-    do_mirror = jax.random.bernoulli(rng_key, 0.3)
+    rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
+    do_mirror = jax.random.bernoulli(rng_mirror, 0.3)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
-    
-    logits, _value, wdl_logits = forward(params, obs, is_training=True)
+
+    logits, _value, wdl_logits = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
     logits = logits.astype(jnp.float32)
     wdl_logits = wdl_logits.astype(jnp.float32)
@@ -905,7 +914,7 @@ def restore_checkpoint(
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: 4分支GNN (Local+Row+Col+Global) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
+    print("特性: 3分支GNN (Local+Row+Col+马象多跳) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)

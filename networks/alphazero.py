@@ -1,15 +1,15 @@
 """
-AlphaZero network - 精简 4 分支 GNN 架构
+AlphaZero network - 精简 3 分支 GNN 架构（无 Global）
 
 分支设计（全部基于静态棋盘拓扑，无动态规则计算）:
-- Local: 8 方向邻居注意力（马腿/象眼等短距交互）
+- Local: 8 直接邻居 + 8 马跳 + 4 象跳（共 20 邻居），捕捉马腿/象眼/兵等短距交互
 - Row: 同行分组注意力（车/炮行攻击，9 节点一组 × 10 行）
 - Col: 同列分组注意力（车/炮列攻击，10 节点一组 × 9 列）
-- Global: 全局注意力（长距离战术模式，90×90）
 
 关键设计决策:
+- 去掉 Global 分支，Row/Col 已覆盖长距离，节省 ~5-8% 计算
+- Local 扩展马/象多跳邻居，显式建模马走日、象走田及河界限制
 - 不在网络内计算合法走法/攻击/将军掩码，让网络从原始棋子位置自行学习
-- Row/Col 使用分组注意力（reshape 分组）而非 N×N 全量掩码，效率提升 ~10x
 - Factorized Policy Head (from/to pair scoring) + Attention-Pooled Value Head
 """
 
@@ -32,27 +32,82 @@ from xiangqi.actions import (
 # ============================================================================
 
 def _build_grid_neighbors(height: int, width: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """构建 8 邻居图拓扑（上下左右 + 4 对角）"""
-    directions = [
+    """构建 20 邻居图拓扑：8 直接 + 8 马跳 + 4 象跳
+
+    - 直接邻居 (0-7): 上下左右 + 4 对角，用于兵/士/将等
+    - 马跳 (8-15): 日字 8 方向 (r±2,c±1),(r±1,c±2)，用于马及马腿
+    - 象跳 (16-19): 田字 4 方向 (r±2,c±2)，象不能过河（楚河在 row 4-5 之间）
+    """
+    num_nodes = height * width
+
+    # 直接邻居 8 方向
+    direct_dirs = [
         (-1, 0), (1, 0), (0, -1), (0, 1),
         (-1, -1), (-1, 1), (1, -1), (1, 1),
     ]
-    num_nodes = height * width
-    max_deg = len(directions)
+    # 马跳 8 方向：日字
+    knight_dirs = [
+        (-2, -1), (-2, 1), (2, -1), (2, 1),
+        (-1, -2), (-1, 2), (1, -2), (1, 2),
+    ]
+    # 象跳 4 方向：田字
+    elephant_dirs = [(-2, -2), (-2, 2), (2, -2), (2, 2)]
+
+    all_dirs = direct_dirs + knight_dirs + elephant_dirs
+    max_deg = len(all_dirs)  # 20
     neighbor_idx = np.full((num_nodes, max_deg), -1, dtype=np.int32)
     neighbor_mask = np.zeros((num_nodes, max_deg), dtype=np.float32)
     neighbor_dir = np.zeros((num_nodes, max_deg), dtype=np.int32)
 
+    # 楚河汉界：row 4 与 row 5 之间，象不能过河
+    # 红方区域 row 0-4，黑方区域 row 5-9
+    def _elephant_same_side(r: int, nr: int) -> bool:
+        red_side = (r <= 4) and (nr <= 4)
+        black_side = (r >= 5) and (nr >= 5)
+        return red_side or black_side
+
     for r in range(height):
         for c in range(width):
             node = r * width + c
-            for dir_id, (dr, dc) in enumerate(directions):
+            for dir_id, (dr, dc) in enumerate(all_dirs):
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < height and 0 <= nc < width:
+                    # 象跳需检查河界
+                    if dir_id >= 16:
+                        if not _elephant_same_side(r, nr):
+                            continue
                     neighbor_idx[node, dir_id] = nr * width + nc
                     neighbor_mask[node, dir_id] = 1.0
                     neighbor_dir[node, dir_id] = dir_id
     return neighbor_idx, neighbor_mask, neighbor_dir
+
+
+def _build_region_ids(height: int, width: int) -> np.ndarray:
+    """构建棋盘区域 ID：九宫、河界、半场
+
+    区域定义（中国象棋）:
+    - 0: 红九宫 (r in [0,1,2], c in [3,4,5])
+    - 1: 黑九宫 (r in [7,8,9], c in [3,4,5])
+    - 2: 河界 (r in [4,5]，楚河汉界)
+    - 3: 红方半场 (r<=3 且非红九宫)
+    - 4: 黑方半场 (r>=6 且非黑九宫)
+    """
+    num_nodes = height * width
+    region_id = np.zeros(num_nodes, dtype=np.int32)
+    for r in range(height):
+        for c in range(width):
+            node = r * width + c
+            if r <= 2 and 3 <= c <= 5:
+                region_id[node] = 0  # 红九宫
+            elif r >= 7 and 3 <= c <= 5:
+                region_id[node] = 1  # 黑九宫
+            elif r in (4, 5):
+                region_id[node] = 2  # 河界
+            elif r <= 3:
+                region_id[node] = 3  # 红方半场
+            else:
+                region_id[node] = 4  # 黑方半场
+    return region_id
 
 
 # ============================================================================
@@ -72,27 +127,26 @@ class SwiGLU(nn.Module):
 
 
 # ============================================================================
-# 4 分支 Graph Attention Block
+# 3 分支 Graph Attention Block（无 Global）
 # ============================================================================
 
 class GraphBlock(nn.Module):
-    """4-branch graph attention + gated FFN residual block
+    """3-branch graph attention + gated FFN residual block
 
-    4 个注意力分支各有明确分工:
-    - local: 8 方向邻居，捕捉相邻格交互（马腿、象眼、兵的攻击范围）
-    - row: 同行 9 节点分组注意力，捕捉行方向交互（车/炮横向攻击）
-    - col: 同列 10 节点分组注意力，捕捉列方向交互（车/炮纵向攻击）
-    - global: 90 节点全局注意力，捕捉长距离战术关联（可选）
+    3 个注意力分支:
+    - local: 20 邻居（8 直接 + 8 马跳 + 4 象跳），捕捉马腿、象眼、兵等
+    - row: 同行 9 节点分组注意力（车/炮横向）
+    - col: 同列 10 节点分组注意力（车/炮纵向）
 
-    use_global=False 时跳过 global 分支，节省 ~12% FLOPs/block。
     gate 使用 sigmoid（各分支独立控制），避免 softmax 导致的分支坍缩。
+    FFN 含 dropout 提升泛化（仅训练时生效）。
     """
     hidden_dim: int
-    use_global: bool = True
     num_rows: int = BOARD_HEIGHT   # 10
     num_cols: int = BOARD_WIDTH    # 9
     mlp_ratio: float = 2.0
     layer_scale_init: float = 1e-2
+    dropout_rate: float = 0.05
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
@@ -104,10 +158,10 @@ class GraphBlock(nn.Module):
         neighbor_dir: jnp.ndarray,
         train: bool = True,
     ) -> jnp.ndarray:
-        del train
 
         D = self.hidden_dim
         scale = 1.0 / math.sqrt(float(D))
+        max_deg = neighbor_idx.shape[1]  # 20
 
         x = nn.LayerNorm(dtype=self.dtype, name="ln_attn")(h)
         q = nn.Dense(D, use_bias=False, dtype=self.dtype, name="q_proj")(x)
@@ -116,13 +170,13 @@ class GraphBlock(nn.Module):
 
         B = q.shape[0]
 
-        # ── Branch 1: Local 8-directional attention ──
+        # ── Branch 1: Local attention (8 直接 + 8 马 + 4 象) ──
         idx = jnp.where(neighbor_idx < 0, 0, neighbor_idx)
-        k_neigh = jnp.take(k, idx, axis=1)               # (B, N, 8, D)
-        v_neigh = jnp.take(v, idx, axis=1)               # (B, N, 8, D)
+        k_neigh = jnp.take(k, idx, axis=1)               # (B, N, 20, D)
+        v_neigh = jnp.take(v, idx, axis=1)               # (B, N, 20, D)
         dir_embed = nn.Embed(
-            num_embeddings=8, features=D, dtype=self.dtype, name="dir_embed"
-        )(jnp.clip(neighbor_dir, 0, 7))[None, :, :, :]   # (1, N, 8, D)
+            num_embeddings=max_deg, features=D, dtype=self.dtype, name="dir_embed"
+        )(jnp.clip(neighbor_dir, 0, max_deg - 1))[None, :, :, :]   # (1, N, 20, D)
 
         local_logits = jnp.sum(q[:, :, None, :] * (k_neigh + dir_embed), axis=-1) * scale
         local_logits = jnp.where(
@@ -153,18 +207,8 @@ class GraphBlock(nn.Module):
         col_agg = col_agg.transpose(0, 2, 1, 3).reshape(B, -1, D)
         col_out = nn.Dense(D, dtype=self.dtype, name="col_out")(col_agg)
 
-        # ── Branch 4: Global attention (90 x 90, 可选) ──
-        if self.use_global:
-            global_scores = jnp.einsum("bnd,bmd->bnm", q, k) * scale
-            global_attn = nn.softmax(global_scores, axis=-1)
-            global_agg = jnp.einsum("bnm,bmd->bnd", global_attn, v)
-            global_out = nn.Dense(D, dtype=self.dtype, name="global_out")(global_agg)
-
-            branches = jnp.stack([local_out, row_out, col_out, global_out], axis=2)
-            num_branches = 4
-        else:
-            branches = jnp.stack([local_out, row_out, col_out], axis=2)
-            num_branches = 3
+        branches = jnp.stack([local_out, row_out, col_out], axis=2)
+        num_branches = 3
 
         # ── Gated mix (sigmoid: 各分支独立控制，防止坍缩) ──
         gate_logits = nn.Dense(num_branches, dtype=self.dtype, name="rel_gate")(x)
@@ -178,10 +222,11 @@ class GraphBlock(nn.Module):
         )
         h = h + gamma1[None, None, :] * agg
 
-        # ── FFN ──
+        # ── FFN（含 dropout 提升泛化）──
         x = nn.LayerNorm(dtype=self.dtype, name="ln_ffn")(h)
         ffn_dim = max(int(D * self.mlp_ratio), D)
         x = SwiGLU(hidden_dim=ffn_dim, dtype=self.dtype, name="ffn_in")(x)
+        x = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(x)
         x = nn.Dense(D, dtype=self.dtype, name="ffn_out")(x)
         gamma2 = self.param(
             "gamma2", nn.initializers.constant(self.layer_scale_init), (D,)
@@ -249,7 +294,8 @@ class PolicyHead(nn.Module):
 class ValueHead(nn.Module):
     """WDL (Win/Draw/Loss) value head
 
-    三路池化（attention + mean + max）→ MLP → 3-class softmax
+    四路池化（attention + mean + max + std）→ MLP → 3-class softmax
+    std 池化刻画局面不确定性，丰富价值表示。
     输出: (value_scalar, wdl_logits)
       - value_scalar: W - L ∈ [-1, 1]，供 MCTS 使用
       - wdl_logits: (B, 3) 原始 logits，供交叉熵 loss 使用
@@ -265,8 +311,9 @@ class ValueHead(nn.Module):
         pooled = jnp.sum(pool_weights[..., None] * x, axis=1)
         mean_pooled = jnp.mean(x, axis=1)
         max_pooled = jnp.max(x, axis=1)
+        std_pooled = jnp.std(x, axis=1)
 
-        fused = jnp.concatenate([pooled, mean_pooled, max_pooled], axis=-1)
+        fused = jnp.concatenate([pooled, mean_pooled, max_pooled, std_pooled], axis=-1)
         fused = nn.Dense(self.model_dim * 2, dtype=self.dtype, name="fc1")(fused)
         fused = nn.silu(fused)
         fused = nn.Dense(self.model_dim, dtype=self.dtype, name="fc2")(fused)
@@ -283,7 +330,7 @@ class ValueHead(nn.Module):
 # ============================================================================
 
 class AlphaZeroNetwork(nn.Module):
-    """精简 4 分支 GNN AlphaZero 网络
+    """精简 3 分支 GNN AlphaZero 网络（Local+Row+Col，无 Global，Local 含马象多跳）
 
     输入: (B, C, H, W) 观察张量（126 通道 = 9 帧 × 14 棋子类型）
     输出: (policy_logits, value, wdl_logits)
@@ -301,6 +348,7 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_idx = jnp.array(neighbor_idx, dtype=jnp.int32)
         self.neighbor_mask = jnp.array(neighbor_mask, dtype=jnp.float32)
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
+        self.region_id = jnp.array(_build_region_ids(BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int32)
         self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
         self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
 
@@ -328,7 +376,7 @@ class AlphaZeroNetwork(nn.Module):
                 f"通道数不匹配，期望 {num_frames * channels_per_frame}，实际 {x.shape[-1]}"
             )
 
-        piece_embed_dim = max(self.channels // 8, 16)
+        piece_embed_dim = max(self.channels // 4, 24)  # 增大以更好区分棋子类型
         role_embed = self.param(
             "piece_role_embed",
             nn.initializers.normal(stddev=0.02),
@@ -390,14 +438,18 @@ class AlphaZeroNetwork(nn.Module):
             nn.initializers.normal(stddev=0.02),
             (num_nodes, self.channels),
         )
-        h = h + pos_embed[None, :, :]
+        region_embed = self.param(
+            "region_embed",
+            nn.initializers.normal(stddev=0.02),
+            (5, self.channels),  # 红九宫/黑九宫/河界/红半场/黑半场
+        )
+        h = h + pos_embed[None, :, :] + region_embed[None, self.region_id, :]
         h = nn.silu(h)
 
-        half = self.num_blocks // 2
         for i in range(self.num_blocks):
             h = GraphBlock(
                 hidden_dim=self.channels,
-                use_global=(i >= half),
+                dropout_rate=0.05,
                 dtype=self.dtype,
             )(
                 h,
