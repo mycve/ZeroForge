@@ -6,6 +6,7 @@ ZeroForge Web API - FastAPI 后端
 import os
 import sys
 import time
+import re
 import asyncio
 import subprocess
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
+from collections.abc import Mapping
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -27,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import mctx
+from flax import traverse_util
 
 from xiangqi.env import XiangqiEnv, XiangqiState, NUM_OBSERVATION_CHANNELS
 from xiangqi.rules import get_legal_moves_mask, is_in_check, find_king, BOARD_WIDTH, BOARD_HEIGHT
@@ -42,7 +45,7 @@ from networks.alphazero import AlphaZeroNetwork
 
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
-MCTS_QTRANSFORM_VALUE_SCALE = 0.1
+MCTS_QTRANSFORM_VALUE_SCALE = 0.25
 MCTS_GUMBEL_SCALE = 0.0  # 实战：关闭 Gumbel 噪声，根节点 argmax，最大化走子强度
 MCTS_QTRANSFORM = partial(
     mctx.qtransform_completed_by_mix_value,
@@ -184,19 +187,107 @@ def init_uci_engine():
 
 
 # ============================================================================
-# AI 模型管理（固定网络配置，与 train.py 一致）
+# AI 模型管理
 # ============================================================================
-
-NET_CHANNELS = 128
-NET_BLOCKS = 10
-
 
 class ModelManager:
     def __init__(self):
         self.params = None
         self.net = None
         self.step = 0
+        self.channels = 0
+        self.num_blocks = 0
         self.last_error = ""
+
+    def _to_plain_dict(self, tree):
+        if isinstance(tree, Mapping):
+            return {k: self._to_plain_dict(v) for k, v in tree.items()}
+        return tree
+
+    def _flatten_params(self, params) -> dict:
+        try:
+            plain = self._to_plain_dict(params)
+            return traverse_util.flatten_dict(plain)
+        except Exception:
+            return {}
+
+    def _infer_channels(self, params) -> Optional[int]:
+        flat = self._flatten_params(params)
+        # 优先 input_proj/kernel[-1]
+        for path, v in flat.items():
+            if len(path) >= 2 and path[-2] == "input_proj" and path[-1] == "kernel":
+                try:
+                    return int(v.shape[-1])
+                except Exception:
+                    continue
+        # 兜底：任意 q_proj/kernel[-1]
+        for path, v in flat.items():
+            if len(path) >= 2 and path[-2] == "q_proj" and path[-1] == "kernel":
+                try:
+                    return int(v.shape[-1])
+                except Exception:
+                    continue
+        return None
+
+    def _infer_num_blocks(self, params) -> int:
+        flat = self._flatten_params(params)
+        block_ids = set()
+        for path in flat.keys():
+            for part in path:
+                m = re.match(r"GraphBlock_(\d+)$", str(part))
+                if m:
+                    block_ids.add(int(m.group(1)))
+        if block_ids:
+            return max(block_ids) + 1
+        try:
+            return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
+        except Exception:
+            return 0
+
+    def _shape_tuple(self, x):
+        try:
+            return tuple(np.shape(x))
+        except Exception:
+            return None
+
+    def _merge_compatible_params(self, template_params, loaded_params):
+        template_flat = self._flatten_params(template_params)
+        loaded_flat = self._flatten_params(loaded_params)
+        merged_flat = {}
+        stats = {
+            "loaded": 0,
+            "initialized": 0,
+            "shape_mismatch": 0,
+            "unexpected": 0,
+        }
+        for k, t_val in template_flat.items():
+            l_val = loaded_flat.get(k)
+            if l_val is None:
+                merged_flat[k] = t_val
+                stats["initialized"] += 1
+                continue
+            if self._shape_tuple(t_val) != self._shape_tuple(l_val):
+                merged_flat[k] = t_val
+                stats["initialized"] += 1
+                stats["shape_mismatch"] += 1
+                continue
+            try:
+                if hasattr(t_val, "dtype"):
+                    merged_flat[k] = jnp.asarray(l_val, dtype=t_val.dtype)
+                else:
+                    merged_flat[k] = l_val
+                stats["loaded"] += 1
+            except Exception:
+                merged_flat[k] = t_val
+                stats["initialized"] += 1
+                stats["shape_mismatch"] += 1
+
+        for k in loaded_flat.keys():
+            if k not in template_flat:
+                stats["unexpected"] += 1
+
+        merged = traverse_util.unflatten_dict(merged_flat)
+        return merged, stats
 
     def load(self, ckpt_dir: str, step: int) -> bool:
         self.last_error = ""
@@ -208,36 +299,74 @@ class ModelManager:
             self.last_error = f"未找到 checkpoint: {ckpt_dir}"
             return False
 
-        # 固定网络结构，与 train.py 完全一致
-        net = AlphaZeroNetwork(
-            action_space_size=ACTION_SPACE_SIZE,
-            channels=NET_CHANNELS,
-            num_blocks=NET_BLOCKS,
-        )
-        dummy_obs = jnp.zeros(
-            (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
-        )
-        variables = net.init(jax.random.PRNGKey(0), dummy_obs, train=False)
-        params_template = variables["params"]
-
-        restore_target = {"params": params_template}
-        restored = ckpt_manager.restore(
-            step, args=ocp.args.StandardRestore(restore_target, partial_restore=True)
-        )
-        params = restored["params"]
-
-        # 前向验证
+        restored = None
         try:
-            _ = net.apply({"params": params}, dummy_obs, train=False)
-        except Exception as e:
-            self.last_error = f"Checkpoint 加载失败: {e}"
+            restored = ckpt_manager.restore(step)
+        except Exception:
+            try:
+                ckpt_path = os.path.join(ckpt_dir, str(step))
+                restored = ocp.StandardCheckpointer().restore(ckpt_path)
+            except Exception as e:
+                self.last_error = f"Checkpoint 恢复失败: {e}"
+                print(f"[AI] {self.last_error}")
+                return False
+
+        params = None
+        if isinstance(restored, dict) or hasattr(restored, "keys"):
+            if "params" in restored:
+                params = restored["params"]
+            elif "default" in restored and isinstance(restored["default"], dict):
+                params = restored["default"].get("params")
+
+        if params is None:
+            self.last_error = "Checkpoint 中未找到 params"
             print(f"[AI] {self.last_error}")
             return False
 
-        self.net = net
-        self.params = params
+        channels = self._infer_channels(params)
+        num_blocks = self._infer_num_blocks(params)
+        if not channels or num_blocks <= 0:
+            self.last_error = (
+                f"模型结构推断失败: channels={channels}, num_blocks={num_blocks} "
+                "(可能是旧 CNN checkpoint 或参数格式不匹配)"
+            )
+            print(f"[AI] {self.last_error}")
+            return False
+
+        self.net = AlphaZeroNetwork(
+            action_space_size=ACTION_SPACE_SIZE,
+            channels=channels,
+            num_blocks=num_blocks,
+        )
+        # 立即做一次前向验证，提前发现 checkpoint 与当前网络结构不兼容的问题
+        try:
+            dummy_obs = jnp.zeros(
+                (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
+            )
+            template_params = self.net.init(
+                jax.random.PRNGKey(0), dummy_obs, train=False
+            )["params"]
+            merged_params, merge_stats = self._merge_compatible_params(template_params, params)
+            _ = self.net.apply({'params': merged_params}, dummy_obs, train=False)
+        except Exception as e:
+            self.net = None
+            self.params = None
+            self.last_error = f"Checkpoint 与当前网络结构不兼容: {e}"
+            print(f"[AI] {self.last_error}")
+            return False
+
+        self.params = merged_params
         self.step = step
-        print(f"[AI] 模型加载完成: step={step}")
+        self.channels = channels
+        self.num_blocks = num_blocks
+        print(
+            "[AI] 参数合并统计: "
+            f"loaded={merge_stats['loaded']}, "
+            f"initialized={merge_stats['initialized']}, "
+            f"shape_mismatch={merge_stats['shape_mismatch']}, "
+            f"unexpected={merge_stats['unexpected']}"
+        )
+        print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}")
         return True
 
 
@@ -1059,8 +1188,8 @@ async def load_model(req: LoadModelRequest):
         return {
             "success": True,
             "step": model_mgr.step,
-            "channels": NET_CHANNELS,
-            "num_blocks": NET_BLOCKS,
+            "channels": model_mgr.channels,
+            "num_blocks": model_mgr.num_blocks,
         }
     else:
         detail = model_mgr.last_error or "Failed to load model"
@@ -1075,8 +1204,8 @@ async def get_model_info():
     return {
         "loaded": True,
         "step": model_mgr.step,
-        "channels": NET_CHANNELS,
-        "num_blocks": NET_BLOCKS,
+        "channels": model_mgr.channels,
+        "num_blocks": model_mgr.num_blocks,
     }
 
 
