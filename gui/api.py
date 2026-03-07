@@ -6,7 +6,6 @@ ZeroForge Web API - FastAPI 后端
 import os
 import sys
 import time
-import re
 import asyncio
 import subprocess
 import threading
@@ -17,7 +16,6 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from collections.abc import Mapping
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -29,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import mctx
-from flax import traverse_util
 
 from xiangqi.env import XiangqiEnv, XiangqiState, NUM_OBSERVATION_CHANNELS
 from xiangqi.rules import get_legal_moves_mask, is_in_check, find_king, BOARD_WIDTH, BOARD_HEIGHT
@@ -199,95 +196,27 @@ class ModelManager:
         self.num_blocks = 0
         self.last_error = ""
 
-    def _to_plain_dict(self, tree):
-        if isinstance(tree, Mapping):
-            return {k: self._to_plain_dict(v) for k, v in tree.items()}
-        return tree
-
-    def _flatten_params(self, params) -> dict:
-        try:
-            plain = self._to_plain_dict(params)
-            return traverse_util.flatten_dict(plain)
-        except Exception:
-            return {}
-
     def _infer_channels(self, params) -> Optional[int]:
-        flat = self._flatten_params(params)
-        # 优先 input_proj/kernel[-1]
-        for path, v in flat.items():
-            if len(path) >= 2 and path[-2] == "input_proj" and path[-1] == "kernel":
-                try:
-                    return int(v.shape[-1])
-                except Exception:
-                    continue
-        # 兜底：任意 q_proj/kernel[-1]
-        for path, v in flat.items():
-            if len(path) >= 2 and path[-2] == "q_proj" and path[-1] == "kernel":
-                try:
-                    return int(v.shape[-1])
-                except Exception:
-                    continue
+        # 当前 GNN 结构：首层 input_proj 的输出维度即 channels
+        try:
+            if "input_proj" in params:
+                proj = params["input_proj"]
+                return int(proj["kernel"].shape[-1])
+        except Exception:
+            pass
+        # 兜底：GraphBlock_0/q_proj
+        try:
+            if "GraphBlock_0" in params and "q_proj" in params["GraphBlock_0"]:
+                return int(params["GraphBlock_0"]["q_proj"]["kernel"].shape[-1])
+        except Exception:
+            pass
         return None
 
     def _infer_num_blocks(self, params) -> int:
-        flat = self._flatten_params(params)
-        block_ids = set()
-        for path in flat.keys():
-            for part in path:
-                m = re.match(r"GraphBlock_(\d+)$", str(part))
-                if m:
-                    block_ids.add(int(m.group(1)))
-        if block_ids:
-            return max(block_ids) + 1
         try:
             return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
         except Exception:
             return 0
-
-    def _shape_tuple(self, x):
-        try:
-            return tuple(np.shape(x))
-        except Exception:
-            return None
-
-    def _merge_compatible_params(self, template_params, loaded_params):
-        template_flat = self._flatten_params(template_params)
-        loaded_flat = self._flatten_params(loaded_params)
-        merged_flat = {}
-        stats = {
-            "loaded": 0,
-            "initialized": 0,
-            "shape_mismatch": 0,
-            "unexpected": 0,
-        }
-        for k, t_val in template_flat.items():
-            l_val = loaded_flat.get(k)
-            if l_val is None:
-                merged_flat[k] = t_val
-                stats["initialized"] += 1
-                continue
-            if self._shape_tuple(t_val) != self._shape_tuple(l_val):
-                merged_flat[k] = t_val
-                stats["initialized"] += 1
-                stats["shape_mismatch"] += 1
-                continue
-            try:
-                if hasattr(t_val, "dtype"):
-                    merged_flat[k] = jnp.asarray(l_val, dtype=t_val.dtype)
-                else:
-                    merged_flat[k] = l_val
-                stats["loaded"] += 1
-            except Exception:
-                merged_flat[k] = t_val
-                stats["initialized"] += 1
-                stats["shape_mismatch"] += 1
-
-        for k in loaded_flat.keys():
-            if k not in template_flat:
-                stats["unexpected"] += 1
-
-        merged = traverse_util.unflatten_dict(merged_flat)
-        return merged, stats
 
     def load(self, ckpt_dir: str, step: int) -> bool:
         self.last_error = ""
@@ -343,11 +272,7 @@ class ModelManager:
             dummy_obs = jnp.zeros(
                 (1, NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.float32
             )
-            template_params = self.net.init(
-                jax.random.PRNGKey(0), dummy_obs, train=False
-            )["params"]
-            merged_params, merge_stats = self._merge_compatible_params(template_params, params)
-            _ = self.net.apply({'params': merged_params}, dummy_obs, train=False)
+            _ = self.net.apply({'params': params}, dummy_obs, train=False)
         except Exception as e:
             self.net = None
             self.params = None
@@ -355,17 +280,10 @@ class ModelManager:
             print(f"[AI] {self.last_error}")
             return False
 
-        self.params = merged_params
+        self.params = params
         self.step = step
         self.channels = channels
         self.num_blocks = num_blocks
-        print(
-            "[AI] 参数合并统计: "
-            f"loaded={merge_stats['loaded']}, "
-            f"initialized={merge_stats['initialized']}, "
-            f"shape_mismatch={merge_stats['shape_mismatch']}, "
-            f"unexpected={merge_stats['unexpected']}"
-        )
         print(f"[AI] 模型加载完成: step={step}, channels={channels}, blocks={num_blocks}")
         return True
 
