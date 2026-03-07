@@ -346,12 +346,12 @@
                                 </div>
                             </details>
                             
-                            <!-- UCI 每步时间（仅当 UCI 可用时显示）-->
+                            <!-- UCI 搜索深度（仅当 UCI 可用时显示）-->
                             <div v-if="uciReady" class="pt-2">
                                 <label class="block text-xs sm:text-sm font-medium text-gray-700 mb-1">
-                                    每步时间: {{ uciMovetimeMs }} ms
+                                    深度: {{ uciDepth }}
                                 </label>
-                                <input type="range" v-model.number="uciMovetimeMs" min="0" max="1000" step="50"
+                                <input type="range" v-model.number="uciDepth" min="1" max="20" step="1"
                                        class="w-full h-2">
                             </div>
                             
@@ -538,7 +538,7 @@
             // 设置
             const redType = ref('Human');
             const blackType = ref('ZeroForge AI');
-            const uciMovetimeMs = ref(1000);
+            const uciDepth = ref(10);  // UCI 搜索深度 1-20
             const ckptDir = ref('checkpoints');
             const checkpoints = ref([]);
             const selectedStep = ref(null);
@@ -796,7 +796,7 @@
                             const res = await fetch('/api/uci_think', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ movetime_ms: uciMovetimeMs.value })
+                                body: JSON.stringify({ depth: uciDepth.value })
                             });
                             if (!res.ok) throw new Error('UCI think failed');
                             const data = await res.json();
@@ -975,7 +975,7 @@
                 // UI
                 selected, thinking, paused, loading, activeTab, message, messageType,
                 // 设置
-                redType, blackType, uciMovetimeMs, aiSimulations, aiTopK, openingRandomMoves, openingTopK, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
+                redType, blackType, uciDepth, aiSimulations, aiTopK, openingRandomMoves, openingTopK, ckptDir, checkpoints, selectedStep, modelInfo, fenInput,
                 // 历史
                 moveHistory,
                 // 计算属性
