@@ -66,9 +66,11 @@ class Config:
     td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
-    selfplay_batch_size: int = 2048
+    selfplay_batch_size: int = 1024
     num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
+    top_k: int = 6                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 40  # 前 40 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.2
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 2_500_000
@@ -275,7 +277,7 @@ def selfplay(params, rng_key, batch_size):
     - Gumbel-Top-k：探索在搜索内完成，无需 Dirichlet/温度/根节点采样，根节点直接 argmax
     """
     def step_fn(state, key):
-        key_search, key_reset = jax.random.split(key, 2)
+        key_search, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
         logits, value, wdl_logits = forward(params, obs)
         root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
@@ -302,11 +304,26 @@ def selfplay(params, rng_key, batch_size):
         one_hot = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
-        
-        # Gumbel 探索已在搜索内完成，根节点直接取 visit 权重最高的合法动作（无需采样）
+
+        def _sample_action(w, legal_mask, sample_key):
+            # 在 log 空间做温度缩放，避免小概率动作下溢。
+            w_masked = jnp.where(legal_mask, w, 0.0)
+            log_w = jnp.log(w_masked + 1e-10) / config.selfplay_temperature
+            log_w = jnp.where(legal_mask, log_w, -jnp.inf)
+            log_w = log_w - jnp.max(log_w)
+            probs = jnp.exp(log_w)
+            probs = jnp.where(legal_mask, probs, 0.0)
+            probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
+            return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
+
+        # 前 40 半步增加根节点多样性，后续回到贪心走子。
+        sample_keys = jax.random.split(key_sample, batch_size)
+        sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
-        action = jnp.argmax(action_weights_masked, axis=-1)
+        greedy_action = jnp.argmax(action_weights_masked, axis=-1)
+        use_temperature = state.step_count < config.selfplay_temperature_steps
+        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
         
         actor = state.current_player
         
