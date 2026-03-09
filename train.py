@@ -62,15 +62,15 @@ class Config:
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
     selfplay_batch_size: int = 2048
-    num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
+    num_simulations: int = 32            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_800_000
     sample_reuse_times: int = 1
     
     # 损失权重
-    value_loss_weight: float = 0.3
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.5   # 提高以维持探索，ent 过低(<0.5)时适当增大
