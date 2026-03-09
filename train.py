@@ -45,9 +45,9 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构（3分支GNN：Local+Row+Col，无Global，Local含马象多跳）
-    num_channels: int = 128
-    num_blocks: int = 10
+    # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global），马象靠 Row+Col 多跳
+    num_channels: int = 96   # 128 更宽，96 更快；可据算力调整
+    num_blocks: int = 6      # Row+Col 2跳即全局，6 层足够
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -58,23 +58,28 @@ class Config:
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.75          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
-    selfplay_batch_size: int = 2048
+    selfplay_batch_size: int = 3072
     num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_800_000
-    sample_reuse_times: int = 1
+    replay_buffer_size: int = 2_000_000
+    sample_reuse_times: int = 2
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 2.5   # Gumbel 噪声强度，ent 过低时增大（top_k 无效，主要靠此）
+    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度，ent 过低时增大（top_k 无效，主要靠此）
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
+    # 动态调节：熵持续低于阈值时自动增大 gumbel_scale
+    entropy_threshold: float = 0.5          # 低于此值视为探索不足
+    entropy_low_consecutive: int = 2        # 连续 N 轮低于阈值则触发调整
+    gumbel_scale_increment: float = 0.5    # 每次调整增加量
+    gumbel_scale_max: float = 8.0           # 上限，防止过度探索
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
@@ -254,13 +259,13 @@ class Sample(NamedTuple):
 # ============================================================================
 
 
-@partial(jax.pmap, static_broadcasted_argnums=(2,))
-def selfplay(params, rng_key, batch_size):
+@partial(jax.pmap, static_broadcasted_argnums=(2, 3))
+def selfplay(params, rng_key, batch_size, gumbel_scale: float):
     """
     高性能自玩算子：
     - lax.scan 消除 Python 循环开销
     - Gumbel-Top-k：探索在搜索内完成，无需 Dirichlet/温度/根节点采样，根节点直接 argmax
-    - 统一策略、标准初始局面
+    - gumbel_scale 由外部传入，支持动态调节（熵过低时自动增大）
     """
     def step_fn(state, key):
         key_search, key_reset = jax.random.split(key, 2)
@@ -278,7 +283,7 @@ def selfplay(params, rng_key, batch_size):
             max_num_considered_actions=config.top_k,
             invalid_actions=~state.legal_action_mask,
             qtransform=_QTRANSFORM,
-            gumbel_scale=config.selfplay_gumbel_scale,
+            gumbel_scale=gumbel_scale,
         )
         action_weights = policy_output.action_weights
         root_value = policy_output.search_tree.node_values[:, 0]
@@ -770,6 +775,7 @@ class TrainState(NamedTuple):
     history_models: dict            # 历史模型 (用于 ELO 评估)
     iteration_elos: dict            # ELO 记录
     total_opt_steps: int            # 累计优化步数（用于 LR 调度）
+    current_gumbel_scale: float     # 当前 gumbel_scale（支持动态调节）
 
 
 def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
@@ -825,12 +831,13 @@ def save_checkpoint(
     meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
     os.makedirs(meta_dir, exist_ok=True)
     
-    # 保存 ELO、历史模型索引、total_opt_steps
+    # 保存 ELO、历史模型索引、total_opt_steps、current_gumbel_scale
     with open(os.path.join(meta_dir, "metadata.json"), "w") as f:
         json.dump({
             "iteration_elos": {str(k): float(v) for k, v in train_state.iteration_elos.items()},
             "history_model_keys": [int(k) for k in train_state.history_models.keys()],
             "total_opt_steps": train_state.total_opt_steps,
+            "current_gumbel_scale": train_state.current_gumbel_scale,
         }, f)
     
     # 保存历史模型参数
@@ -880,12 +887,14 @@ def restore_checkpoint(
     iteration_elos = {}
     
     total_opt_steps = 0
+    current_gumbel_scale = config.selfplay_gumbel_scale
     if os.path.exists(meta_dir):
         with open(os.path.join(meta_dir, "metadata.json"), "r") as f:
             meta = json.load(f)
             iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
             history_model_keys = meta["history_model_keys"]
             total_opt_steps = int(meta.get("total_opt_steps", 0))
+            current_gumbel_scale = float(meta.get("current_gumbel_scale", config.selfplay_gumbel_scale))
         
         tree_struct = jax.tree.structure(params_template)
         for k in history_model_keys:
@@ -901,11 +910,11 @@ def restore_checkpoint(
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
         latest_elo = iteration_elos[latest_elo_iter]
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}, gumbel={current_gumbel_scale:.2f}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
     else:
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}")
+        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}, gumbel={current_gumbel_scale:.2f}")
     
-    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps
+    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps, current_gumbel_scale
 
 
 # ============================================================================
@@ -914,7 +923,7 @@ def restore_checkpoint(
 
 def main():
     print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: 3分支GNN (Local+Row+Col+马象多跳) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
+    print("特性: 3分支GNN (Local 8+Row+Col) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -959,8 +968,8 @@ def main():
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template)
     
     if restored is not None:
-        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps = restored
-        print(f"[断点续训] 从 iteration={iteration} 继续训练")
+        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps, current_gumbel_scale = restored
+        print(f"[断点续训] 从 iteration={iteration} 继续训练, gumbel_scale={current_gumbel_scale:.2f}")
     else:
         params = params_template
         opt_state = opt_state_template
@@ -969,6 +978,7 @@ def main():
         history_models = {0: jax.device_get(params)}
         iteration_elos = {0: 1500.0}
         total_opt_steps = 0
+        current_gumbel_scale = config.selfplay_gumbel_scale
 
     params = replicate_to_devices(params)
     opt_state = replicate_to_devices(opt_state)
@@ -1044,7 +1054,8 @@ def main():
             if decisive_games > 0:
                 writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
     
-    print(f"[Selfplay] batch_size={config.selfplay_batch_size}")
+    print(f"[Selfplay] batch_size={config.selfplay_batch_size}, gumbel_scale={current_gumbel_scale:.2f} (动态调节: ent<{config.entropy_threshold} 连续{config.entropy_low_consecutive}轮→+{config.gumbel_scale_increment})")
+    low_entropy_count = 0
 
     while True:
         iteration += 1
@@ -1057,7 +1068,7 @@ def main():
             selfplay_keys = jax.device_put_sharded(list(jax.random.split(sk_selfplay, num_devices)), devices)
 
         try:
-            data = selfplay(params, selfplay_keys, config.selfplay_batch_size // num_devices)
+            data = selfplay(params, selfplay_keys, config.selfplay_batch_size // num_devices, current_gumbel_scale)
         except jax.errors.JaxRuntimeError as e:
             msg = str(e).lower()
             if ("resource_exhausted" in msg) or ("out of memory" in msg):
@@ -1086,6 +1097,21 @@ def main():
         stats = stats_np.sum(axis=0).astype(np.int64)   # 跨设备求和
         avg_length = float(jax.device_get(avg_len_dev).mean())
         root_visit_entropy = float(jax.device_get(entropy_dev).mean())
+
+        # 动态调节 gumbel_scale：熵持续低于阈值时自动增大
+        if root_visit_entropy < config.entropy_threshold:
+            low_entropy_count += 1
+            if low_entropy_count >= config.entropy_low_consecutive:
+                old_scale = current_gumbel_scale
+                current_gumbel_scale = min(
+                    current_gumbel_scale + config.gumbel_scale_increment,
+                    config.gumbel_scale_max,
+                )
+                low_entropy_count = 0
+                print(f"[Gumbel] ent={root_visit_entropy:.3f} 连续{config.entropy_low_consecutive}轮低于{config.entropy_threshold}，"
+                      f"gumbel_scale {old_scale:.2f} → {current_gumbel_scale:.2f}")
+        else:
+            low_entropy_count = 0
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
@@ -1161,7 +1187,7 @@ def main():
         print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
               f"vloss={value_loss:.4f} | "
               f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
-              f"ent={root_visit_entropy:.3f} | "
+              f"ent={root_visit_entropy:.3f} gumbel={current_gumbel_scale:.2f} | "
               f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
         base_lr = float(lr_schedule(total_opt_steps))
         
@@ -1172,6 +1198,7 @@ def main():
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("stats/root_visit_entropy", root_visit_entropy, iteration)
+        writer.add_scalar("stats/gumbel_scale", current_gumbel_scale, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
         
         # 胜负和统计 (数量)
@@ -1204,6 +1231,7 @@ def main():
                 history_models=history_models,
                 iteration_elos=iteration_elos,
                 total_opt_steps=total_opt_steps,
+                current_gumbel_scale=current_gumbel_scale,
             )
             save_checkpoint(ckpt_manager, train_state, iteration)
         
