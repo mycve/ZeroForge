@@ -57,7 +57,7 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 2e-4       # AdamW 起始 LR
+    learning_rate: float = 3e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
@@ -66,9 +66,9 @@ class Config:
     td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
-    selfplay_batch_size: int = 3072
-    num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_batch_size: int = 2048
+    num_simulations: int = 64            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 2_500_000
