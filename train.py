@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 ZeroForge - 中国象棋 Gumbel AlphaZero
-现代化极简架构：Gumbel-Top-k MCTS（搜索内探索，根节点 argmax 无温度/无采样）
-+ 视角归一化 + 镜像增强 + 标准 ELO
+
+架构：
+- Gumbel-Top-k MCTS：搜索内探索，根节点 argmax（无温度/无采样）
+- 视角归一化：obs 红方=绝对视角、黑方=180° 翻转；策略目标统一为绝对坐标系
+- 训练时黑方 obs 需旋转 logits 到绝对坐标系再与 policy_tgt 比较
+- 镜像增强：30% 概率左右翻转 obs 与 policy
+- 动态 gumbel_scale：熵持续低于阈值时自动增大，增强探索
+- 标准 ELO 评估
 """
 
 import os
@@ -75,7 +81,7 @@ class Config:
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度，ent 过低时增大（top_k 无效，主要靠此）
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
-    # 动态调节：熵持续低于阈值时自动增大 gumbel_scale
+    # 动态调节：root_visit_entropy 持续低于阈值时自动增大 gumbel_scale，增强探索
     entropy_threshold: float = 0.5          # 低于此值视为探索不足
     entropy_low_consecutive: int = 2        # 连续 N 轮低于阈值则触发调整
     gumbel_scale_increment: float = 0.5    # 每次调整增加量
@@ -157,7 +163,8 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
-# 预计算旋转索引，避免在 JIT 循环内重复计算
+# 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
+# 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def replicate_to_devices(pytree):
@@ -216,12 +223,15 @@ def eval_forward(params, obs):
 
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数（瓶颈在 forward 推理 ~85%+，env.step 占比极小）"""
+    """MCTS 递归函数（瓶颈在 forward 推理 ~85%+，env.step 占比极小）
+    
+    黑方时 obs 已翻转，网络输出为黑方坐标系；旋转到绝对坐标系供 MCTS 使用。
+    """
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
     logits, value, _ = forward(params, obs)
-    
+    # 黑方视角：logits 旋转到绝对坐标系，与 legal_action_mask（绝对）一致
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
     logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
@@ -237,24 +247,26 @@ def recurrent_fn(params, rng_key, action, state):
 # ============================================================================
 
 class SelfplayOutput(NamedTuple):
-    obs: jnp.ndarray
+    """自对弈单步输出"""
+    obs: jnp.ndarray              # 观察（红方=绝对视角，黑方=180° 翻转）
     reward: jnp.ndarray
     terminated: jnp.ndarray
-    action_weights: jnp.ndarray
+    action_weights: jnp.ndarray   # 策略目标，始终为绝对坐标系（红方视角）
     discount: jnp.ndarray
-    winner: jnp.ndarray
+    winner: jnp.ndarray           # 0=红胜 1=黑胜 -1=和棋
     draw_reason: jnp.ndarray
-    root_value: jnp.ndarray  # MCTS 搜索后的标量价值估计
-    root_wdl: jnp.ndarray    # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
-    root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵 (max_steps, batch)，用于监控探索程度
-    current_player: jnp.ndarray  # 当前行棋方 0=红 1=黑，用于训练时正确旋转 logits
+    root_value: jnp.ndarray       # MCTS 搜索后的标量价值估计
+    root_wdl: jnp.ndarray        # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
+    root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵，用于监控探索程度
+    current_player: jnp.ndarray  # 当前行棋方 0=红 1=黑，训练时用于 logits 旋转对齐
 
 class Sample(NamedTuple):
+    """训练样本（从 SelfplayOutput 经 compute_targets 得到）"""
     obs: jnp.ndarray
-    policy_tgt: jnp.ndarray
-    wdl_tgt: jnp.ndarray   # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
-    mask: jnp.ndarray
-    current_player: jnp.ndarray  # 0=红 1=黑，黑方时需旋转 logits 再算 policy loss
+    policy_tgt: jnp.ndarray       # 策略目标，绝对坐标系
+    wdl_tgt: jnp.ndarray         # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
+    mask: jnp.ndarray            # 有效步掩码（游戏结束前）
+    current_player: jnp.ndarray  # 0=红 1=黑，黑方时 loss_fn 内需旋转 logits 再算 policy loss
 
 # ============================================================================
 # 自玩
@@ -274,10 +286,10 @@ def selfplay(params, rng_key, batch_size, gumbel_scale: float):
         obs = jax.vmap(env.observe)(state)
         logits, value, wdl_logits = forward(params, obs)
         root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
-        
+        # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         
-        # MCTS 搜索（移除了全局 cond 分支，避免编译两套计算图的开销）
+        # MCTS 搜索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         policy_output = mctx.gumbel_muzero_policy(
             params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
@@ -308,10 +320,10 @@ def selfplay(params, rng_key, batch_size, gumbel_scale: float):
         # 执行动作
         next_state = jax.vmap(env.step)(state, action)
         
-        # 策略目标统一为红方（绝对）坐标系，MCTS 的 action_weights 已为绝对坐标系
+        # 策略目标：MCTS 的 action_weights 已为绝对坐标系，直接存储（训练时与 policy_tgt 对齐）
         policy_tgt_abs = action_weights
         
-        # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
+        # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中，用于动态调节 gumbel_scale
         w_masked = jnp.where(state.legal_action_mask, action_weights, 0.0)
         total = jnp.sum(w_masked, axis=-1, keepdims=True) + 1e-10
         p = jnp.where(state.legal_action_mask, w_masked / total, 0.0)
@@ -346,8 +358,10 @@ def compute_targets(data: SelfplayOutput):
     
     与标量 TD(λ) 的区别：
     - bootstrap 用网络原始 WDL 概率（而非 MCTS 标量值）
-    - 视角翻转用 W↔L 互换（而非标量取反）
-    - 游戏结果直接映射为 one-hot WDL
+    - 视角翻转用 W↔L 互换（对手的 [W,D,L] -> 我方的 [L,D,W]）
+    - 游戏结果直接映射为 one-hot WDL（reward +1/0/-1 -> [W,D,L]）
+    
+    输出 Sample：policy_tgt 为绝对坐标系，current_player 用于 loss_fn 中 logits 旋转。
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     lam = config.td_lambda
@@ -408,6 +422,7 @@ def compute_selfplay_stats(data: SelfplayOutput):
     """在 GPU 上计算自对弈统计标量，仅传回 ~100 字节而非 ~3GB 原始数据
     
     返回 (stats[12], avg_length, root_visit_entropy_mean) 均为 float32
+    stats: [总局数, 红胜, 黑胜, 和棋, 步数到限, 无吃子到限, 重复和棋, 长将判负, ...]
     """
     term = data.terminated       # (max_steps, batch)
     winner = data.winner
@@ -446,13 +461,14 @@ def compute_selfplay_stats(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵
+    - 策略损失：交叉熵。policy_tgt 始终为绝对坐标系；黑方 obs 时网络输出为黑方坐标系，
+      需用 logits[:, _ROTATED_IDX] 旋转到绝对坐标系再比较。
     - 价值损失：WDL 交叉熵（比标量 MSE 梯度信号更强，精确区分"和棋"与"不确定"）
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
 
-    # 随机镜像增强
+    # 随机左右镜像增强（30% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
     do_mirror = jax.random.bernoulli(rng_mirror, 0.3)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
@@ -465,11 +481,11 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
     
-    # 黑方视角时网络输出为黑方坐标系，需旋转到绝对（红方）坐标系再与 policy_tgt 比较
+    # 黑方 obs 时网络输出为黑方坐标系，旋转到绝对坐标系后与 policy_tgt（绝对）对齐
     is_black = samples.current_player == 1
     logits_for_policy = jnp.where(is_black[:, None], logits[:, _ROTATED_IDX], logits)
     
-    # 策略损失
+    # 策略损失（交叉熵）
     policy_ce = optax.softmax_cross_entropy(logits_for_policy, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
@@ -577,7 +593,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
         state = jax.vmap(env.step)(state, action)
         obs = jax.vmap(env.observe)(state)
         logits, value = eval_forward(params, obs)
-        
+        # 黑方视角：logits 旋转到绝对坐标系
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
         logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
@@ -607,7 +623,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
         return out, next_state
     
     def step_fn(state, key):
-        # 在根节点确定当前搜索归属于哪个模型
+        # 根节点：红方用 params_red，黑方用 params_black
         is_red = state.current_player == 0
         state = state.replace(search_model_index=jnp.where(is_red, 0, 1).astype(jnp.int32))
         
@@ -657,7 +673,10 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 # ============================================================================
 
 class ReplayBuffer:
-    """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）"""
+    """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）
+    
+    存储：obs, policy_tgt(绝对坐标系), wdl_tgt, mask, current_player(0=红 1=黑)
+    """
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
@@ -665,7 +684,7 @@ class ReplayBuffer:
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
-        self.current_player = np.zeros((max_size,), dtype=np.int32)
+        self.current_player = np.zeros((max_size,), dtype=np.int32)  # 训练时用于 logits 旋转
         self.ptr = 0
         self.size = 0
         self.total_added = 0
@@ -682,7 +701,7 @@ class ReplayBuffer:
         return np.random.default_rng(int(seed))
 
     def add(self, samples: Sample):
-        """存入样本（从 JAX 自动转 NumPy）"""
+        """存入样本（JAX -> NumPy，含 obs/policy_tgt/wdl_tgt/mask/current_player）"""
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
@@ -704,10 +723,9 @@ class ReplayBuffer:
         self.total_added += n_new
     
     def sample(self, batch_size: int, rng_key):
-        """采样后转回 JAX 数组
+        """均匀采样，转回 JAX 数组
         
-        优化：obs 保持 uint8 传输，减少 4x CPU→GPU 带宽
-        在 GPU 上的 loss_fn 中再转为 float32
+        obs 保持 uint8 以减小 CPU→GPU 带宽，loss_fn 内再转为 float32。
         """
         if self.size <= 0:
             raise ValueError("ReplayBuffer 为空，无法采样")
@@ -755,7 +773,7 @@ class ReplayBuffer:
         loaded_policy = np.array(state["policy_tgt"])
         loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
-        loaded_cp = np.array(state.get("current_player", np.zeros_like(loaded_mask, dtype=np.int32)))
+        loaded_cp = np.array(state["current_player"])
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
         old_max = loaded_obs.shape[0]
@@ -765,7 +783,7 @@ class ReplayBuffer:
             self.policy_tgt[:old_max] = loaded_policy
             self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
-            self.current_player[:old_max] = loaded_cp[:old_max] if loaded_cp.size >= old_max else 0
+            self.current_player[:old_max] = loaded_cp[:old_max]
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
@@ -773,7 +791,7 @@ class ReplayBuffer:
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
-            self.current_player[:] = loaded_cp[:self.max_size] if loaded_cp.size >= self.max_size else 0
+            self.current_player[:] = loaded_cp[:self.max_size]
             self.size = self.max_size
             self.ptr = 0
         self.total_added = int(state["total_added"])
@@ -792,7 +810,7 @@ class TrainState(NamedTuple):
     history_models: dict            # 历史模型 (用于 ELO 评估)
     iteration_elos: dict            # ELO 记录
     total_opt_steps: int            # 累计优化步数（用于 LR 调度）
-    current_gumbel_scale: float     # 当前 gumbel_scale（支持动态调节）
+    current_gumbel_scale: float     # 当前 gumbel_scale（动态调节后需持久化）
 
 
 def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
@@ -910,8 +928,8 @@ def restore_checkpoint(
             meta = json.load(f)
             iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
             history_model_keys = meta["history_model_keys"]
-            total_opt_steps = int(meta.get("total_opt_steps", 0))
-            current_gumbel_scale = float(meta.get("current_gumbel_scale", config.selfplay_gumbel_scale))
+            total_opt_steps = int(meta["total_opt_steps"])
+            current_gumbel_scale = float(meta["current_gumbel_scale"])
         
         tree_struct = jax.tree.structure(params_template)
         for k in history_model_keys:
@@ -1115,7 +1133,7 @@ def main():
         avg_length = float(jax.device_get(avg_len_dev).mean())
         root_visit_entropy = float(jax.device_get(entropy_dev).mean())
 
-        # 动态调节 gumbel_scale：熵持续低于阈值时自动增大
+        # 动态调节 gumbel_scale：root_visit_entropy 持续低于阈值时自动增大
         if root_visit_entropy < config.entropy_threshold:
             low_entropy_count += 1
             if low_entropy_count >= config.entropy_low_consecutive:
