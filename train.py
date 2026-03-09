@@ -66,7 +66,7 @@ class Config:
     top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 2_000_000
+    replay_buffer_size: int = 2_500_000
     sample_reuse_times: int = 2
     
     # 损失权重
@@ -247,12 +247,14 @@ class SelfplayOutput(NamedTuple):
     root_value: jnp.ndarray  # MCTS 搜索后的标量价值估计
     root_wdl: jnp.ndarray    # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
     root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵 (max_steps, batch)，用于监控探索程度
+    current_player: jnp.ndarray  # 当前行棋方 0=红 1=黑，用于训练时正确旋转 logits
 
 class Sample(NamedTuple):
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray
     wdl_tgt: jnp.ndarray   # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
     mask: jnp.ndarray
+    current_player: jnp.ndarray  # 0=红 1=黑，黑方时需旋转 logits 再算 policy loss
 
 # ============================================================================
 # 自玩
@@ -306,8 +308,8 @@ def selfplay(params, rng_key, batch_size, gumbel_scale: float):
         # 执行动作
         next_state = jax.vmap(env.step)(state, action)
         
-        normalized_action_weights = jnp.where(state.current_player[:, None] == 0, 
-                                              action_weights, action_weights[:, _ROTATED_IDX])
+        # 策略目标统一为红方（绝对）坐标系，MCTS 的 action_weights 已为绝对坐标系
+        policy_tgt_abs = action_weights
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         w_masked = jnp.where(state.legal_action_mask, action_weights, 0.0)
@@ -316,7 +318,7 @@ def selfplay(params, rng_key, batch_size, gumbel_scale: float):
         root_visit_entropy = -jnp.sum(p * jnp.log(p + 1e-10), axis=-1)
         
         data = SelfplayOutput(
-            obs=obs, action_weights=normalized_action_weights,
+            obs=obs, action_weights=policy_tgt_abs,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
@@ -324,6 +326,7 @@ def selfplay(params, rng_key, batch_size, gumbel_scale: float):
             root_value=root_value,
             root_wdl=root_wdl,
             root_visit_entropy=root_visit_entropy,
+            current_player=state.current_player,
         )
         
         # 结束后直接重置为标准初始局面
@@ -393,6 +396,7 @@ def compute_targets(data: SelfplayOutput):
         policy_tgt=data.action_weights, 
         wdl_tgt=wdl_tgt,
         mask=value_mask,
+        current_player=data.current_player,
     )
 
 # ============================================================================
@@ -461,8 +465,12 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
     
+    # 黑方视角时网络输出为黑方坐标系，需旋转到绝对（红方）坐标系再与 policy_tgt 比较
+    is_black = samples.current_player == 1
+    logits_for_policy = jnp.where(is_black[:, None], logits[:, _ROTATED_IDX], logits)
+    
     # 策略损失
-    policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
+    policy_ce = optax.softmax_cross_entropy(logits_for_policy, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     # 价值损失：WDL 交叉熵（目标已由 compute_targets 正确计算）
@@ -657,6 +665,7 @@ class ReplayBuffer:
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
+        self.current_player = np.zeros((max_size,), dtype=np.int32)
         self.ptr = 0
         self.size = 0
         self.total_added = 0
@@ -680,6 +689,7 @@ class ReplayBuffer:
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         wdl_flat = samples_np.wdl_tgt.reshape(-1, 3)
         mask_flat = samples_np.mask.reshape(-1)
+        cp_flat = samples_np.current_player.reshape(-1)
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -688,6 +698,7 @@ class ReplayBuffer:
         self.policy_tgt[indices] = policy_flat
         self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
+        self.current_player[indices] = cp_flat
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
@@ -714,12 +725,14 @@ class ReplayBuffer:
         policy_batch = self.policy_tgt[idx]
         wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
+        cp_batch = self.current_player[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             wdl_tgt=jnp.asarray(wdl_batch),
-            mask=jnp.asarray(mask_batch)
+            mask=jnp.asarray(mask_batch),
+            current_player=jnp.asarray(cp_batch),
         )
         return sample, idx.astype(np.int64)
 
@@ -733,6 +746,7 @@ class ReplayBuffer:
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
             "wdl_tgt": self.wdl_tgt, "mask": self.mask,
+            "current_player": self.current_player,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
@@ -741,6 +755,7 @@ class ReplayBuffer:
         loaded_policy = np.array(state["policy_tgt"])
         loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
+        loaded_cp = np.array(state.get("current_player", np.zeros_like(loaded_mask, dtype=np.int32)))
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
         old_max = loaded_obs.shape[0]
@@ -750,6 +765,7 @@ class ReplayBuffer:
             self.policy_tgt[:old_max] = loaded_policy
             self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
+            self.current_player[:old_max] = loaded_cp[:old_max] if loaded_cp.size >= old_max else 0
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
@@ -757,6 +773,7 @@ class ReplayBuffer:
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
+            self.current_player[:] = loaded_cp[:self.max_size] if loaded_cp.size >= self.max_size else 0
             self.size = self.max_size
             self.ptr = 0
         self.total_added = int(state["total_added"])
