@@ -247,22 +247,20 @@ class SelfplayOutput(NamedTuple):
     obs: jnp.ndarray              # 观察（红方=绝对视角，黑方=180° 翻转）
     reward: jnp.ndarray
     terminated: jnp.ndarray
-    action_weights: jnp.ndarray   # 策略目标，始终为绝对坐标系（红方视角）
+    action_weights: jnp.ndarray   # 策略目标，与 obs 保持同一归一化视角
     discount: jnp.ndarray
     winner: jnp.ndarray           # 0=红胜 1=黑胜 -1=和棋
     draw_reason: jnp.ndarray
     root_value: jnp.ndarray       # MCTS 搜索后的标量价值估计
     root_wdl: jnp.ndarray        # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
     root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵，用于监控探索程度
-    current_player: jnp.ndarray  # 当前行棋方 0=红 1=黑，训练时用于 logits 旋转对齐
 
 class Sample(NamedTuple):
     """训练样本（从 SelfplayOutput 经 compute_targets 得到）"""
     obs: jnp.ndarray
-    policy_tgt: jnp.ndarray       # 策略目标，绝对坐标系
+    policy_tgt: jnp.ndarray       # 策略目标，与 obs 保持同一归一化视角
     wdl_tgt: jnp.ndarray         # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
     mask: jnp.ndarray            # 有效步掩码（游戏结束前）
-    current_player: jnp.ndarray  # 0=红 1=黑，黑方时 loss_fn 内需旋转 logits 再算 policy loss
 
 # ============================================================================
 # 自玩
@@ -330,8 +328,12 @@ def selfplay(params, rng_key, batch_size):
         # 执行动作
         next_state = jax.vmap(env.step)(state, action)
         
-        # 策略目标：MCTS 的 action_weights 已为绝对坐标系，直接存储（训练时与 policy_tgt 对齐）
-        policy_tgt_abs = action_weights
+        # 恢复统一视角：策略目标与 obs 保持同一归一化视角。
+        normalized_action_weights = jnp.where(
+            state.current_player[:, None] == 0,
+            action_weights,
+            action_weights[:, _ROTATED_IDX],
+        )
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         w_masked = jnp.where(state.legal_action_mask, action_weights, 0.0)
@@ -340,7 +342,7 @@ def selfplay(params, rng_key, batch_size):
         root_visit_entropy = -jnp.sum(p * jnp.log(p + 1e-10), axis=-1)
         
         data = SelfplayOutput(
-            obs=obs, action_weights=policy_tgt_abs,
+            obs=obs, action_weights=normalized_action_weights,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
@@ -348,7 +350,6 @@ def selfplay(params, rng_key, batch_size):
             root_value=root_value,
             root_wdl=root_wdl,
             root_visit_entropy=root_visit_entropy,
-            current_player=state.current_player,
         )
         
         # 结束后直接重置为标准初始局面
@@ -371,7 +372,7 @@ def compute_targets(data: SelfplayOutput):
     - 视角翻转用 W↔L 互换（对手的 [W,D,L] -> 我方的 [L,D,W]）
     - 游戏结果直接映射为 one-hot WDL（reward +1/0/-1 -> [W,D,L]）
     
-    输出 Sample：policy_tgt 为绝对坐标系，current_player 用于 loss_fn 中 logits 旋转。
+    输出 Sample：policy_tgt 与 obs 使用同一归一化视角。
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     lam = config.td_lambda
@@ -420,7 +421,6 @@ def compute_targets(data: SelfplayOutput):
         policy_tgt=data.action_weights, 
         wdl_tgt=wdl_tgt,
         mask=value_mask,
-        current_player=data.current_player,
     )
 
 # ============================================================================
@@ -471,8 +471,7 @@ def compute_selfplay_stats(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵。policy_tgt 始终为绝对坐标系；黑方 obs 时网络输出为黑方坐标系，
-      需用 logits[:, _ROTATED_IDX] 旋转到绝对坐标系再比较。
+    - 策略损失：交叉熵。policy_tgt 与 obs 处于同一归一化视角，可直接比较。
     - 价值损失：WDL 交叉熵（比标量 MSE 梯度信号更强，精确区分"和棋"与"不确定"）
     """
     obs = samples.obs.astype(jnp.float32)
@@ -490,13 +489,9 @@ def loss_fn(params, samples: Sample, rng_key):
     wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
     wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
-    
-    # 黑方 obs 时网络输出为黑方坐标系，旋转到绝对坐标系后与 policy_tgt（绝对）对齐
-    is_black = samples.current_player == 1
-    logits_for_policy = jnp.where(is_black[:, None], logits[:, _ROTATED_IDX], logits)
-    
+
     # 策略损失（交叉熵）
-    policy_ce = optax.softmax_cross_entropy(logits_for_policy, policy_tgt)
+    policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     # 价值损失：WDL 交叉熵（目标已由 compute_targets 正确计算）
@@ -685,7 +680,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 class ReplayBuffer:
     """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）
     
-    存储：obs, policy_tgt(绝对坐标系), wdl_tgt, mask, current_player(0=红 1=黑)
+    存储：obs, policy_tgt(与 obs 同视角), wdl_tgt, mask
     """
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
@@ -694,7 +689,6 @@ class ReplayBuffer:
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
         self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
-        self.current_player = np.zeros((max_size,), dtype=np.int32)  # 训练时用于 logits 旋转
         self.ptr = 0
         self.size = 0
         self.total_added = 0
@@ -711,14 +705,13 @@ class ReplayBuffer:
         return np.random.default_rng(int(seed))
 
     def add(self, samples: Sample):
-        """存入样本（JAX -> NumPy，含 obs/policy_tgt/wdl_tgt/mask/current_player）"""
+        """存入样本（JAX -> NumPy，含 obs/policy_tgt/wdl_tgt/mask）"""
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         wdl_flat = samples_np.wdl_tgt.reshape(-1, 3)
         mask_flat = samples_np.mask.reshape(-1)
-        cp_flat = samples_np.current_player.reshape(-1)
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -727,7 +720,6 @@ class ReplayBuffer:
         self.policy_tgt[indices] = policy_flat
         self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
-        self.current_player[indices] = cp_flat
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
@@ -753,14 +745,12 @@ class ReplayBuffer:
         policy_batch = self.policy_tgt[idx]
         wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
-        cp_batch = self.current_player[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             wdl_tgt=jnp.asarray(wdl_batch),
             mask=jnp.asarray(mask_batch),
-            current_player=jnp.asarray(cp_batch),
         )
         return sample, idx.astype(np.int64)
 
@@ -774,7 +764,6 @@ class ReplayBuffer:
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
             "wdl_tgt": self.wdl_tgt, "mask": self.mask,
-            "current_player": self.current_player,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
@@ -783,7 +772,6 @@ class ReplayBuffer:
         loaded_policy = np.array(state["policy_tgt"])
         loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
-        loaded_cp = np.array(state["current_player"])
         loaded_size = int(state["size"])
         loaded_ptr = int(state["ptr"])
         old_max = loaded_obs.shape[0]
@@ -793,7 +781,6 @@ class ReplayBuffer:
             self.policy_tgt[:old_max] = loaded_policy
             self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
-            self.current_player[:old_max] = loaded_cp[:old_max]
             self.size = actual_samples
             self.ptr = loaded_ptr % self.max_size
         else:
@@ -801,7 +788,6 @@ class ReplayBuffer:
             self.policy_tgt[:] = loaded_policy[:self.max_size]
             self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
-            self.current_player[:] = loaded_cp[:self.max_size]
             self.size = self.max_size
             self.ptr = 0
         self.total_added = int(state["total_added"])

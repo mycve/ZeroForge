@@ -22,8 +22,6 @@ from xiangqi.actions import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
     ACTION_SPACE_SIZE,
-    _ACTION_TO_FROM_SQ,
-    _ACTION_TO_TO_SQ,
 )
 
 
@@ -231,51 +229,29 @@ class GraphBlock(nn.Module):
 # ============================================================================
 
 class PolicyHead(nn.Module):
-    """Factorized from/to policy head
-
-    将动作分解为 (from_square, to_square) 对，用点积评分:
-    score(a) = base_factorized(a) + correction_delta(a) + global
-
-    correction 分支为小型残差打分器，补偿纯 from/to 因子化的表达上限。
-    """
+    """Direct policy head with local node features + global pooled context."""
     action_space_size: int
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray, from_idx: jnp.ndarray, to_idx: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
         x = nn.LayerNorm(dtype=self.dtype)(h)
-        proj_dim = max(self.model_dim // 2, 64)
-        q_from = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="from_proj")(x)
-        k_to = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="to_proj")(x)
+        batch_size = x.shape[0]
+        local_dim = max(self.model_dim // 3, 32)
 
-        from_bias = nn.Dense(1, dtype=self.dtype, name="from_bias")(x).squeeze(-1)
-        to_bias = nn.Dense(1, dtype=self.dtype, name="to_bias")(x).squeeze(-1)
+        p_local = nn.Dense(local_dim, dtype=self.dtype, name="local_proj")(x)
+        p_local = nn.gelu(p_local)
+        p_local = p_local.reshape((batch_size, -1))
 
-        pair_scores = jnp.einsum("bnd,bmd->bnm", q_from, k_to) * (1.0 / math.sqrt(float(proj_dim)))
-        logits = (
-            pair_scores[:, from_idx, to_idx]
-            + from_bias[:, from_idx]
-            + to_bias[:, to_idx]
-        )
+        p_global = jnp.mean(x, axis=1)
+        p_global = nn.Dense(max(self.model_dim // 2, 64), dtype=self.dtype, name="global_fc")(p_global)
+        p_global = nn.gelu(p_global)
 
-        # Lightweight correction branch: delta(a) from projected (from,to) node features.
-        corr_dim = max(self.model_dim // 16, 8)
-        corr_from = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_from_proj")(x)
-        corr_to = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_to_proj")(x)
-        corr_from_act = corr_from[:, from_idx, :]
-        corr_to_act = corr_to[:, to_idx, :]
-        corr_feat = jnp.concatenate(
-            [corr_from_act * corr_to_act, jnp.abs(corr_from_act - corr_to_act)], axis=-1
-        )
-        corr_hidden = nn.Dense(corr_dim, dtype=self.dtype, name="corr_fc1")(corr_feat)
-        corr_hidden = nn.silu(corr_hidden)
-        corr_delta = nn.Dense(1, dtype=self.dtype, name="corr_fc2")(corr_hidden).squeeze(-1)
-        corr_scale = self.param("corr_scale", nn.initializers.constant(0.0), ())
-        logits = logits + corr_scale * corr_delta
-
-        global_ctx = jnp.mean(x, axis=1)
-        logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
+        hidden = jnp.concatenate([p_local, p_global], axis=-1)
+        hidden = nn.Dense(max(self.model_dim * 2, 128), dtype=self.dtype, name="policy_fc1")(hidden)
+        hidden = nn.gelu(hidden)
+        logits = nn.Dense(self.action_space_size, dtype=self.dtype, name="policy_out")(hidden)
         return logits
 
 
@@ -341,8 +317,6 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_mask = jnp.array(neighbor_mask, dtype=jnp.float32)
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
         self.region_id = jnp.array(_build_region_ids(BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int32)
-        self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
-        self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -460,7 +434,7 @@ class AlphaZeroNetwork(nn.Module):
             action_space_size=self.action_space_size,
             model_dim=self.channels,
             dtype=self.dtype,
-        )(h, self.action_from_idx, self.action_to_idx)
+        )(h)
 
         value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
         return (
