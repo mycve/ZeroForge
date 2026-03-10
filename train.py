@@ -11,6 +11,7 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 
 import logging
 import os
+import sys
 import time
 import json
 import warnings
@@ -45,6 +46,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
 logger = logging.getLogger("zeroforge")
 
