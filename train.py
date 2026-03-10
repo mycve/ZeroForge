@@ -51,8 +51,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global），马象靠 Row+Col 多跳
-    num_channels: int = 96   # 128 更宽，96 更快；可据算力调整
-    num_blocks: int = 6      # Row+Col 2跳即全局，6 层足够
+    num_channels: int = 128   # 128 更宽，96 更快；可据算力调整
+    num_blocks: int = 10      # Row+Col 2跳即全局，6 层足够
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -63,18 +63,18 @@ class Config:
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.85          # 0.99 近似蒙特卡洛（方差极高），0.85 平衡偏差/方差
+    td_lambda: float = 0.75
     
     # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
     selfplay_batch_size: int = 1024
-    num_simulations: int = 24            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 6                       # 根节点候选数，Gumbel 无需高 top_k
+    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 40  # 前 40 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.2
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 2_500_000
-    sample_reuse_times: int = 2
+    replay_buffer_size: int = 1_000_000
+    sample_reuse_times: int = 1
     
     # 损失权重
     value_loss_weight: float = 1.0
