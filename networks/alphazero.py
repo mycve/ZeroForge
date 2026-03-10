@@ -22,8 +22,6 @@ from xiangqi.actions import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
     ACTION_SPACE_SIZE,
-    _ACTION_TO_FROM_SQ,
-    _ACTION_TO_TO_SQ,
 )
 
 
@@ -131,6 +129,7 @@ class GraphBlock(nn.Module):
         neighbor_idx: jnp.ndarray,
         neighbor_mask: jnp.ndarray,
         neighbor_dir: jnp.ndarray,
+        node_occupancy: jnp.ndarray,
         train: bool = True,
     ) -> jnp.ndarray:
 
@@ -167,7 +166,15 @@ class GraphBlock(nn.Module):
         qr = q.reshape(B, self.num_rows, self.num_cols, D)
         kr = k.reshape(B, self.num_rows, self.num_cols, D)
         vr = v.reshape(B, self.num_rows, self.num_cols, D)
+        row_occ = node_occupancy.reshape(B, self.num_rows, self.num_cols).astype(jnp.bool_)
+        row_self = jnp.eye(self.num_cols, dtype=jnp.bool_)[None, None, :, :]
+        row_key_mask = row_occ[:, :, None, :] | row_self
         row_scores = jnp.einsum("brnd,brmd->brnm", qr, kr) * scale
+        row_scores = jnp.where(
+            row_key_mask,
+            row_scores,
+            jnp.finfo(row_scores.dtype).min,
+        )
         row_attn = nn.softmax(row_scores, axis=-1)
         row_agg = jnp.einsum("brnm,brmd->brnd", row_attn, vr).reshape(B, -1, D)
         row_out = nn.Dense(D, dtype=self.dtype, name="row_out")(row_agg)
@@ -176,7 +183,15 @@ class GraphBlock(nn.Module):
         qc = q.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
         kc = k.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
         vc = v.reshape(B, self.num_rows, self.num_cols, D).transpose(0, 2, 1, 3)
+        col_occ = row_occ.transpose(0, 2, 1)
+        col_self = jnp.eye(self.num_rows, dtype=jnp.bool_)[None, None, :, :]
+        col_key_mask = col_occ[:, :, None, :] | col_self
         col_scores = jnp.einsum("bcnd,bcmd->bcnm", qc, kc) * scale
+        col_scores = jnp.where(
+            col_key_mask,
+            col_scores,
+            jnp.finfo(col_scores.dtype).min,
+        )
         col_attn = nn.softmax(col_scores, axis=-1)
         col_agg = jnp.einsum("bcnm,bcmd->bcnd", col_attn, vc)
         col_agg = col_agg.transpose(0, 2, 1, 3).reshape(B, -1, D)
@@ -214,51 +229,31 @@ class GraphBlock(nn.Module):
 # ============================================================================
 
 class PolicyHead(nn.Module):
-    """Factorized from/to policy head
-
-    将动作分解为 (from_square, to_square) 对，用点积评分:
-    score(a) = base_factorized(a) + correction_delta(a) + global
-
-    correction 分支为小型残差打分器，补偿纯 from/to 因子化的表达上限。
-    """
+    """Direct policy head with local node features + global pooled context."""
     action_space_size: int
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray, from_idx: jnp.ndarray, to_idx: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
         x = nn.LayerNorm(dtype=self.dtype)(h)
-        proj_dim = max(self.model_dim // 2, 64)
-        q_from = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="from_proj")(x)
-        k_to = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="to_proj")(x)
+        batch_size = x.shape[0]
+        local_dim = max(self.model_dim // 3, 32)
 
-        from_bias = nn.Dense(1, dtype=self.dtype, name="from_bias")(x).squeeze(-1)
-        to_bias = nn.Dense(1, dtype=self.dtype, name="to_bias")(x).squeeze(-1)
+        # Project each node, then flatten all board-local features into the action scorer.
+        p_local = nn.Dense(local_dim, dtype=self.dtype, name="local_proj")(x)
+        p_local = nn.gelu(p_local)
+        p_local = p_local.reshape((batch_size, -1))
 
-        pair_scores = jnp.einsum("bnd,bmd->bnm", q_from, k_to) * (1.0 / math.sqrt(float(proj_dim)))
-        logits = (
-            pair_scores[:, from_idx, to_idx]
-            + from_bias[:, from_idx]
-            + to_bias[:, to_idx]
-        )
+        # Global pooled context helps with long-range tactical and strategic priors.
+        p_global = jnp.mean(x, axis=1)
+        p_global = nn.Dense(max(self.model_dim // 2, 64), dtype=self.dtype, name="global_fc")(p_global)
+        p_global = nn.gelu(p_global)
 
-        # Lightweight correction branch: delta(a) from projected (from,to) node features.
-        corr_dim = max(self.model_dim // 16, 8)
-        corr_from = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_from_proj")(x)
-        corr_to = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_to_proj")(x)
-        corr_from_act = corr_from[:, from_idx, :]
-        corr_to_act = corr_to[:, to_idx, :]
-        corr_feat = jnp.concatenate(
-            [corr_from_act * corr_to_act, jnp.abs(corr_from_act - corr_to_act)], axis=-1
-        )
-        corr_hidden = nn.Dense(corr_dim, dtype=self.dtype, name="corr_fc1")(corr_feat)
-        corr_hidden = nn.silu(corr_hidden)
-        corr_delta = nn.Dense(1, dtype=self.dtype, name="corr_fc2")(corr_hidden).squeeze(-1)
-        corr_scale = self.param("corr_scale", nn.initializers.constant(0.0), ())
-        logits = logits + corr_scale * corr_delta
-
-        global_ctx = jnp.mean(x, axis=1)
-        logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
+        hidden = jnp.concatenate([p_local, p_global], axis=-1)
+        hidden = nn.Dense(max(self.model_dim * 2, 128), dtype=self.dtype, name="policy_fc1")(hidden)
+        hidden = nn.gelu(hidden)
+        logits = nn.Dense(self.action_space_size, dtype=self.dtype, name="policy_out")(hidden)
         return logits
 
 
@@ -324,8 +319,6 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_mask = jnp.array(neighbor_mask, dtype=jnp.float32)
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
         self.region_id = jnp.array(_build_region_ids(BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int32)
-        self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
-        self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -383,6 +376,7 @@ class AlphaZeroNetwork(nn.Module):
         ).astype(self.dtype)  # (14, Dp)
 
         x = x.reshape((batch_size, BOARD_HEIGHT, BOARD_WIDTH, num_frames, channels_per_frame))
+        node_occupancy = (jnp.sum(x[:, :, :, 0, :], axis=-1) > 0).reshape(batch_size, num_nodes)
 
         # 历史帧时间权重：9 帧各一个可学习标量，初始化为指数衰减
         # 帧顺序: [当前, t-1, t-2, ..., t-8]，越近权重越大
@@ -434,6 +428,7 @@ class AlphaZeroNetwork(nn.Module):
                 self.neighbor_idx,
                 self.neighbor_mask,
                 self.neighbor_dir,
+                node_occupancy,
                 train=train,
             )
 
@@ -441,7 +436,7 @@ class AlphaZeroNetwork(nn.Module):
             action_space_size=self.action_space_size,
             model_dim=self.channels,
             dtype=self.dtype,
-        )(h, self.action_from_idx, self.action_to_idx)
+        )(h)
 
         value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
         return (
