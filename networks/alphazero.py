@@ -2,15 +2,15 @@
 AlphaZero network - 精简 3 分支 GNN 架构（无 Global）
 
 分支设计（全部基于静态棋盘拓扑，无动态规则计算）:
-- Local: 8 方向邻居（上下左右+4对角），马/象靠 Row+Col 多跳学习
-- Row: 同行分组注意力（车/炮行攻击，9 节点一组 × 10 行）
-- Col: 同列分组注意力（车/炮列攻击，10 节点一组 × 9 列）
+- Local: 8 方向邻居（上下左右+4对角），负责短程交互
+- Row: 同行分组注意力（车/炮横向），并对空位做 occupancy mask
+- Col: 同列分组注意力（车/炮纵向），并对空位做 occupancy mask
 
 关键设计决策:
-- 去掉 Global，Row/Col 多跳覆盖长距离
-- Local 仅 8 邻居，节省 ~20% 计算，自对弈更快
+- 去掉主干 Global，Row/Col 多跳覆盖大部分长距离关系
+- Local 仅 8 邻居，节省计算，自对弈更快
 - 不在网络内计算合法走法，让网络从原始棋子位置自行学习
-- Factorized Policy Head (from/to pair scoring) + Attention-Pooled Value Head
+- Factorized Policy Head + 轻量 pair correction + Attention-Pooled Value Head
 """
 
 import math
@@ -22,6 +22,8 @@ from xiangqi.actions import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
     ACTION_SPACE_SIZE,
+    _ACTION_TO_FROM_SQ,
+    _ACTION_TO_TO_SQ,
 )
 
 
@@ -229,29 +231,49 @@ class GraphBlock(nn.Module):
 # ============================================================================
 
 class PolicyHead(nn.Module):
-    """Direct policy head with local node features + global pooled context."""
+    """Factorized from/to policy head.
+
+    将动作分解为 (from_square, to_square) 对，用点积评分:
+    score(a) = base_factorized(a) + correction_delta(a) + global
+    """
     action_space_size: int
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, h: jnp.ndarray, from_idx: jnp.ndarray, to_idx: jnp.ndarray) -> jnp.ndarray:
         x = nn.LayerNorm(dtype=self.dtype)(h)
-        batch_size = x.shape[0]
-        local_dim = max(self.model_dim // 3, 32)
+        proj_dim = max(self.model_dim // 2, 64)
+        q_from = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="from_proj")(x)
+        k_to = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="to_proj")(x)
 
-        p_local = nn.Dense(local_dim, dtype=self.dtype, name="local_proj")(x)
-        p_local = nn.gelu(p_local)
-        p_local = p_local.reshape((batch_size, -1))
+        from_bias = nn.Dense(1, dtype=self.dtype, name="from_bias")(x).squeeze(-1)
+        to_bias = nn.Dense(1, dtype=self.dtype, name="to_bias")(x).squeeze(-1)
 
-        p_global = jnp.mean(x, axis=1)
-        p_global = nn.Dense(max(self.model_dim // 2, 64), dtype=self.dtype, name="global_fc")(p_global)
-        p_global = nn.gelu(p_global)
+        pair_scores = jnp.einsum("bnd,bmd->bnm", q_from, k_to) * (1.0 / math.sqrt(float(proj_dim)))
+        logits = (
+            pair_scores[:, from_idx, to_idx]
+            + from_bias[:, from_idx]
+            + to_bias[:, to_idx]
+        )
 
-        hidden = jnp.concatenate([p_local, p_global], axis=-1)
-        hidden = nn.Dense(max(self.model_dim * 2, 128), dtype=self.dtype, name="policy_fc1")(hidden)
-        hidden = nn.gelu(hidden)
-        logits = nn.Dense(self.action_space_size, dtype=self.dtype, name="policy_out")(hidden)
+        # Small pair-specific correction branch to improve tactical ranking.
+        corr_dim = max(self.model_dim // 16, 8)
+        corr_from = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_from_proj")(x)
+        corr_to = nn.Dense(corr_dim, use_bias=False, dtype=self.dtype, name="corr_to_proj")(x)
+        corr_from_act = corr_from[:, from_idx, :]
+        corr_to_act = corr_to[:, to_idx, :]
+        corr_feat = jnp.concatenate(
+            [corr_from_act * corr_to_act, jnp.abs(corr_from_act - corr_to_act)], axis=-1
+        )
+        corr_hidden = nn.Dense(corr_dim, dtype=self.dtype, name="corr_fc1")(corr_feat)
+        corr_hidden = nn.silu(corr_hidden)
+        corr_delta = nn.Dense(1, dtype=self.dtype, name="corr_fc2")(corr_hidden).squeeze(-1)
+        corr_scale = self.param("corr_scale", nn.initializers.constant(0.0), ())
+        logits = logits + corr_scale * corr_delta
+
+        global_ctx = jnp.mean(x, axis=1)
+        logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
         return logits
 
 
@@ -317,6 +339,8 @@ class AlphaZeroNetwork(nn.Module):
         self.neighbor_mask = jnp.array(neighbor_mask, dtype=jnp.float32)
         self.neighbor_dir = jnp.array(neighbor_dir, dtype=jnp.int32)
         self.region_id = jnp.array(_build_region_ids(BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int32)
+        self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
+        self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -434,7 +458,7 @@ class AlphaZeroNetwork(nn.Module):
             action_space_size=self.action_space_size,
             model_dim=self.channels,
             dtype=self.dtype,
-        )(h)
+        )(h, self.action_from_idx, self.action_to_idx)
 
         value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
         return (

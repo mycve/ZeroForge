@@ -3,13 +3,13 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索，根节点 argmax（无温度/无采样）
-- 视角归一化：obs 红方=绝对视角、黑方=180° 翻转；策略目标统一为绝对坐标系
-- 训练时黑方 obs 需旋转 logits 到绝对坐标系再与 policy_tgt 比较
-- 镜像增强：30% 概率左右翻转 obs 与 policy
+- Gumbel-Top-k MCTS：搜索内探索，前 40 半步温度采样，后续 argmax
+- 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
+- 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
 """
 
+import logging
 import os
 import time
 import json
@@ -40,6 +40,14 @@ from xiangqi.fen import load_fens_from_file, parse_fen
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("zeroforge")
+
 # ============================================================================
 # 配置
 # ============================================================================
@@ -50,9 +58,9 @@ class Config:
     ckpt_dir: str = "checkpoints"
     log_dir: str = "logs"
     
-    # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global），马象靠 Row+Col 多跳
-    num_channels: int = 128   # 128 更宽，96 更快；可据算力调整
-    num_blocks: int = 10      # Row+Col 2跳即全局，6 层足够
+    # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
+    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
+    num_blocks: int = 8       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -65,7 +73,7 @@ class Config:
     training_batch_size: int = 4096
     td_lambda: float = 0.75
     
-    # 自对弈与搜索：Gumbel-Top-k，根节点按 visit 权重 argmax（无温度、无采样）
+    # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
@@ -74,7 +82,7 @@ class Config:
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_000_000
-    sample_reuse_times: int = 1
+    sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
     value_loss_weight: float = 1.0
@@ -124,7 +132,7 @@ def _align_to_device_multiple(value: int, field_name: str) -> int:
         if aligned == 0:
             aligned = num_devices
     if aligned != value:
-        print(f"[Config] {field_name} 从 {value} 自动调整为 {aligned} (num_devices={num_devices})")
+        logger.info("[Config] %s 从 %s 自动调整为 %s (num_devices=%s)", field_name, value, aligned, num_devices)
     return aligned
 
 
@@ -139,7 +147,7 @@ def _shard_batch_for_devices(batch_flat):
     per_device = total // num_devices
     usable = per_device * num_devices
     if usable != total:
-        print(f"[Batch] 训练 batch {total} 无法整除设备数 {num_devices}，自动裁剪为 {usable}")
+        logger.info("[Batch] 训练 batch %s 无法整除设备数 %s，自动裁剪为 %s", total, num_devices, usable)
 
     def _reshape(x):
         x = x[:usable]
@@ -168,6 +176,17 @@ def replicate_to_devices(pytree):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         return jax.device_put_replicated(pytree, devices)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m:d}m{s:02d}s"
+    return f"{s:d}s"
 
 
 
@@ -529,7 +548,7 @@ def _build_eval_initial_states(
         if not fens:
             raise ValueError(f"FEN 文件为空: {fen_file}")
         if for_current_red:
-            print(f"[评估] FEN 文件 {fen_file} 共 {len(fens)} 条局面，先后手轮换")
+            logger.info("[评估] FEN 文件 %s 共 %s 条局面，先后手轮换", fen_file, len(fens))
         # 先后手轮换：偶数索引→current=red，奇数索引→current=black
         boards_r, players_r = [], []
         boards_b, players_b = [], []
@@ -568,7 +587,7 @@ def _build_eval_initial_states(
         players_jax = jnp.array(players)
         states_flat = jax.vmap(env.init_from_board)(boards_jax, players_jax)
     elif fen_file:
-        print(f"[评估] FEN 文件不存在 {fen_file}，改用标准初始局面")
+        logger.warning("[评估] FEN 文件不存在 %s，改用标准初始局面", fen_file)
         keys = jax.random.split(rng_key, batch_size)
         states_flat = jax.vmap(env.init)(keys)
     else:
@@ -874,7 +893,7 @@ def save_checkpoint(
         np.savez_compressed(os.path.join(meta_dir, f"history_{k}.npz"), 
                            **{f"arr_{i}": arr for i, arr in enumerate(jax.tree.leaves(v))})
     
-    print(f"[Checkpoint] 已保存 step={step}")
+    logger.info("[Checkpoint] 已保存 step=%s", step)
 
 
 def restore_checkpoint(
@@ -890,10 +909,10 @@ def restore_checkpoint(
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
-        print("[Checkpoint] 未找到已有 checkpoint，从头开始训练")
+        logger.info("[Checkpoint] 未找到已有 checkpoint，从头开始训练")
         return None
     
-    print(f"[Checkpoint] 正在恢复 step={latest_step}...")
+    logger.info("[Checkpoint] 正在恢复 step=%s...", latest_step)
     
     restore_target = {
         "params": params_template,
@@ -937,9 +956,21 @@ def restore_checkpoint(
     if iteration_elos:
         latest_elo_iter = max(iteration_elos.keys())
         latest_elo = iteration_elos[latest_elo_iter]
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}, ELO={latest_elo:.0f} (iter {latest_elo_iter})")
+        logger.info(
+            "[Checkpoint] 恢复完成: iteration=%s, frames=%s, opt_steps=%s, ELO=%.0f (iter %s)",
+            iteration,
+            frames,
+            total_opt_steps,
+            latest_elo,
+            latest_elo_iter,
+        )
     else:
-        print(f"[Checkpoint] 恢复完成: iteration={iteration}, frames={frames}, opt_steps={total_opt_steps}")
+        logger.info(
+            "[Checkpoint] 恢复完成: iteration=%s, frames=%s, opt_steps=%s",
+            iteration,
+            frames,
+            total_opt_steps,
+        )
     
     return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps
 
@@ -949,8 +980,9 @@ def restore_checkpoint(
 # ============================================================================
 
 def main():
-    print("=" * 50 + "\nZeroForge - 现代高效架构\n" + "=" * 50)
-    print("特性: 3分支GNN (Local 8+Row+Col) + Gumbel-Top-k(argmax) + TD(λ) + 经验回放 + 断点续训")
+    logger.info("=" * 50)
+    logger.info("ZeroForge - 现代高效架构")
+    logger.info("特性: 3分支GNN + factorized policy head + 统一视角训练 + Gumbel-Top-k + TD(λ)")
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -981,12 +1013,15 @@ def main():
         return config.learning_rate * warmup_factor * cosine_factor
     
     final_lr = config.learning_rate * config.lr_min_ratio
-    print(
-        f"[LR] 余弦退火: {config.learning_rate:.1e} → {final_lr:.1e}, "
-        f"周期={config.lr_cosine_steps}steps(≈{config.lr_cosine_steps // 266}轮), "
-        f"warmup={config.lr_warmup_steps}steps"
+    logger.info(
+        "[LR] 余弦退火: %.1e → %.1e, 周期=%s steps(≈%s轮), warmup=%s steps",
+        config.learning_rate,
+        final_lr,
+        config.lr_cosine_steps,
+        config.lr_cosine_steps // 266,
+        config.lr_warmup_steps,
     )
-    print(f"[TD(λ)] 固定 λ={config.td_lambda}")
+    logger.info("[TD(λ)] 固定 λ=%s", config.td_lambda)
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
@@ -996,7 +1031,7 @@ def main():
     
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps = restored
-        print(f"[断点续训] 从 iteration={iteration} 继续训练")
+        logger.info("[断点续训] 从 iteration=%s 继续训练", iteration)
     else:
         params = params_template
         opt_state = opt_state_template
@@ -1024,17 +1059,17 @@ def main():
         f"_sp{config.selfplay_batch_size}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
-    print(f"[Log] TensorBoard 日志: {run_log_dir}")
+    logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
     writer = SummaryWriter(run_log_dir)
     start_time_total = time.time()
     
-    print("开始训练！")
+    logger.info("开始训练")
     
     # 恢复后若轮到评估（如崩溃在 ckpt 保存后、eval 前），补跑评估
     if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
         available_iters = sorted(k for k in history_models.keys() if k < iteration)
         if available_iters:
-            print(f"[断点续训] 补跑 iteration={iteration} 的评估...")
+            logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
             rated_iters = [k for k in available_iters if k in iteration_elos]
             ref_iter = max(rated_iters, key=lambda k: iteration_elos[k]) if rated_iters else available_iters[-1]
             ref_reason = "best_elo" if rated_iters else "latest_ckpt"
@@ -1053,7 +1088,7 @@ def main():
                 winners_r = evaluate(params, past_params, states_r, eval_keys_r)
                 winners_b = evaluate(past_params, params, states_b, eval_keys_b)
             except Exception as e:
-                print(f"[评估错误] 补跑评估失败: {e}")
+                logger.exception("[评估错误] 补跑评估失败: %s", e)
                 raise RuntimeError("断点续训补跑评估异常") from e
             wins_red = int((winners_r == 0).sum())
             draws_red = int((winners_r == -1).sum())
@@ -1071,7 +1106,16 @@ def main():
             elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
             iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
             decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
-            print(f"评估 vs Iter {ref_iter} ({ref_reason}): W/D/L {wins}/{draws}/{losses} | 得分率 {score:.2%} | ELO {iteration_elos[iteration]:.0f}")
+            logger.info(
+                "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 得分率 %.2f%% | ELO %.0f",
+                ref_iter,
+                ref_reason,
+                wins,
+                draws,
+                losses,
+                score * 100.0,
+                iteration_elos[iteration],
+            )
             writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
             writer.add_scalar("eval/win_rate", wins / total_games, iteration)
             writer.add_scalar("eval/draw_rate", draws / total_games, iteration)
@@ -1080,7 +1124,14 @@ def main():
             if decisive_games > 0:
                 writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
     
-    print(f"[Selfplay] batch_size={config.selfplay_batch_size}, gumbel_scale={config.selfplay_gumbel_scale}")
+    logger.info(
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
+        config.selfplay_batch_size,
+        config.selfplay_gumbel_scale,
+        config.sample_reuse_times,
+        config.selfplay_temperature_steps,
+        config.selfplay_temperature,
+    )
 
     while True:
         iteration += 1
@@ -1194,11 +1245,24 @@ def main():
         iter_time = time.time() - st
         fps = new_frames / max(iter_time, 1e-9)
         buf_stats = replay_buffer.stats()
-        print(f"iter={iteration:3d} | ploss={policy_loss:.4f} "
-              f"vloss={value_loss:.4f} | "
-              f"len={avg_length:4.1f} fps={fps:4.0f} buf={buf_stats['size']//1000}k train={num_updates} | "
-              f"ent={root_visit_entropy:.3f} | "
-              f"红{r_wins:3d} 黑{b_wins:3d} 和{draws:3d}")
+        total_elapsed = time.time() - start_time_total
+        logger.info(
+            "iter=%3d | ploss=%.4f vloss=%.4f | len=%4.1f fps=%4.0f "
+            "buf=%dk train=%d | ent=%.3f | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
+            iteration,
+            policy_loss,
+            value_loss,
+            avg_length,
+            fps,
+            buf_stats["size"] // 1000,
+            num_updates,
+            root_visit_entropy,
+            r_wins,
+            b_wins,
+            draws,
+            _format_duration(iter_time),
+            _format_duration(total_elapsed),
+        )
         base_lr = float(lr_schedule(total_opt_steps))
         
         # TensorBoard 记录
@@ -1281,9 +1345,9 @@ def main():
                     winners_r = evaluate(params, past_params, states_r, eval_keys_r)
                     winners_b = evaluate(past_params, params, states_b, eval_keys_b)
                 except Exception as e:
-                    print(f"[评估错误] 当前模型 dtype={config.network_dtype}, action_size={ACTION_SPACE_SIZE}")
-                    print(f"[评估错误] params dtype: {jax.tree.leaves(params)[0].dtype}")
-                    print(f"[评估错误] past_params dtype: {jax.tree.leaves(past_params)[0].dtype}")
+                    logger.error("[评估错误] 当前模型 dtype=%s, action_size=%s", config.network_dtype, ACTION_SPACE_SIZE)
+                    logger.error("[评估错误] params dtype: %s", jax.tree.leaves(params)[0].dtype)
+                    logger.error("[评估错误] past_params dtype: %s", jax.tree.leaves(past_params)[0].dtype)
                     raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
 
                 # 当前模型先手（红）与后手（黑）拆分统计，避免“和棋被误判为输”。
@@ -1309,16 +1373,29 @@ def main():
                 elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
                 iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
                 decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
-                print(
-                    f"评估 vs Iter {ref_iter} ({ref_reason}): "
-                    f"W/D/L {wins}/{draws}/{losses} | "
-                    f"胜率 {win_rate:.2%} 和率 {draw_rate:.2%} 负率 {loss_rate:.2%} | "
-                    f"得分率 {score:.2%} | 决胜局胜率 {decisive_text} | "
-                    f"ELO {iteration_elos[iteration]:.0f}"
+                logger.info(
+                    "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 胜率 %.2f%% 和率 %.2f%% 负率 %.2f%% | "
+                    "得分率 %.2f%% | 决胜局胜率 %s | ELO %.0f",
+                    ref_iter,
+                    ref_reason,
+                    wins,
+                    draws,
+                    losses,
+                    win_rate * 100.0,
+                    draw_rate * 100.0,
+                    loss_rate * 100.0,
+                    score * 100.0,
+                    decisive_text,
+                    iteration_elos[iteration],
                 )
-                print(
-                    f"  先手(当前红) W/D/L {wins_red}/{draws_red}/{losses_red} | "
-                    f"后手(当前黑) W/D/L {wins_black}/{draws_black}/{losses_black}"
+                logger.info(
+                    "  先手(当前红) W/D/L %s/%s/%s | 后手(当前黑) W/D/L %s/%s/%s",
+                    wins_red,
+                    draws_red,
+                    losses_red,
+                    wins_black,
+                    draws_black,
+                    losses_black,
                 )
                 writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
                 writer.add_scalar("eval/win_rate", win_rate, iteration)
@@ -1328,7 +1405,7 @@ def main():
                 if decisive_games > 0:
                     writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
             else:
-                print(f"[警告] 无可用历史模型，跳过本次评估")
+                logger.warning("[警告] 无可用历史模型，跳过本次评估")
 
 if __name__ == "__main__":
     main()
