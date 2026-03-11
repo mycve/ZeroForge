@@ -74,14 +74,13 @@ MCTS_QTRANSFORM = partial(
 DEFAULT_NUM_SIMULATIONS = 256
 DEFAULT_TOP_K = 32
 
-# 日志写入磁盘，走法等信息由 send() 输出到 stdout
-_LOG_DIR = os.path.expanduser("~/.cache/zeroforge_jax")
+# 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
+_LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_FILE = os.path.join(_LOG_DIR, "zeroforge_uci.log")
 logger = logging.getLogger("zeroforge_uci")
 logger.setLevel(logging.DEBUG)
 logger.handlers.clear()
 try:
-    os.makedirs(_LOG_DIR, exist_ok=True)
     _fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
     _fh.setLevel(logging.DEBUG)
     _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
