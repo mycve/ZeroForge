@@ -386,9 +386,6 @@ class Engine:
 
         val = float(policy.search_tree.node_values[0, 0])
 
-        if state.current_player == 1:
-            val = -val
-
         return move, val
 
 
