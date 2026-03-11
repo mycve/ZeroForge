@@ -313,25 +313,28 @@ class Engine:
 
 
 def build_state(env, fen, moves):
-
+    """从 FEN 和走法列表构建局面，非法走法会跳过并记录"""
     board, player = parse_fen(fen)
-
     state = env.init_from_board(
         jnp.array(board, dtype=jnp.int8),
         jnp.int32(player),
     )
-
     for m in moves:
-
-        f, t = uci_to_move(m[:4])
-
-        action = move_to_action(jnp.int32(f), jnp.int32(t))
-
-        state = env.step(state, action)
-
-        if state.terminated:
-            break
-
+        m = (m or "").strip()
+        if len(m) < 4:
+            continue
+        try:
+            f, t = uci_to_move(m[:4])
+            action = int(move_to_action(jnp.int32(f), jnp.int32(t)))
+            if action < 0:
+                logger.error("非法走法(动作-1): %s", m[:4])
+                continue
+            state = env.step(state, jnp.int32(action))
+            if state.terminated:
+                break
+        except (ValueError, IndexError, KeyError) as e:
+            logger.error("解析走法失败 %r: %s", m[:4], e)
+            continue
     return state
 
 
@@ -348,81 +351,78 @@ def run_uci(engine, simulations, top_k):
         print(x, flush=True)
 
     for line in sys.stdin:
+        cmd = ""
+        try:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            cmd = parts[0]
 
-        parts = line.strip().split()
+            if cmd == "uci":
+                send("id name ZeroForge")
+                send("id author ZeroForge")
+                send("uciok")
 
-        if not parts:
-            continue
+            elif cmd == "isready":
+                if engine.params is None:
+                    engine.load()
+                send("readyok")
 
-        cmd = parts[0]
-
-        if cmd == "uci":
-
-            send("id name ZeroForge")
-            send("id author ZeroForge")
-            send("uciok")
-
-        elif cmd == "isready":
-
-            if engine.params is None:
-                engine.load()
-
-            send("readyok")
-
-        elif cmd == "position":
-
-            fen = STARTING_FEN
-            moves = []
-
-            if parts[1] == "startpos":
-
-                if "moves" in parts:
-                    i = parts.index("moves")
-                    moves = parts[i + 1 :]
-
-            elif parts[1] == "fen":
-
-                i = parts.index("fen") + 1
-                fen = " ".join(parts[i : i + 2])
-
-                if "moves" in parts:
-                    j = parts.index("moves")
-                    moves = parts[j + 1 :]
-
-            state = build_state(engine.env, fen, moves)
-
-        elif cmd == "go":
-
-            if engine.params is None:
-                if not engine.load():
-                    send("info string model load failed")
-                    send("bestmove 0000")
+            elif cmd == "position":
+                fen = STARTING_FEN
+                moves = []
+                if len(parts) < 2:
                     continue
+                if parts[1] == "startpos":
+                    if "moves" in parts:
+                        i = parts.index("moves")
+                        moves = parts[i + 1 :]
+                elif parts[1] == "fen":
+                    if "fen" not in parts:
+                        continue
+                    i = parts.index("fen") + 1
+                    j = parts.index("moves") if "moves" in parts else len(parts)
+                    fen = " ".join(parts[i:j])
+                    if "moves" in parts:
+                        moves = parts[j + 1 :]
+                try:
+                    state = build_state(engine.env, fen, moves)
+                except (ValueError, KeyError) as e:
+                    logger.error("build_state 失败: %s", e)
+                    state = build_state(engine.env, STARTING_FEN, [])
 
-            if state is None:
-                state = build_state(engine.env, STARTING_FEN, [])
+            elif cmd == "go":
+                if engine.params is None:
+                    if not engine.load():
+                        send("info string model load failed")
+                        send("bestmove 0000")
+                        continue
+                if state is None:
+                    state = build_state(engine.env, STARTING_FEN, [])
+                t0 = time.perf_counter()
+                move, val = engine.get_best_move(state, simulations, top_k)
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                if move:
+                    cp = int(val * 1000)
+                    send(
+                        f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
+                        f"nodes {simulations} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
+                    )
+                    send(f"bestmove {move}")
+                else:
+                    send("bestmove 0000")
 
-            t0 = time.perf_counter()
-            move, val = engine.get_best_move(state, simulations, top_k)
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            elif cmd == "quit":
+                break
 
-            if move:
-
-                cp = int(val * 1000)
-                # 与 Pikafish 兼容的 info 格式，便于 GUI 解析 score cp
-                send(
-                    f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
-                    f"nodes {simulations} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
-                )
-                send(f"bestmove {move}")
-
-            else:
-
-                send("bestmove 0000")
-
-        elif cmd == "quit":
-
-            break
+        except Exception as e:
+            logger.error("UCI 命令处理异常: %s", e)
+            if cmd == "go":
+                try:
+                    send("info string error")
+                    send("bestmove 0000")
+                except Exception:
+                    pass
 
 
 # ==========================================================
