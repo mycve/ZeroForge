@@ -1,1 +1,1 @@
-uv run python .\uci_engine.py
+uv run python .\uci_engine.py --cpu
