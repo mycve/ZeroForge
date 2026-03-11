@@ -35,6 +35,18 @@ os.environ["JAX_LOGGING_LEVEL"] = "ERROR"
 os.environ.setdefault("GLOG_minloglevel", "3")  # 3=FATAL only，屏蔽 INFO/WARNING/ERROR
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
+# 某些 XLA/C++ 日志会直接写到进程 stderr，绕过 Python logging。
+# 为避免污染 UCI GUI 控制台和协议交互，这里在导入 JAX 前把 stderr 重定向到独立文件。
+_BOOT_LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+_STDERR_LOG_FILE = os.path.join(_BOOT_LOG_DIR, "zeroforge_uci_stderr.log")
+try:
+    _stderr_fd = os.open(_STDERR_LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(_stderr_fd, 2)
+    os.close(_stderr_fd)
+    sys.stderr = open(2, "w", buffering=1, encoding="utf-8", errors="replace", closefd=False)
+except OSError:
+    pass
+
 # ==========================================================
 
 import jax
@@ -74,6 +86,8 @@ MCTS_QTRANSFORM = partial(
 
 DEFAULT_NUM_SIMULATIONS = 512
 DEFAULT_TOP_K = 32
+DEFAULT_THREADS = 1
+DEFAULT_HASH_MB = 16
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -409,6 +423,21 @@ def build_state(env, fen, moves):
     return state
 
 
+def parse_setoption(parts):
+    """解析 UCI setoption，支持多词 option name/value。"""
+    if "name" not in parts:
+        return "", None
+    name_idx = parts.index("name") + 1
+    if "value" in parts:
+        value_idx = parts.index("value")
+        name = " ".join(parts[name_idx:value_idx]).strip()
+        value = " ".join(parts[value_idx + 1 :]).strip()
+    else:
+        name = " ".join(parts[name_idx:]).strip()
+        value = None
+    return name, value
+
+
 # ==========================================================
 # UCI LOOP
 # ==========================================================
@@ -417,7 +446,12 @@ def build_state(env, fen, moves):
 def run_uci(engine, simulations, top_k):
 
     state = None
-    opts = {"simulations": simulations, "top_k": top_k}
+    opts = {
+        "simulations": simulations,
+        "top_k": top_k,
+        "threads": DEFAULT_THREADS,
+        "hash": DEFAULT_HASH_MB,
+    }
     logger.info("UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s", simulations, top_k, _LOG_FILE)
     engine.start_background_load()
 
@@ -441,18 +475,38 @@ def run_uci(engine, simulations, top_k):
                 send("id author ZeroForge")
                 send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
                 send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
+                send(f"option name Threads type spin default {opts['threads']} min 1 max 1")
+                send(f"option name Hash type spin default {opts['hash']} min 1 max 1024")
+                send("option name Clear Hash type button")
                 send("uciok")
 
             elif cmd == "setoption":
-                if "name" in parts and "value" in parts:
-                    ni, vi = parts.index("name"), parts.index("value")
-                    name = parts[ni + 1] if ni + 1 < len(parts) else ""
-                    val = parts[vi + 1] if vi + 1 < len(parts) else ""
-                    if name == "Simulations" and val.isdigit():
-                        opts["simulations"] = max(16, min(4096, int(val)))
-                    elif name == "TopK" and val.isdigit():
-                        opts["top_k"] = max(4, min(64, int(val)))
-                    logger.info("设置选项 %s=%s -> simulations=%s top_k=%s", name, val, opts["simulations"], opts["top_k"])
+                name, val = parse_setoption(parts)
+                if name == "Simulations" and val and val.isdigit():
+                    opts["simulations"] = max(16, min(4096, int(val)))
+                elif name == "TopK" and val and val.isdigit():
+                    opts["top_k"] = max(4, min(64, int(val)))
+                elif name == "Threads" and val and val.isdigit():
+                    requested = int(val)
+                    opts["threads"] = 1
+                    logger.info("设置选项 Threads=%s -> 当前实现固定单线程", requested)
+                elif name == "Hash" and val and val.isdigit():
+                    opts["hash"] = max(1, min(1024, int(val)))
+                    logger.info("设置选项 Hash=%sMB -> 当前实现无置换表，仅记录该值", opts["hash"])
+                elif name == "Clear Hash":
+                    logger.info("收到 Clear Hash -> 当前实现无置换表，忽略")
+                elif name:
+                    logger.info("收到未实现选项 %s=%s，忽略", name, val)
+                if name in {"Simulations", "TopK"}:
+                    logger.info(
+                        "设置选项 %s=%s -> simulations=%s top_k=%s threads=%s hash=%s",
+                        name,
+                        val,
+                        opts["simulations"],
+                        opts["top_k"],
+                        opts["threads"],
+                        opts["hash"],
+                    )
 
             elif cmd == "isready":
                 if engine.params is None:
