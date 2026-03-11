@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ZeroForge UCI 引擎（高性能优化版）
+ZeroForge UCI 引擎（高性能 + JAX 编译缓存）
 """
 
 import os
@@ -9,27 +9,46 @@ import argparse
 import logging
 from functools import partial
 
-# CPU 强制
+# ==========================================================
+# JAX 性能设置（必须在 import jax 前）
+# ==========================================================
+
+os.environ["JAX_COMPILATION_CACHE_DIR"] = os.path.expanduser(
+    "~/.cache/zeroforge_jax"
+)
+
+os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "1"
+os.environ["JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES"] = "0"
+
+# 避免 GPU 一次性占满显存
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+# CPU 模式
 if "--cpu" in sys.argv:
     os.environ["JAX_PLATFORMS"] = "cpu"
+
+# ==========================================================
 
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import mctx
 
-from xiangqi.env import XiangqiEnv, XiangqiState, NUM_OBSERVATION_CHANNELS
+from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import (
-    move_to_action, action_to_move, move_to_uci, uci_to_move,
-    ACTION_SPACE_SIZE, rotate_action,
+    move_to_action,
+    action_to_move,
+    move_to_uci,
+    uci_to_move,
+    ACTION_SPACE_SIZE,
+    rotate_action,
 )
 from xiangqi.fen import parse_fen
 from networks.alphazero import AlphaZeroNetwork
 
-
-# ======================================================================
+# ==========================================================
 # 常量
-# ======================================================================
+# ==========================================================
 
 STARTING_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w"
 
@@ -40,9 +59,8 @@ MCTS_QTRANSFORM = partial(
     value_scale=0.1,
 )
 
-DEFAULT_NUM_SIMULATIONS = 128
+DEFAULT_NUM_SIMULATIONS = 64
 DEFAULT_TOP_K = 16
-
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -52,13 +70,12 @@ logging.basicConfig(
 
 logger = logging.getLogger("zeroforge_uci")
 
-
-# ======================================================================
+# ==========================================================
 # Engine
-# ======================================================================
+# ==========================================================
+
 
 class Engine:
-
     def __init__(self, ckpt_dir, step=0):
 
         self.ckpt_dir = os.path.abspath(ckpt_dir)
@@ -74,7 +91,7 @@ class Engine:
 
         self.rng = jax.random.PRNGKey(0)
 
-    # -------------------------------------------------------------
+    # ------------------------------------------------------
 
     def _infer_arch(self, params):
 
@@ -82,6 +99,7 @@ class Engine:
         blocks = 8
 
         try:
+
             p = params.get("params", params)
 
             if "input_proj" in p:
@@ -97,7 +115,7 @@ class Engine:
 
         return channels, blocks
 
-    # -------------------------------------------------------------
+    # ------------------------------------------------------
 
     def load(self):
 
@@ -139,30 +157,30 @@ class Engine:
 
             self.params = params
 
-            # -------------------------------------------------
-            # JIT 编译 inference
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # JIT inference
+            # --------------------------------------------------
 
             self._infer = jax.jit(
                 lambda p, x: self.net.apply({"params": p}, x, train=False)
             )
 
-            # -------------------------------------------------
-            # JIT recurrent fn
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # recurrent_fn
+            # --------------------------------------------------
 
             def recurrent_fn(params, rng_key, action, state):
 
-                prev_p = state.current_player
+                prev_player = state.current_player
 
-                ns = self.env.step(state, action)
+                next_state = self.env.step(state, action)
 
-                obs = self.env.observe(ns)[None]
+                obs = self.env.observe(next_state)[None]
 
                 logits, value, _ = self._infer(params, obs)
 
                 logits = jnp.where(
-                    ns.current_player[:, None] == 0,
+                    next_state.current_player[:, None] == 0,
                     logits,
                     logits[:, _ROTATED_IDX],
                 )
@@ -170,29 +188,30 @@ class Engine:
                 logits = logits - jnp.max(logits, axis=-1, keepdims=True)
 
                 logits = jnp.where(
-                    ns.legal_action_mask,
+                    next_state.legal_action_mask,
                     logits,
                     jnp.finfo(logits.dtype).min,
                 )
 
                 return (
                     mctx.RecurrentFnOutput(
-                        reward=ns.rewards[jnp.arange(ns.rewards.shape[0]), prev_p],
-                        discount=jnp.where(ns.terminated, 0.0, -1.0),
+                        reward=next_state.rewards[
+                            jnp.arange(next_state.rewards.shape[0]), prev_player
+                        ],
+                        discount=jnp.where(next_state.terminated, 0.0, -1.0),
                         prior_logits=logits,
                         value=value,
                     ),
-                    ns,
+                    next_state,
                 )
 
             self._recurrent_fn = jax.jit(recurrent_fn)
 
-            # -------------------------------------------------
-            # warmup
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # warmup（触发编译）
+            # --------------------------------------------------
 
             dummy = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9))
-
             self._infer(self.params, dummy)
 
             logger.warning("模型加载完成 step=%s", step)
@@ -205,9 +224,12 @@ class Engine:
 
             return False
 
-    # -------------------------------------------------------------
+    # ------------------------------------------------------
 
     def get_best_move(self, state, simulations, top_k):
+
+        if self._infer is None:
+            raise RuntimeError("engine not loaded")
 
         legal_mask = state.legal_action_mask
 
@@ -272,9 +294,10 @@ class Engine:
         return move, val
 
 
-# ======================================================================
+# ==========================================================
 # FEN
-# ======================================================================
+# ==========================================================
+
 
 def build_state(env, fen, moves):
 
@@ -299,9 +322,10 @@ def build_state(env, fen, moves):
     return state
 
 
-# ======================================================================
+# ==========================================================
 # UCI LOOP
-# ======================================================================
+# ==========================================================
+
 
 def run_uci(engine, simulations, top_k):
 
@@ -323,7 +347,6 @@ def run_uci(engine, simulations, top_k):
 
             send("id name ZeroForge")
             send("id author ZeroForge")
-
             send("uciok")
 
         elif cmd == "isready":
@@ -342,37 +365,37 @@ def run_uci(engine, simulations, top_k):
 
                 if "moves" in parts:
                     i = parts.index("moves")
-                    moves = parts[i + 1:]
+                    moves = parts[i + 1 :]
 
             elif parts[1] == "fen":
 
                 i = parts.index("fen") + 1
-
-                fen = " ".join(parts[i:i + 2])
+                fen = " ".join(parts[i : i + 2])
 
                 if "moves" in parts:
                     j = parts.index("moves")
-                    moves = parts[j + 1:]
+                    moves = parts[j + 1 :]
 
             state = build_state(engine.env, fen, moves)
 
         elif cmd == "go":
 
+            if engine.params is None:
+                if not engine.load():
+                    send("info string model load failed")
+                    send("bestmove 0000")
+                    continue
+
             if state is None:
                 state = build_state(engine.env, STARTING_FEN, [])
 
-            move, val = engine.get_best_move(
-                state,
-                simulations,
-                top_k,
-            )
+            move, val = engine.get_best_move(state, simulations, top_k)
 
             if move:
 
                 cp = int(val * 1000)
 
                 send(f"info score cp {cp} pv {move}")
-
                 send(f"bestmove {move}")
 
             else:
@@ -384,20 +407,19 @@ def run_uci(engine, simulations, top_k):
             break
 
 
-# ======================================================================
+# ==========================================================
 # MAIN
-# ======================================================================
+# ==========================================================
+
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--ckpt", default="checkpoints")
-
     parser.add_argument("--step", type=int, default=0)
 
     parser.add_argument("--simulations", type=int, default=DEFAULT_NUM_SIMULATIONS)
-
     parser.add_argument("--topk", type=int, default=DEFAULT_TOP_K)
 
     parser.add_argument("--cpu", action="store_true")
