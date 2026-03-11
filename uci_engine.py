@@ -354,6 +354,7 @@ def build_state(env, fen, moves):
 def run_uci(engine, simulations, top_k):
 
     state = None
+    opts = {"simulations": simulations, "top_k": top_k}
     logger.info("UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s", simulations, top_k, _LOG_FILE)
 
     def send(x):
@@ -370,7 +371,19 @@ def run_uci(engine, simulations, top_k):
             if cmd == "uci":
                 send("id name ZeroForge")
                 send("id author ZeroForge")
+                send("option name Simulations type spin default 256 min 1 max 4096")
+                send("option name TopK type spin default 32 min 1 max 128")
                 send("uciok")
+
+            elif cmd == "setoption":
+                if "name" in parts and "value" in parts:
+                    ni, vi = parts.index("name"), parts.index("value")
+                    name = parts[ni + 1] if ni + 1 < len(parts) else ""
+                    val = parts[vi + 1] if vi + 1 < len(parts) else ""
+                    if name == "Simulations" and val.isdigit():
+                        opts["simulations"] = max(1, min(4096, int(val)))
+                    elif name == "TopK" and val.isdigit():
+                        opts["top_k"] = max(1, min(128, int(val)))
 
             elif cmd == "isready":
                 if engine.params is None:
@@ -408,14 +421,15 @@ def run_uci(engine, simulations, top_k):
                         continue
                 if state is None:
                     state = build_state(engine.env, STARTING_FEN, [])
+                sims, tk = opts["simulations"], opts["top_k"]
                 t0 = time.perf_counter()
-                move, val = engine.get_best_move(state, simulations, top_k)
+                move, val = engine.get_best_move(state, sims, tk)
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 if move:
                     cp = int(val * 1000)
                     send(
                         f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
-                        f"nodes {simulations} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
+                        f"nodes {sims} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
                     )
                     send(f"bestmove {move}")
                 else:
