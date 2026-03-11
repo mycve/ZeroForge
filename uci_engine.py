@@ -375,8 +375,9 @@ def run_uci(engine, simulations, top_k):
             if cmd == "uci":
                 send("id name ZeroForge")
                 send("id author ZeroForge")
-                send("option name Simulations type spin default 256 min 1 max 4096")
-                send("option name TopK type spin default 32 min 1 max 128")
+                send("") # 换行间隔开option
+                send("option name Simulations type spin default 256 min 16 max 4096")
+                send("option name TopK type spin default 32 min 4 max 64")
                 send("uciok")
 
             elif cmd == "setoption":
