@@ -35,6 +35,17 @@ from xiangqi.actions import (
     ACTION_SPACE_SIZE, rotate_action
 )
 from networks.alphazero import AlphaZeroNetwork
+import os
+import threading
+from typing import Optional, Tuple
+
+
+# ==============================
+# JAX 编译缓存
+# ==============================
+
+os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", "./jax_cache")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 # ============================================================================
 # 常量
@@ -399,43 +410,70 @@ def get_legal_moves_list(jax_state: XiangqiState) -> List[dict]:
 # JIT 推理函数（只创建一次）
 # ------------------------------------------------
 
-infer_fn = None
 
+# ==============================
+# 全局变量
+# ==============================
+
+
+infer_fn = None
+mcts_recurrent_fn = None
+
+ai_lock = threading.Lock()
+
+
+# ==============================
+# JIT 推理函数
+# ==============================
 
 def get_infer_fn():
     global infer_fn
+
     if infer_fn is None:
-        infer_fn = jax.jit(
-            lambda p, x: model_mgr.net.apply({'params': p}, x, train=False)
-        )
+
+        @jax.jit
+        def infer(params, obs):
+            return model_mgr.net.apply({'params': params}, obs, train=False)
+
+        infer_fn = infer
+
     return infer_fn
 
 
-# ------------------------------------------------
+# ==============================
 # MCTS recurrent_fn
-# ------------------------------------------------
+# ==============================
 
 def create_mcts_recurrent_fn():
+
     infer = get_infer_fn()
 
+    @jax.jit
     def recurrent_fn(params, rng_key, action, state):
 
         prev_p = state.current_player
 
+        # step
         ns = jax.vmap(env.step)(state, action)
+
+        # observe
         obs = jax.vmap(env.observe)(ns)
 
         logits, value, _ = infer(params, obs)
 
-        logits = jnp.where(ns.current_player[:, None] == 0,
-                           logits,
-                           logits[:, _ROTATED_IDX])
+        logits = jnp.where(
+            ns.current_player[:, None] == 0,
+            logits,
+            logits[:, _ROTATED_IDX],
+        )
 
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
 
-        logits = jnp.where(ns.legal_action_mask,
-                           logits,
-                           jnp.finfo(logits.dtype).min)
+        logits = jnp.where(
+            ns.legal_action_mask,
+            logits,
+            jnp.finfo(logits.dtype).min,
+        )
 
         return (
             mctx.RecurrentFnOutput(
@@ -446,199 +484,225 @@ def create_mcts_recurrent_fn():
                 prior_logits=logits,
                 value=value,
             ),
-            ns
+            ns,
         )
 
-    # JIT 编译
-    return jax.jit(recurrent_fn)
+    return recurrent_fn
 
 
-mcts_recurrent_fn = None
+# ==============================
+# 模型 warmup
+# ==============================
+
+def warmup_model():
+
+    if model_mgr.params is None:
+        return
+
+    infer = get_infer_fn()
+
+    dummy = jnp.zeros(
+        (
+            1,
+            NUM_OBSERVATION_CHANNELS,
+            BOARD_HEIGHT,
+            BOARD_WIDTH,
+        ),
+        dtype=jnp.float32,
+    )
+
+    infer(model_mgr.params, dummy)
 
 
-# ------------------------------------------------
+# ==============================
 # AI 搜索
-# ------------------------------------------------
+# ==============================
 
 def get_ai_action(
     state: GameState,
     num_simulations: int = 256,
     top_k: int = 32,
     return_policy: bool = False,
-):
+) -> Tuple[Optional[int], float, Optional[dict]]:
 
     global rng_key, mcts_recurrent_fn
 
     if model_mgr.params is None:
         return None, 0.0, None
 
-    infer = get_infer_fn()
+    with ai_lock:
 
-    # ------------------------------------------------
-    # 获取合法动作
-    # ------------------------------------------------
+        infer = get_infer_fn()
 
-    legal_mask = state.jax_state.legal_action_mask
-    legal_actions = np.where(np.array(legal_mask))[0]
+        # ---------------------------
+        # 合法动作
+        # ---------------------------
 
-    # 只有一个合法走法
-    if len(legal_actions) == 1:
+        legal_mask = state.jax_state.legal_action_mask
+        legal_actions = np.where(np.asarray(legal_mask))[0]
 
-        action = int(legal_actions[0])
+        # 只有一个走法
+        if len(legal_actions) == 1:
 
-        print(f"[AI] 只有一个合法走法: {action}")
+            action = int(legal_actions[0])
+
+            obs = env.observe(state.jax_state)[None, ...]
+
+            _, value, _ = infer(model_mgr.params, obs)
+
+            search_value = float(value[0])
+
+            if state.current_player == 1:
+                search_value = -search_value
+
+            policy_info = None
+
+            if return_policy:
+
+                fs, ts = action_to_move(action)
+
+                fr, fc = fs // 9, fs % 9
+                tr, tc = ts // 9, ts % 9
+
+                policy_info = {
+                    "top_moves": [
+                        {
+                            "action": action,
+                            "uci": move_to_uci(fs, ts),
+                            "weight": 1.0,
+                            "prior": 1.0,
+                            "from": [fr, fc],
+                            "to": [tr, tc],
+                        }
+                    ],
+                    "is_forced": True,
+                }
+
+            return action, search_value, policy_info
+
+        # ---------------------------
+        # 创建 recurrent_fn
+        # ---------------------------
+
+        if mcts_recurrent_fn is None:
+            mcts_recurrent_fn = create_mcts_recurrent_fn()
+
+        # ---------------------------
+        # root inference
+        # ---------------------------
 
         obs = env.observe(state.jax_state)[None, ...]
-        _, value, _ = infer(model_mgr.params, obs)
 
-        search_value = float(value[0])
+        logits, value, _ = infer(model_mgr.params, obs)
+
+        if state.current_player == 1:
+            logits = logits[:, _ROTATED_IDX]
+
+        logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+
+        logits = jnp.where(
+            state.jax_state.legal_action_mask,
+            logits,
+            jnp.finfo(logits.dtype).min,
+        )
+
+        invalid_mask = ~state.jax_state.legal_action_mask
+
+        prior_probs = jax.nn.softmax(logits[0])
+
+        # ---------------------------
+        # MCTS root
+        # ---------------------------
+
+        rng_key, sk1 = jax.random.split(rng_key)
+
+        root = mctx.RootFnOutput(
+            prior_logits=logits,
+            value=value,
+            embedding=jax.tree_util.tree_map(
+                lambda x: x[None], state.jax_state
+            ),
+        )
+
+        top_k = min(top_k, len(legal_actions))
+
+        # ---------------------------
+        # MCTS search
+        # ---------------------------
+
+        policy_output = mctx.gumbel_muzero_policy(
+            params=model_mgr.params,
+            rng_key=sk1,
+            root=root,
+            recurrent_fn=mcts_recurrent_fn,
+            num_simulations=num_simulations,
+            max_num_considered_actions=top_k,
+            invalid_actions=invalid_mask[None, ...],
+            qtransform=MCTS_QTRANSFORM,
+            gumbel_scale=MCTS_GUMBEL_SCALE,
+        )
+
+        # ---------------------------
+        # 解析结果
+        # ---------------------------
+
+        search_value = float(
+            policy_output.search_tree.node_values[0, 0]
+        )
 
         if state.current_player == 1:
             search_value = -search_value
+
+        summary = policy_output.search_tree.summary()
+
+        visit_counts = np.array(summary.visit_counts[0])
+        improved_policy = np.array(
+            policy_output.action_weights[0]
+        )
+
+        action = int(np.argmax(improved_policy))
+
+        # ---------------------------
+        # policy info
+        # ---------------------------
 
         policy_info = None
 
         if return_policy:
 
-            fs, ts = action_to_move(action)
+            top_indices = np.argsort(improved_policy)[::-1][:top_k]
 
-            fr, fc = fs // 9, fs % 9
-            tr, tc = ts // 9, ts % 9
+            top_moves = []
+
+            for idx in top_indices:
+
+                if improved_policy[idx] <= 1e-6:
+                    continue
+
+                fs, ts = action_to_move(int(idx))
+
+                fr, fc = fs // 9, fs % 9
+                tr, tc = ts // 9, ts % 9
+
+                top_moves.append(
+                    {
+                        "action": int(idx),
+                        "uci": move_to_uci(fs, ts),
+                        "weight": float(improved_policy[idx]),
+                        "visits": int(visit_counts[idx]),
+                        "prior": float(prior_probs[idx]),
+                        "from": [fr, fc],
+                        "to": [tr, tc],
+                    }
+                )
 
             policy_info = {
-                "top_moves": [{
-                    "action": action,
-                    "uci": move_to_uci(fs, ts),
-                    "weight": 1.0,
-                    "prior": 1.0,
-                    "from": [fr, fc],
-                    "to": [tr, tc],
-                }],
-                "is_forced": True,
+                "top_moves": top_moves,
+                "top_k": top_k,
+                "is_forced": False,
             }
 
         return action, search_value, policy_info
-
-    # ------------------------------------------------
-    # 创建 MCTS recurrent_fn
-    # ------------------------------------------------
-
-    if mcts_recurrent_fn is None:
-        mcts_recurrent_fn = create_mcts_recurrent_fn()
-
-    # ------------------------------------------------
-    # Root inference
-    # ------------------------------------------------
-
-    obs = env.observe(state.jax_state)[None, ...]
-
-    logits, value, _ = infer(model_mgr.params, obs)
-
-    if state.current_player == 1:
-        logits = logits[:, _ROTATED_IDX]
-
-    logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-
-    logits = jnp.where(
-        state.jax_state.legal_action_mask,
-        logits,
-        jnp.finfo(logits.dtype).min
-    )
-
-    invalid_mask = ~state.jax_state.legal_action_mask
-
-    prior_probs = jax.nn.softmax(logits[0])
-
-    # ------------------------------------------------
-    # MCTS root
-    # ------------------------------------------------
-
-    rng_key, sk1 = jax.random.split(rng_key)
-
-    root = mctx.RootFnOutput(
-        prior_logits=logits,
-        value=value,
-        embedding=jax.tree_util.tree_map(
-            lambda x: x[None], state.jax_state
-        )
-    )
-
-    # 限制 top_k
-    top_k = min(top_k, len(legal_actions))
-
-    # ------------------------------------------------
-    # MCTS search
-    # ------------------------------------------------
-
-    policy_output = mctx.gumbel_muzero_policy(
-        params=model_mgr.params,
-        rng_key=sk1,
-        root=root,
-        recurrent_fn=mcts_recurrent_fn,
-        num_simulations=num_simulations,
-        max_num_considered_actions=top_k,
-        invalid_actions=invalid_mask[None, ...],
-        qtransform=MCTS_QTRANSFORM,
-        gumbel_scale=MCTS_GUMBEL_SCALE,
-    )
-
-    # ------------------------------------------------
-    # 结果解析
-    # ------------------------------------------------
-
-    search_value = float(policy_output.search_tree.node_values[0, 0])
-
-    if state.current_player == 1:
-        search_value = -search_value
-
-    summary = policy_output.search_tree.summary()
-
-    visit_probs = np.array(summary.visit_probs[0])
-    visit_counts = np.array(summary.visit_counts[0])
-
-    improved_policy = np.array(policy_output.action_weights[0])
-
-    action = int(np.argmax(improved_policy))
-
-    # ------------------------------------------------
-    # 构建策略信息
-    # ------------------------------------------------
-
-    policy_info = None
-
-    if return_policy:
-
-        top_indices = np.argsort(improved_policy)[::-1][:top_k]
-
-        top_moves = []
-
-        for idx in top_indices:
-
-            if improved_policy[idx] <= 1e-6:
-                continue
-
-            fs, ts = action_to_move(int(idx))
-
-            fr, fc = fs // 9, fs % 9
-            tr, tc = ts // 9, ts % 9
-
-            top_moves.append({
-                "action": int(idx),
-                "uci": move_to_uci(fs, ts),
-                "weight": float(improved_policy[idx]),
-                "visits": int(visit_counts[idx]),
-                "prior": float(prior_probs[idx]),
-                "from": [fr, fc],
-                "to": [tr, tc],
-            })
-
-        policy_info = {
-            "top_moves": top_moves,
-            "top_k": top_k,
-            "is_forced": False,
-        }
-
-    return action, search_value, policy_info
 # ============================================================================
 # API 模型
 # ============================================================================
