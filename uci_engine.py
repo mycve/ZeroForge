@@ -86,8 +86,6 @@ MCTS_QTRANSFORM = partial(
 
 DEFAULT_NUM_SIMULATIONS = 512
 DEFAULT_TOP_K = 32
-DEFAULT_THREADS = 1
-DEFAULT_HASH_MB = 16
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -131,6 +129,41 @@ class Engine:
         self._load_done = threading.Event()
         self._load_thread = None
         self._load_error = ""
+
+    # ------------------------------------------------------
+
+    def reset_runtime(self):
+
+        with self._load_lock:
+            self.params = None
+            self.net = None
+            self._infer = None
+            self._recurrent_fn = None
+            self._load_error = ""
+            self._load_done.clear()
+            self._load_thread = None
+
+    # ------------------------------------------------------
+
+    def configure(self, ckpt_dir=None, step=None):
+
+        changed = False
+
+        if ckpt_dir is not None:
+            new_ckpt_dir = os.path.abspath(ckpt_dir)
+            if new_ckpt_dir != self.ckpt_dir:
+                self.ckpt_dir = new_ckpt_dir
+                changed = True
+
+        if step is not None and step != self.step:
+            self.step = step
+            changed = True
+
+        if changed:
+            logger.info("更新加载配置 ckpt_dir=%s step=%s", self.ckpt_dir, self.step)
+            self.reset_runtime()
+
+        return changed
 
     # ------------------------------------------------------
 
@@ -444,13 +477,12 @@ def run_uci(engine, simulations, top_k):
 
     state = None
     opts = {
+        "checkpoint_dir": engine.ckpt_dir,
+        "step": engine.step,
         "simulations": simulations,
         "top_k": top_k,
-        "threads": DEFAULT_THREADS,
-        "hash": DEFAULT_HASH_MB,
     }
     logger.info("UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s", simulations, top_k, _LOG_FILE)
-    engine.start_background_load()
 
     def send(x):
         print(x, flush=True)
@@ -467,42 +499,37 @@ def run_uci(engine, simulations, top_k):
             cmd = parts[0]
 
             if cmd == "uci":
-                engine.start_background_load()
                 send("id name ZeroForge")
                 send("id author ZeroForge")
+                send(f"option name CheckpointDir type string default {opts['checkpoint_dir']}")
+                send(f"option name Step type spin default {opts['step']} min 0 max 100000000")
                 send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
                 send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
-                send(f"option name Threads type spin default {opts['threads']} min 1 max 1")
-                send(f"option name Hash type spin default {opts['hash']} min 1 max 1024")
-                send("option name Clear Hash type button")
                 send("uciok")
 
             elif cmd == "setoption":
                 name, val = parse_setoption(parts)
-                if name == "Simulations" and val and val.isdigit():
+                if name == "CheckpointDir" and val:
+                    opts["checkpoint_dir"] = os.path.abspath(val)
+                    engine.configure(ckpt_dir=opts["checkpoint_dir"])
+                elif name == "Step" and val and val.isdigit():
+                    opts["step"] = max(0, int(val))
+                    engine.configure(step=opts["step"])
+                elif name == "Simulations" and val and val.isdigit():
                     opts["simulations"] = max(16, min(4096, int(val)))
                 elif name == "TopK" and val and val.isdigit():
                     opts["top_k"] = max(4, min(64, int(val)))
-                elif name == "Threads" and val and val.isdigit():
-                    requested = int(val)
-                    opts["threads"] = 1
-                    logger.info("设置选项 Threads=%s -> 当前实现固定单线程", requested)
-                elif name == "Hash" and val and val.isdigit():
-                    opts["hash"] = max(1, min(1024, int(val)))
-                    logger.info("设置选项 Hash=%sMB -> 当前实现无置换表，仅记录该值", opts["hash"])
-                elif name == "Clear Hash":
-                    logger.info("收到 Clear Hash -> 当前实现无置换表，忽略")
                 elif name:
                     logger.info("收到未实现选项 %s=%s，忽略", name, val)
-                if name in {"Simulations", "TopK"}:
+                if name in {"CheckpointDir", "Step", "Simulations", "TopK"}:
                     logger.info(
-                        "设置选项 %s=%s -> simulations=%s top_k=%s threads=%s hash=%s",
+                        "设置选项 %s=%s -> ckpt_dir=%s step=%s simulations=%s top_k=%s",
                         name,
                         val,
+                        opts["checkpoint_dir"],
+                        opts["step"],
                         opts["simulations"],
                         opts["top_k"],
-                        opts["threads"],
-                        opts["hash"],
                     )
 
             elif cmd == "isready":
