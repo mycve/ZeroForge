@@ -470,6 +470,7 @@ def run_uci(engine, simulations, top_k):
                 engine.start_background_load()
                 send("id name ZeroForge")
                 send("id author ZeroForge")
+                send("")
                 send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
                 send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
                 send(f"option name Threads type spin default {opts['threads']} min 1 max 1")
