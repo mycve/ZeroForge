@@ -27,6 +27,9 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 if "--cpu" in sys.argv:
     os.environ["JAX_PLATFORMS"] = "cpu"
 
+# 抑制 JAX/第三方库启动日志，避免污染 UCI 输出、影响 GUI 解析
+os.environ["JAX_LOGGING_LEVEL"] = "ERROR"
+
 # ==========================================================
 
 import jax
@@ -46,6 +49,11 @@ from xiangqi.actions import (
 from xiangqi.fen import parse_fen
 from networks.alphazero import AlphaZeroNetwork
 
+# 抑制第三方库日志，UCI 协议要求 stdout 仅输出协议行
+for _name in ("jax", "jax._src", "orbax", "mctx", "absl"):
+    _lg = logging.getLogger(_name)
+    _lg.setLevel(logging.ERROR)
+
 # ==========================================================
 # 常量
 # ==========================================================
@@ -62,13 +70,14 @@ MCTS_QTRANSFORM = partial(
 DEFAULT_NUM_SIMULATIONS = 64
 DEFAULT_TOP_K = 16
 
+# UCI 模式：仅 ERROR 输出到 stderr，避免无关日志干扰 GUI
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.ERROR,
     format="%(message)s",
     stream=sys.stderr,
 )
-
 logger = logging.getLogger("zeroforge_uci")
+logger.setLevel(logging.ERROR)
 
 # ==========================================================
 # Engine
@@ -214,7 +223,7 @@ class Engine:
             dummy = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9))
             self._infer(self.params, dummy)
 
-            logger.warning("模型加载完成 step=%s", step)
+            logger.debug("模型加载完成 step=%s", step)
 
             return True
 
