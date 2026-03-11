@@ -198,7 +198,7 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
-
+uci.bat
 # PyPI configuration file
 .pypirc
 
