@@ -30,6 +30,9 @@ if "--cpu" in sys.argv:
 
 # 抑制 JAX/第三方库启动日志，避免污染 UCI 输出、影响 GUI 解析
 os.environ["JAX_LOGGING_LEVEL"] = "ERROR"
+# 抑制 XLA C++ 层 glog 输出（如 cpu_aot_loader E0311 的 prefer-no-scatter 等）
+os.environ.setdefault("GLOG_minloglevel", "3")  # 3=FATAL only，屏蔽 INFO/WARNING/ERROR
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 # ==========================================================
 
