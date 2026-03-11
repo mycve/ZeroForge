@@ -74,25 +74,51 @@ class UCIEngine:
         self.path = path
         self.process = None
         self.output_queue = queue.Queue()
+        self.stderr_queue = queue.Queue()
         self._stop_event = threading.Event()
         self.lock = threading.Lock()
         self.ready = False
+
+    def _clear_queue(self, q: queue.Queue):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _drain_queue(self, q: queue.Queue, limit: int = 50) -> List[str]:
+        items: List[str] = []
+        while len(items) < limit:
+            try:
+                items.append(q.get_nowait())
+            except queue.Empty:
+                break
+        return items
 
     def start(self) -> bool:
         """启动引擎"""
         if self.process and self.process.poll() is None:
             return True  # 已经在运行
         try:
+            self.ready = False
+            self._clear_queue(self.output_queue)
+            self._clear_queue(self.stderr_queue)
             self.process = subprocess.Popen(
                 [self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, bufsize=1
             )
             self._stop_event.clear()
             threading.Thread(target=self._read_stdout, daemon=True).start()
+            threading.Thread(target=self._read_stderr, daemon=True).start()
             self.send("uci")
             # 等待 uciok
             start = time.time()
             while time.time() - start < 5:
+                if self.process.poll() is not None:
+                    print(f"[UCI] 启动失败，进程已退出: {self.process.returncode}")
+                    for line in self._drain_queue(self.stderr_queue, limit=20):
+                        print(f"[UCI][stderr] {line}")
+                    return False
                 try:
                     line = self.output_queue.get(timeout=0.1)
                     if "uciok" in line:
@@ -102,6 +128,9 @@ class UCIEngine:
                 except queue.Empty:
                     continue
             print(f"[UCI] 引擎启动超时")
+            for line in self._drain_queue(self.stderr_queue, limit=20):
+                print(f"[UCI][stderr] {line}")
+            self.stop()
             return False
         except Exception as e:
             print(f"[UCI] 启动失败: {e}")
@@ -113,10 +142,20 @@ class UCIEngine:
             if line:
                 self.output_queue.put(line.strip())
 
+    def _read_stderr(self):
+        while not self._stop_event.is_set() and self.process and self.process.poll() is None:
+            line = self.process.stderr.readline()
+            if line:
+                self.stderr_queue.put(line.strip())
+
     def send(self, cmd: str):
         if self.process and self.process.stdin:
-            self.process.stdin.write(f"{cmd}\n")
-            self.process.stdin.flush()
+            try:
+                self.process.stdin.write(f"{cmd}\n")
+                self.process.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                self.ready = False
+                print(f"[UCI] 发送命令失败 {cmd!r}: {e}")
 
     def restart(self) -> bool:
         """重启引擎进程，彻底清空 hash 等状态"""
@@ -132,12 +171,14 @@ class UCIEngine:
         wait_seconds = min(120, depth * 8)  # 深度越大等待越久，最多 120 秒
         
         with self.lock:
+            if not self.process or self.process.poll() is not None:
+                self.ready = False
+                if not self.start():
+                    return None, None
+
             # 清空队列
-            while not self.output_queue.empty():
-                try:
-                    self.output_queue.get_nowait()
-                except queue.Empty:
-                    break
+            self._clear_queue(self.output_queue)
+            self._clear_queue(self.stderr_queue)
             
             self.send(f"position fen {fen}")
             self.send(go_cmd)
@@ -146,6 +187,12 @@ class UCIEngine:
             last_score = None
             
             while time.time() - start_time < wait_seconds:
+                if not self.process or self.process.poll() is not None:
+                    self.ready = False
+                    print("[UCI] 搜索过程中引擎进程退出")
+                    for line in self._drain_queue(self.stderr_queue, limit=20):
+                        print(f"[UCI][stderr] {line}")
+                    return None, None
                 try:
                     line = self.output_queue.get(timeout=0.1)
                     if "score cp" in line:
@@ -168,12 +215,29 @@ class UCIEngine:
                         return line.split()[1], last_score
                 except queue.Empty:
                     continue
+            print(f"[UCI] 搜索超时 depth={depth} fen={fen}")
+            self.send("stop")
+            for line in self._drain_queue(self.stderr_queue, limit=20):
+                print(f"[UCI][stderr] {line}")
             return None, None
 
     def stop(self):
         self._stop_event.set()
         if self.process:
-            self.process.terminate()
+            self.ready = False
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+            except OSError:
+                pass
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+            self.process = None
 
 
 # 全局 UCI 引擎实例

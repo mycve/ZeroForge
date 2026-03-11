@@ -71,7 +71,7 @@ MCTS_QTRANSFORM = partial(
     value_scale=0.1,
 )
 
-DEFAULT_NUM_SIMULATIONS = 256
+DEFAULT_NUM_SIMULATIONS = 512
 DEFAULT_TOP_K = 32
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
@@ -80,6 +80,7 @@ _LOG_FILE = os.path.join(_LOG_DIR, "zeroforge_uci.log")
 logger = logging.getLogger("zeroforge_uci")
 logger.setLevel(logging.DEBUG)
 logger.handlers.clear()
+logger.propagate = False
 try:
     _fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
     _fh.setLevel(logging.DEBUG)
@@ -363,6 +364,9 @@ def run_uci(engine, simulations, top_k):
     for line in sys.stdin:
         cmd = ""
         try:
+            raw_line = line.strip()
+            if raw_line:
+                logger.debug("收到命令: %s", raw_line)
             parts = line.strip().split()
             if not parts:
                 continue
@@ -384,9 +388,11 @@ def run_uci(engine, simulations, top_k):
                         opts["simulations"] = max(1, min(4096, int(val)))
                     elif name == "TopK" and val.isdigit():
                         opts["top_k"] = max(1, min(128, int(val)))
+                    logger.info("设置选项 %s=%s -> simulations=%s top_k=%s", name, val, opts["simulations"], opts["top_k"])
 
             elif cmd == "isready":
                 if engine.params is None:
+                    logger.info("收到 isready，开始加载模型")
                     engine.load()
                 send("readyok")
 
@@ -409,11 +415,19 @@ def run_uci(engine, simulations, top_k):
                         moves = parts[j + 1 :]
                 try:
                     state = build_state(engine.env, fen, moves)
+                    logger.info("局面更新 fen=%s moves=%s", fen, len(moves))
                 except (ValueError, KeyError) as e:
                     logger.error("build_state 失败: %s", e)
                     state = build_state(engine.env, STARTING_FEN, [])
 
             elif cmd == "go":
+                depth = None
+                if "depth" in parts:
+                    try:
+                        depth_idx = parts.index("depth")
+                        depth = int(parts[depth_idx + 1])
+                    except (ValueError, IndexError):
+                        depth = None
                 if engine.params is None:
                     if not engine.load():
                         send("info string model load failed")
@@ -422,24 +436,35 @@ def run_uci(engine, simulations, top_k):
                 if state is None:
                     state = build_state(engine.env, STARTING_FEN, [])
                 sims, tk = opts["simulations"], opts["top_k"]
+                logger.info("开始搜索 depth=%s simulations=%s top_k=%s", depth, sims, tk)
                 t0 = time.perf_counter()
                 move, val = engine.get_best_move(state, sims, tk)
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 if move:
                     cp = int(val * 1000)
+                    logger.info("搜索完成 move=%s value=%.4f elapsed_ms=%s", move, val, elapsed_ms)
                     send(
                         f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
                         f"nodes {sims} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
                     )
                     send(f"bestmove {move}")
                 else:
+                    logger.warning("搜索无合法着法 elapsed_ms=%s", elapsed_ms)
                     send("bestmove 0000")
 
+            elif cmd == "ucinewgame":
+                state = None
+                logger.info("收到 ucinewgame，已重置内部局面")
+
+            elif cmd == "stop":
+                logger.info("收到 stop，但当前搜索为同步阻塞式，忽略")
+
             elif cmd == "quit":
+                logger.info("收到 quit，退出 UCI 循环")
                 break
 
         except Exception as e:
-            logger.error("UCI 命令处理异常: %s", e)
+            logger.exception("UCI 命令处理异常 cmd=%s: %s", cmd, e)
             if cmd == "go":
                 try:
                     send("info string error")
