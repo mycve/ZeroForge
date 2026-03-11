@@ -74,14 +74,23 @@ MCTS_QTRANSFORM = partial(
 DEFAULT_NUM_SIMULATIONS = 256
 DEFAULT_TOP_K = 32
 
-# UCI 模式：仅 ERROR 输出到 stderr，避免无关日志干扰 GUI
-logging.basicConfig(
-    level=logging.ERROR,
-    format="%(message)s",
-    stream=sys.stderr,
-)
+# 日志写入磁盘，走法等信息由 send() 输出到 stdout
+_LOG_DIR = os.path.expanduser("~/.cache/zeroforge_jax")
+_LOG_FILE = os.path.join(_LOG_DIR, "zeroforge_uci.log")
 logger = logging.getLogger("zeroforge_uci")
-logger.setLevel(logging.ERROR)
+logger.setLevel(logging.DEBUG)
+logger.handlers.clear()
+try:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    _fh = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_fh)
+except OSError as e:
+    _fh = logging.StreamHandler(sys.stderr)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_fh)
+    logger.warning("无法创建日志文件 %s，改用 stderr: %s", _LOG_FILE, e)
 
 # ==========================================================
 # Engine
@@ -227,7 +236,7 @@ class Engine:
             dummy = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9))
             self._infer(self.params, dummy)
 
-            logger.debug("模型加载完成 step=%s", step)
+            logger.info("模型加载完成 step=%s", step)
 
             return True
 
@@ -346,6 +355,7 @@ def build_state(env, fen, moves):
 def run_uci(engine, simulations, top_k):
 
     state = None
+    logger.info("UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s", simulations, top_k, _LOG_FILE)
 
     def send(x):
         print(x, flush=True)
