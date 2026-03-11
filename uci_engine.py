@@ -71,8 +71,8 @@ MCTS_QTRANSFORM = partial(
     value_scale=0.1,
 )
 
-DEFAULT_NUM_SIMULATIONS = 128
-DEFAULT_TOP_K = 16
+DEFAULT_NUM_SIMULATIONS = 256
+DEFAULT_TOP_K = 32
 
 # UCI 模式：仅 ERROR 输出到 stderr，避免无关日志干扰 GUI
 logging.basicConfig(
