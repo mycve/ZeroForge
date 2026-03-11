@@ -173,9 +173,9 @@ class Engine:
 
                 prev_player = state.current_player
 
-                next_state = self.env.step(state, action)
+                next_state = jax.vmap(self.env.step)(state, action)
 
-                obs = self.env.observe(next_state)[None]
+                obs = jax.vmap(self.env.observe)(next_state)
 
                 logits, value, _ = self._infer(params, obs)
 
