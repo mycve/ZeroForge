@@ -4,6 +4,7 @@ ZeroForge UCI 引擎（高性能 + JAX 编译缓存）
 """
 
 import os
+import random
 import sys
 import time
 import argparse
@@ -84,8 +85,10 @@ MCTS_QTRANSFORM = partial(
     value_scale=0.1,
 )
 
-DEFAULT_NUM_SIMULATIONS = 512
+DEFAULT_NUM_SIMULATIONS = 1024
 DEFAULT_TOP_K = 32
+OUTPUT_DELAY_MIN_SECS = 0.5
+OUTPUT_DELAY_MAX_SECS = 2.7
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -468,6 +471,12 @@ def parse_setoption(parts):
     return name, value
 
 
+def sleep_before_move_output():
+    delay = random.uniform(OUTPUT_DELAY_MIN_SECS, OUTPUT_DELAY_MAX_SECS)
+    logger.info("输出走法前延迟 %.3f 秒", delay)
+    time.sleep(delay)
+
+
 # ==========================================================
 # UCI LOOP
 # ==========================================================
@@ -573,6 +582,7 @@ def run_uci(engine, simulations, top_k):
                         depth = None
                 if not engine.wait_until_ready():
                     err = engine._load_error or "model load failed"
+                    sleep_before_move_output()
                     send(f"info string {err}")
                     send("bestmove 0000")
                     continue
@@ -586,6 +596,7 @@ def run_uci(engine, simulations, top_k):
                 if move:
                     cp = int(val * 1000)
                     logger.info("搜索完成 move=%s value=%.4f elapsed_ms=%s", move, val, elapsed_ms)
+                    sleep_before_move_output()
                     send(
                         f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
                         f"nodes {sims} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
@@ -593,6 +604,7 @@ def run_uci(engine, simulations, top_k):
                     send(f"bestmove {move}")
                 else:
                     logger.warning("搜索无合法着法 elapsed_ms=%s", elapsed_ms)
+                    sleep_before_move_output()
                     send("bestmove 0000")
 
             elif cmd == "ucinewgame":
@@ -610,6 +622,7 @@ def run_uci(engine, simulations, top_k):
             logger.exception("UCI 命令处理异常 cmd=%s: %s", cmd, e)
             if cmd == "go":
                 try:
+                    sleep_before_move_output()
                     send("info string error")
                     send("bestmove 0000")
                 except Exception:
