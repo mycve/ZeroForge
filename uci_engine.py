@@ -5,6 +5,7 @@ ZeroForge UCI 引擎（高性能 + JAX 编译缓存）
 
 import os
 import sys
+import time
 import argparse
 import logging
 from functools import partial
@@ -67,7 +68,7 @@ MCTS_QTRANSFORM = partial(
     value_scale=0.1,
 )
 
-DEFAULT_NUM_SIMULATIONS = 64
+DEFAULT_NUM_SIMULATIONS = 128
 DEFAULT_TOP_K = 16
 
 # UCI 模式：仅 ERROR 输出到 stderr，避免无关日志干扰 GUI
@@ -398,13 +399,18 @@ def run_uci(engine, simulations, top_k):
             if state is None:
                 state = build_state(engine.env, STARTING_FEN, [])
 
+            t0 = time.perf_counter()
             move, val = engine.get_best_move(state, simulations, top_k)
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
             if move:
 
                 cp = int(val * 1000)
-
-                send(f"info score cp {cp} pv {move}")
+                # 与 Pikafish 兼容的 info 格式，便于 GUI 解析 score cp
+                send(
+                    f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
+                    f"nodes {simulations} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
+                )
                 send(f"bestmove {move}")
 
             else:
