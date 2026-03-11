@@ -8,6 +8,7 @@ import sys
 import time
 import argparse
 import logging
+import threading
 from functools import partial
 
 # ==========================================================
@@ -112,6 +113,10 @@ class Engine:
         self._recurrent_fn = None
 
         self.rng = jax.random.PRNGKey(0)
+        self._load_lock = threading.Lock()
+        self._load_done = threading.Event()
+        self._load_thread = None
+        self._load_error = ""
 
     # ------------------------------------------------------
 
@@ -139,112 +144,169 @@ class Engine:
 
     # ------------------------------------------------------
 
-    def load(self):
+    def _build_runtime(self, params):
+
+        channels, blocks = self._infer_arch(params)
+
+        self.net = AlphaZeroNetwork(
+            action_space_size=ACTION_SPACE_SIZE,
+            channels=channels,
+            num_blocks=blocks,
+        )
+
+        self.params = params
+
+        self._infer = jax.jit(
+            lambda p, x: self.net.apply({"params": p}, x, train=False)
+        )
+
+        def recurrent_fn(params, rng_key, action, state):
+
+            prev_player = state.current_player
+
+            next_state = jax.vmap(self.env.step)(state, action)
+
+            obs = jax.vmap(self.env.observe)(next_state)
+
+            logits, value, _ = self._infer(params, obs)
+
+            logits = jnp.where(
+                next_state.current_player[:, None] == 0,
+                logits,
+                logits[:, _ROTATED_IDX],
+            )
+
+            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+
+            logits = jnp.where(
+                next_state.legal_action_mask,
+                logits,
+                jnp.finfo(logits.dtype).min,
+            )
+
+            return (
+                mctx.RecurrentFnOutput(
+                    reward=next_state.rewards[
+                        jnp.arange(next_state.rewards.shape[0]), prev_player
+                    ],
+                    discount=jnp.where(next_state.terminated, 0.0, -1.0),
+                    prior_logits=logits,
+                    value=value,
+                ),
+                next_state,
+            )
+
+        self._recurrent_fn = jax.jit(recurrent_fn)
+
+    # ------------------------------------------------------
+
+    def _warmup(self):
+
+        dummy = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9), dtype=jnp.float32)
+        self._infer(self.params, dummy)
+
+        state = self.env.init(jax.random.PRNGKey(0))
+        action = jnp.array([int(jnp.argmax(state.legal_action_mask))], dtype=jnp.int32)
+        batched_state = jax.tree_util.tree_map(lambda x: x[None], state)
+        self._recurrent_fn(self.params, jax.random.PRNGKey(1), action, batched_state)
+
+    # ------------------------------------------------------
+
+    def _load_impl(self):
+
+        ckpt_manager = ocp.CheckpointManager(self.ckpt_dir)
+
+        step = self.step or ckpt_manager.latest_step()
+
+        if step is None:
+            self._load_error = "未找到 checkpoint"
+            logger.error(self._load_error)
+            return False
 
         try:
-
-            ckpt_manager = ocp.CheckpointManager(self.ckpt_dir)
-
-            step = self.step or ckpt_manager.latest_step()
-
-            if step is None:
-                logger.error("未找到 checkpoint")
-                return False
-
-            try:
-                restored = ckpt_manager.restore(step)
-            except Exception:
-                restored = ocp.StandardCheckpointer().restore(
-                    os.path.join(self.ckpt_dir, str(step))
-                )
-
-            params = None
-
-            if isinstance(restored, dict):
-                params = restored.get("params") or (
-                    restored.get("default") or {}
-                ).get("params")
-
-            if params is None:
-                logger.error("checkpoint 无 params")
-                return False
-
-            channels, blocks = self._infer_arch(params)
-
-            self.net = AlphaZeroNetwork(
-                action_space_size=ACTION_SPACE_SIZE,
-                channels=channels,
-                num_blocks=blocks,
+            restored = ckpt_manager.restore(step)
+        except Exception:
+            restored = ocp.StandardCheckpointer().restore(
+                os.path.join(self.ckpt_dir, str(step))
             )
 
-            self.params = params
+        params = None
 
-            # --------------------------------------------------
-            # JIT inference
-            # --------------------------------------------------
+        if isinstance(restored, dict):
+            params = restored.get("params") or (
+                restored.get("default") or {}
+            ).get("params")
 
-            self._infer = jax.jit(
-                lambda p, x: self.net.apply({"params": p}, x, train=False)
+        if params is None:
+            self._load_error = "checkpoint 无 params"
+            logger.error(self._load_error)
+            return False
+
+        self._build_runtime(params)
+        self._warmup()
+        logger.info("模型加载完成 step=%s", step)
+        self._load_error = ""
+        return True
+
+    # ------------------------------------------------------
+
+    def _load_worker(self):
+
+        ok = False
+        try:
+            logger.info("后台加载线程启动")
+            ok = self._load_impl()
+        except Exception as e:
+            self._load_error = str(e)
+            logger.exception("后台加载失败: %s", e)
+        finally:
+            if not ok and self.params is None and self._load_error:
+                logger.error("模型未就绪: %s", self._load_error)
+            self._load_done.set()
+
+    # ------------------------------------------------------
+
+    def start_background_load(self):
+
+        with self._load_lock:
+            if self.params is not None:
+                self._load_done.set()
+                return
+            if self._load_thread and self._load_thread.is_alive():
+                return
+            self._load_error = ""
+            self._load_done.clear()
+            self._load_thread = threading.Thread(
+                target=self._load_worker,
+                name="zeroforge-uci-loader",
+                daemon=True,
             )
+            self._load_thread.start()
+            logger.info("已启动后台预加载")
 
-            # --------------------------------------------------
-            # recurrent_fn
-            # --------------------------------------------------
+    # ------------------------------------------------------
 
-            def recurrent_fn(params, rng_key, action, state):
+    def wait_until_ready(self, timeout=None):
 
-                prev_player = state.current_player
+        self.start_background_load()
+        done = self._load_done.wait(timeout)
+        return done and self.params is not None
 
-                next_state = jax.vmap(self.env.step)(state, action)
+    # ------------------------------------------------------
 
-                obs = jax.vmap(self.env.observe)(next_state)
+    def is_loading(self):
+        return self._load_thread is not None and self._load_thread.is_alive()
 
-                logits, value, _ = self._infer(params, obs)
+    # ------------------------------------------------------
 
-                logits = jnp.where(
-                    next_state.current_player[:, None] == 0,
-                    logits,
-                    logits[:, _ROTATED_IDX],
-                )
+    def load(self):
 
-                logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-
-                logits = jnp.where(
-                    next_state.legal_action_mask,
-                    logits,
-                    jnp.finfo(logits.dtype).min,
-                )
-
-                return (
-                    mctx.RecurrentFnOutput(
-                        reward=next_state.rewards[
-                            jnp.arange(next_state.rewards.shape[0]), prev_player
-                        ],
-                        discount=jnp.where(next_state.terminated, 0.0, -1.0),
-                        prior_logits=logits,
-                        value=value,
-                    ),
-                    next_state,
-                )
-
-            self._recurrent_fn = jax.jit(recurrent_fn)
-
-            # --------------------------------------------------
-            # warmup（触发编译）
-            # --------------------------------------------------
-
-            dummy = jnp.zeros((1, NUM_OBSERVATION_CHANNELS, 10, 9))
-            self._infer(self.params, dummy)
-
-            logger.info("模型加载完成 step=%s", step)
-
+        if self.params is not None:
             return True
 
-        except Exception as e:
-
-            logger.error("加载失败 %s", e)
-
-            return False
+        self.start_background_load()
+        self._load_done.wait()
+        return self.params is not None
 
     # ------------------------------------------------------
 
@@ -357,6 +419,7 @@ def run_uci(engine, simulations, top_k):
     state = None
     opts = {"simulations": simulations, "top_k": top_k}
     logger.info("UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s", simulations, top_k, _LOG_FILE)
+    engine.start_background_load()
 
     def send(x):
         print(x, flush=True)
@@ -373,11 +436,11 @@ def run_uci(engine, simulations, top_k):
             cmd = parts[0]
 
             if cmd == "uci":
+                engine.start_background_load()
                 send("id name ZeroForge")
                 send("id author ZeroForge")
-                send("") # 换行间隔开option
-                send("option name Simulations type spin default 256 min 16 max 4096")
-                send("option name TopK type spin default 32 min 4 max 64")
+                send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
+                send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
                 send("uciok")
 
             elif cmd == "setoption":
@@ -386,15 +449,16 @@ def run_uci(engine, simulations, top_k):
                     name = parts[ni + 1] if ni + 1 < len(parts) else ""
                     val = parts[vi + 1] if vi + 1 < len(parts) else ""
                     if name == "Simulations" and val.isdigit():
-                        opts["simulations"] = max(1, min(4096, int(val)))
+                        opts["simulations"] = max(16, min(4096, int(val)))
                     elif name == "TopK" and val.isdigit():
-                        opts["top_k"] = max(1, min(128, int(val)))
+                        opts["top_k"] = max(4, min(64, int(val)))
                     logger.info("设置选项 %s=%s -> simulations=%s top_k=%s", name, val, opts["simulations"], opts["top_k"])
 
             elif cmd == "isready":
                 if engine.params is None:
-                    logger.info("收到 isready，开始加载模型")
-                    engine.load()
+                    logger.info("收到 isready，等待后台加载完成 loading=%s", engine.is_loading())
+                    if not engine.wait_until_ready():
+                        logger.error("isready 等待结束但模型未就绪: %s", engine._load_error)
                 send("readyok")
 
             elif cmd == "position":
@@ -429,11 +493,11 @@ def run_uci(engine, simulations, top_k):
                         depth = int(parts[depth_idx + 1])
                     except (ValueError, IndexError):
                         depth = None
-                if engine.params is None:
-                    if not engine.load():
-                        send("info string model load failed")
-                        send("bestmove 0000")
-                        continue
+                if not engine.wait_until_ready():
+                    err = engine._load_error or "model load failed"
+                    send(f"info string {err}")
+                    send("bestmove 0000")
+                    continue
                 if state is None:
                     state = build_state(engine.env, STARTING_FEN, [])
                 sims, tk = opts["simulations"], opts["top_k"]
@@ -494,5 +558,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     engine = Engine(args.ckpt, args.step)
-
     run_uci(engine, args.simulations, args.topk)
