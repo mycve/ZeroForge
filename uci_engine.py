@@ -89,6 +89,11 @@ MCTS_QTRANSFORM = partial(
 DEFAULT_NUM_SIMULATIONS = 1024
 DEFAULT_TOP_K = 32
 
+# 开局阶段（前 N 完整回合，1回合=2半着）使用较低算力
+OPENING_FULL_MOVES = 10  # 前10回合
+OPENING_SIMS = 48
+OPENING_TOP_K = 8
+
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_FILE = os.path.join(_LOG_DIR, "zeroforge_uci.log")
@@ -371,6 +376,14 @@ class Engine:
         if legal_count == 0:
             return None, 0.0, []
 
+        # 仅有一个合法走法时直接返回，无需推理和 MCTS
+        if legal_count == 1:
+            action = int(jnp.argmax(legal_mask))
+            from_sq, to_sq = action_to_move(action)
+            move = move_to_uci(int(from_sq), int(to_sq))
+            logger.debug("唯一合法走法，直接返回: %s", move)
+            return move, 0.0, [{"uci": move, "weight": 1.0, "visits": 0, "cp": 0}]
+
         top_k = min(top_k, legal_count)
 
         obs = self.env.observe(state)[None]
@@ -650,13 +663,19 @@ def run_uci(engine, simulations, top_k):
                     state = build_state(engine.env, STARTING_FEN, [])
                     last_fen = STARTING_FEN
                     last_moves = []
-                sims, tk = opts["simulations"], opts["top_k"]
-                legal_count = int(jnp.sum(state.legal_action_mask))
-                current_fen = state_to_fen(state)
                 half_moves = len(last_moves)
                 full_moves = half_moves // 2
+                # 开局前 N 回合用较低算力
+                if full_moves < OPENING_FULL_MOVES:
+                    sims, tk = OPENING_SIMS, OPENING_TOP_K
+                else:
+                    sims, tk = opts["simulations"], opts["top_k"]
+                legal_count = int(jnp.sum(state.legal_action_mask))
+                current_fen = state_to_fen(state)
+                phase = "开局" if full_moves < OPENING_FULL_MOVES else "中残局"
                 logger.info(
-                    "======== 开始搜索 ======== [本局引擎第%s次走棋] 对局进度=%s着(约%s回合) depth=%s sims=%s top_k=%s legal=%s",
+                    "======== 开始搜索 ======== [%s] 本局引擎第%s次走棋 对局进度=%s着(约%s回合) depth=%s sims=%s top_k=%s legal=%s",
+                    phase,
                     engine_move_count + 1,
                     half_moves,
                     full_moves,
