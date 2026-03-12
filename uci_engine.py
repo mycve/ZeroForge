@@ -90,8 +90,8 @@ DEFAULT_NUM_SIMULATIONS = 1024
 DEFAULT_TOP_K = 32
 
 # 开局阶段（前 N 完整回合，1回合=2半着）使用较低算力
-OPENING_FULL_MOVES = 3  # 前3回合
-OPENING_SIMS = 48
+OPENING_FULL_MOVES = 5  # 前5回合
+OPENING_SIMS = 128
 OPENING_TOP_K = 8
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
