@@ -825,8 +825,7 @@ class TrainState(NamedTuple):
     iteration: int                  # 当前迭代次数
     frames: int                     # 总帧数
     rng_key: jnp.ndarray           # 随机数状态
-    history_models: dict            # 历史模型 (用于 ELO 评估)
-    iteration_elos: dict            # ELO 记录
+    iteration_elos: dict            # ELO 记录（用于选择评估对手）
     total_opt_steps: int            # 累计优化步数（用于 LR 调度）
 
 
@@ -857,17 +856,17 @@ def save_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     train_state: TrainState,
     step: int,
-):
+) -> None:
     """保存完整训练状态
     
-    包含：模型参数、优化器状态、迭代计数、随机数状态、历史模型、ELO
+    包含：模型参数、优化器状态、迭代计数、随机数状态、ELO、total_opt_steps
+    历史模型由 orbax 直接管理，评估时从 ckpt_manager.restore(ref_iter) 加载，无需单独保存。
     """
     # 从设备获取参数（只取第一个设备的副本）
     params_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.params))
     opt_state_np = jax.device_get(jax.tree.map(lambda x: x[0], train_state.opt_state))
     rng_key_np = jax.device_get(train_state.rng_key)
     
-    # 构建完整状态字典
     state_dict = {
         "params": params_np,
         "opt_state": opt_state_np,
@@ -875,28 +874,30 @@ def save_checkpoint(
         "frames": np.array(train_state.frames),
         "rng_key": rng_key_np,
     }
-    
-    # 保存主状态
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
     
-    # 单独保存 metadata (history_models keys, elos)
-    meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{step}")
-    os.makedirs(meta_dir, exist_ok=True)
-    
-    # 保存 ELO、历史模型索引、total_opt_steps
-    with open(os.path.join(meta_dir, "metadata.json"), "w") as f:
+    # 单文件 metadata.json：iteration_elos、total_opt_steps（仅保留 orbax 保留的 step 对应的 elo）
+    kept_steps = set(ckpt_manager.all_steps(read=True))
+    elos_to_save = {k: v for k, v in train_state.iteration_elos.items() if k in kept_steps}
+    meta_path = os.path.join(os.path.abspath(config.ckpt_dir), "metadata.json")
+    with open(meta_path, "w") as f:
         json.dump({
-            "iteration_elos": {str(k): float(v) for k, v in train_state.iteration_elos.items()},
-            "history_model_keys": [int(k) for k in train_state.history_models.keys()],
+            "iteration_elos": {str(k): float(v) for k, v in elos_to_save.items()},
             "total_opt_steps": train_state.total_opt_steps,
         }, f)
     
-    # 保存历史模型参数
-    for k, v in train_state.history_models.items():
-        np.savez_compressed(os.path.join(meta_dir, f"history_{k}.npz"), 
-                           **{f"arr_{i}": arr for i, arr in enumerate(jax.tree.leaves(v))})
-    
     logger.info("[Checkpoint] 已保存 step=%s", step)
+
+
+def _load_params_from_checkpoint(
+    ckpt_manager: ocp.CheckpointManager,
+    step: int,
+    params_template: dict,
+) -> dict:
+    """从 checkpoint 加载指定 step 的 params（用于 ELO 评估的对手模型）"""
+    restore_target = {"params": params_template}
+    restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
+    return restored["params"]
 
 
 def restore_checkpoint(
@@ -908,7 +909,7 @@ def restore_checkpoint(
     
     Returns:
         None 如果没有 checkpoint
-        (params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps) 如果成功
+        (params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps) 如果成功
     """
     latest_step = ckpt_manager.latest_step()
     if latest_step is None:
@@ -931,28 +932,19 @@ def restore_checkpoint(
     frames = int(restored["frames"])
     rng_key = restored["rng_key"]
     
-    # 恢复 metadata
-    meta_dir = os.path.join(os.path.abspath(config.ckpt_dir), f"meta_{latest_step}")
-    
-    history_models = {}
+    # 从 metadata.json 恢复（兼容旧版 meta_{step}/metadata.json）
+    ckpt_root = os.path.abspath(config.ckpt_dir)
+    meta_path = os.path.join(ckpt_root, "metadata.json")
+    if not os.path.exists(meta_path):
+        meta_path = os.path.join(ckpt_root, f"meta_{latest_step}", "metadata.json")
     iteration_elos = {}
-    
     total_opt_steps = 0
-    if os.path.exists(meta_dir):
-        with open(os.path.join(meta_dir, "metadata.json"), "r") as f:
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
             meta = json.load(f)
             iteration_elos = {int(k): v for k, v in meta["iteration_elos"].items()}
-            history_model_keys = meta["history_model_keys"]
             total_opt_steps = int(meta["total_opt_steps"])
-        
-        tree_struct = jax.tree.structure(params_template)
-        for k in history_model_keys:
-            npz_path = os.path.join(meta_dir, f"history_{k}.npz")
-            if os.path.exists(npz_path):
-                data = np.load(npz_path)
-                leaves = [data[f"arr_{i}"] for i in range(len(data.files))]
-                history_models[k] = jax.tree.unflatten(tree_struct, leaves)
-        
+    
     if total_opt_steps == 0:
         total_opt_steps = (frames * config.sample_reuse_times) // config.training_batch_size
     
@@ -961,21 +953,12 @@ def restore_checkpoint(
         latest_elo = iteration_elos[latest_elo_iter]
         logger.info(
             "[Checkpoint] 恢复完成: iteration=%s, frames=%s, opt_steps=%s, ELO=%.0f (iter %s)",
-            iteration,
-            frames,
-            total_opt_steps,
-            latest_elo,
-            latest_elo_iter,
+            iteration, frames, total_opt_steps, latest_elo, latest_elo_iter,
         )
     else:
-        logger.info(
-            "[Checkpoint] 恢复完成: iteration=%s, frames=%s, opt_steps=%s",
-            iteration,
-            frames,
-            total_opt_steps,
-        )
+        logger.info("[Checkpoint] 恢复完成: iteration=%s, frames=%s, opt_steps=%s", iteration, frames, total_opt_steps)
     
-    return params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps
+    return params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps
 
 
 # ============================================================================
@@ -1033,14 +1016,13 @@ def main():
     restored = restore_checkpoint(ckpt_manager, params_template, opt_state_template)
     
     if restored is not None:
-        params, opt_state, iteration, frames, rng_key, history_models, iteration_elos, total_opt_steps = restored
+        params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps = restored
         logger.info("[断点续训] 从 iteration=%s 继续训练", iteration)
     else:
         params = params_template
         opt_state = opt_state_template
         iteration = 0
         frames = 0
-        history_models = {0: jax.device_get(params)}
         iteration_elos = {0: 1500.0}
         total_opt_steps = 0
 
@@ -1070,13 +1052,14 @@ def main():
     
     # 恢复后若轮到评估（如崩溃在 ckpt 保存后、eval 前），补跑评估
     if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
-        available_iters = sorted(k for k in history_models.keys() if k < iteration)
+        kept_steps = set(ckpt_manager.all_steps(read=True))
+        available_iters = sorted(k for k in kept_steps if k < iteration)
         if available_iters:
             logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
             rated_iters = [k for k in available_iters if k in iteration_elos]
             ref_iter = max(rated_iters, key=lambda k: iteration_elos[k]) if rated_iters else available_iters[-1]
             ref_reason = "best_elo" if rated_iters else "latest_ckpt"
-            past_params = replicate_to_devices(history_models[ref_iter])
+            past_params = replicate_to_devices(_load_params_from_checkpoint(ckpt_manager, ref_iter, params_template))
             rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
             batch_per_eval = config.eval_games
             states_r = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=True)
@@ -1295,25 +1278,25 @@ def main():
         
         # === Checkpoint 保存 ===
         if iteration % config.ckpt_interval == 0:
-            params_np = jax.device_get(jax.tree.map(lambda x: x[0], params))
-            history_models[iteration] = params_np
-            
             train_state = TrainState(
                 params=params,
                 opt_state=opt_state,
                 iteration=iteration,
                 frames=frames,
                 rng_key=rng_key,
-                history_models=history_models,
                 iteration_elos=iteration_elos,
                 total_opt_steps=total_opt_steps,
             )
             save_checkpoint(ckpt_manager, train_state, iteration)
+            # 裁剪 iteration_elos，与 orbax 保留数量一致，避免内存膨胀
+            kept_steps = set(ckpt_manager.all_steps(read=True))
+            iteration_elos = {k: v for k, v in iteration_elos.items() if k in kept_steps}
         
         if iteration % config.eval_interval == 0:
             # 评估对手优先选择“历史最佳模型”（按 iteration_elos），
-            # 若无可用 ELO 记录，则退化为最近历史 checkpoint。
-            available_iters = sorted(k for k in history_models.keys() if k < iteration)
+            # 若无可用 ELO 记录，则退化为最近历史 checkpoint。对手从 orbax checkpoint 加载。
+            kept_steps = set(ckpt_manager.all_steps(read=True))
+            available_iters = sorted(k for k in kept_steps if k < iteration)
             if available_iters:
                 rated_iters = [k for k in available_iters if k in iteration_elos]
                 if rated_iters:
@@ -1323,7 +1306,7 @@ def main():
                     ref_iter = available_iters[-1]
                     ref_reason = "latest_ckpt"
 
-                past_params = replicate_to_devices(history_models[ref_iter])
+                past_params = replicate_to_devices(_load_params_from_checkpoint(ckpt_manager, ref_iter, params_template))
                 rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
                 batch_per_eval = config.eval_games
                 # 构建初始状态（支持 FEN 批量导入 + 先后手轮换）
