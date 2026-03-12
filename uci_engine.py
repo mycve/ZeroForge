@@ -68,42 +68,6 @@ from xiangqi.actions import (
 from xiangqi.fen import parse_fen
 from networks.alphazero import AlphaZeroNetwork
 
-# mctx Tree 常量（用于遍历）
-_TREE_UNVISITED = -1
-
-
-def _tree_depth_and_pv(tree, batch_idx=0, max_depth=100, root_action_override=None):
-    """
-    沿主变（或指定首着）遍历 MCTS 树，返回深度和 PV 着法序列。
-    depth: 主变深度（plies，即着法数）
-    pv_moves: 主变着法 UCI 列表 [move1, move2, ...]
-    root_action_override: 若指定，根节点强制选此着（用于 multipv 2,3,...）
-    """
-    ci = np.array(tree.children_index[batch_idx])  # [N, num_actions]
-    cv = np.array(tree.children_visits[batch_idx])  # [N, num_actions]
-    node_idx = 0
-    depth = 0
-    pv_moves = []
-    for step in range(max_depth):
-        visits = cv[node_idx]
-        if step == 0 and root_action_override is not None:
-            best_action = root_action_override
-        else:
-            best_action = int(np.argmax(visits))
-        child_idx = int(ci[node_idx, best_action])
-        if child_idx == _TREE_UNVISITED or visits[best_action] <= 0:
-            if step == 0:
-                fs, ts = action_to_move(best_action)
-                pv_moves.append(move_to_uci(int(fs), int(ts)))
-                depth = 1
-            break
-        fs, ts = action_to_move(best_action)
-        pv_moves.append(move_to_uci(int(fs), int(ts)))
-        depth += 1
-        node_idx = child_idx
-    return depth, pv_moves
-
-
 # 抑制第三方库日志，UCI 协议要求 stdout 仅输出协议行
 for _name in ("jax", "jax._src", "orbax", "mctx", "absl"):
     _lg = logging.getLogger(_name)
@@ -460,12 +424,11 @@ class Engine:
 
         val = float(policy.search_tree.node_values[0, 0])
 
-        # 构建 Top-N 候选（含 visits、qvalue、depth、pv，用于 UCI multipv）
+        # 构建 Top-N 候选（含 visits、qvalue，用于 UCI multipv）
         top_n = 32
         top_indices = np.argsort(weights)[::-1][:top_n]
         policy_info = []
-        tree = policy.search_tree
-        for i, idx in enumerate(top_indices):
+        for idx in top_indices:
             w = float(weights[idx])
             if w <= 1e-6:
                 break
@@ -473,15 +436,12 @@ class Engine:
             visits = int(visit_counts[idx])
             qval = float(qvalues[idx])
             cp = int(qval * 1000)
-            depth, pv_moves = _tree_depth_and_pv(tree, batch_idx=0, root_action_override=int(idx))
-            pv_str = " ".join(pv_moves) if pv_moves else move_to_uci(int(fs), int(ts))
+            uci_move = move_to_uci(int(fs), int(ts))
             policy_info.append({
-                "uci": move_to_uci(int(fs), int(ts)),
+                "uci": uci_move,
                 "weight": w,
                 "visits": visits,
                 "cp": cp,
-                "depth": depth,
-                "pv": pv_str,
             })
 
         return move, val, policy_info
@@ -719,19 +679,19 @@ def run_uci(engine, simulations, top_k):
                         engine_move_count, move, val, cp, elapsed_ms, nps,
                     )
                     if policy_info:
-                        top_str = " ".join(f"{p['uci']}({p['weight']:.3f},d{p['depth']})" for p in policy_info[:6])
+                        top_str = " ".join(f"{p['uci']}({p['weight']:.3f})" for p in policy_info[:6])
                         logger.info("策略 Top-N: %s", top_str)
                     # UCI: 在 bestmove 前发送最终 info，multipv 模式下发送所有 k 条变例
                     multipv_k = min(opts["multipv"], len(policy_info)) if policy_info else 1
                     for i in range(multipv_k):
                         if policy_info and i < len(policy_info):
                             p = policy_info[i]
-                            pv_cp, pv_depth, pv_line = p["cp"], p["depth"], p["pv"]
+                            pv_cp, pv_move = p["cp"], p["uci"]
                         else:
-                            pv_cp, pv_depth, pv_line = cp, 1, move
+                            pv_cp, pv_move = cp, move
                         send(
-                            f"info depth {pv_depth} seldepth {pv_depth} multipv {i+1} score cp {pv_cp} "
-                            f"nodes {sims} nps {nps} hashfull 0 tbhits 0 time {elapsed_ms} pv {pv_line}"
+                            f"info depth 1 seldepth 1 multipv {i+1} score cp {pv_cp} "
+                            f"nodes {sims} nps {nps} hashfull 0 tbhits 0 time {elapsed_ms} pv {pv_move}"
                         )
                     send(f"bestmove {move}")
                 else:
