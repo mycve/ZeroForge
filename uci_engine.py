@@ -490,7 +490,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
 
     state = None
     opts = {
-        "checkpoint_dir": engine.ckpt_dir,
         "step": engine.step,
         "simulations": simulations,
         "top_k": top_k,
@@ -523,7 +522,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
             if cmd == "uci":
                 send("id name ZeroForge")
                 send("id author ZeroForge")
-                send(f"option name CheckpointDir type string default {opts['checkpoint_dir']}")
                 send(f"option name Step type spin default {opts['step']} min 0 max 100000000")
                 send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
                 send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
@@ -533,10 +531,7 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
 
             elif cmd == "setoption":
                 name, val = parse_setoption(parts)
-                if name == "CheckpointDir" and val:
-                    opts["checkpoint_dir"] = os.path.abspath(val)
-                    engine.configure(ckpt_dir=opts["checkpoint_dir"])
-                elif name == "Step" and val and val.isdigit():
+                if name == "Step" and val and val.isdigit():
                     opts["step"] = max(0, int(val))
                     engine.configure(step=opts["step"])
                 elif name == "Simulations" and val and val.isdigit():
@@ -559,12 +554,11 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                         logger.info("无效 DelayMaxSec=%s，忽略", val)
                 elif name:
                     logger.info("收到未实现选项 %s=%s，忽略", name, val)
-                if name in {"CheckpointDir", "Step", "Simulations", "TopK", "DelayMinSec", "DelayMaxSec"}:
+                if name in {"Step", "Simulations", "TopK", "DelayMinSec", "DelayMaxSec"}:
                     logger.info(
-                        "设置选项 %s=%s -> ckpt_dir=%s step=%s simulations=%s top_k=%s delay_min=%.3f delay_max=%.3f",
+                        "设置选项 %s=%s -> step=%s simulations=%s top_k=%s delay_min=%.3f delay_max=%.3f",
                         name,
                         val,
-                        opts["checkpoint_dir"],
                         opts["step"],
                         opts["simulations"],
                         opts["top_k"],
