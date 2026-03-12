@@ -4,7 +4,6 @@ ZeroForge UCI 引擎（高性能 + JAX 编译缓存）
 """
 
 import os
-import random
 import sys
 import time
 import argparse
@@ -89,8 +88,6 @@ MCTS_QTRANSFORM = partial(
 
 DEFAULT_NUM_SIMULATIONS = 1024
 DEFAULT_TOP_K = 32
-DEFAULT_DELAY_MIN_SECS = 0.0
-DEFAULT_DELAY_MAX_SECS = 0.0
 
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -510,22 +507,12 @@ def parse_setoption(parts):
     return name, value
 
 
-def sleep_before_move_output(delay_min_secs, delay_max_secs):
-    lo = max(0.0, float(delay_min_secs))
-    hi = max(lo, float(delay_max_secs))
-    if hi <= 0.0:
-        return
-    delay = random.uniform(lo, hi)
-    logger.info("输出走法前延迟 %.3f 秒", delay)
-    time.sleep(delay)
-
-
 # ==========================================================
 # UCI LOOP
 # ==========================================================
 
 
-def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
+def run_uci(engine, simulations, top_k):
 
     state = None
     last_fen = STARTING_FEN
@@ -535,15 +522,11 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
         "step": engine.step,
         "simulations": simulations,
         "top_k": top_k,
-        "delay_min_secs": delay_min_secs,
-        "delay_max_secs": delay_max_secs,
     }
     logger.info(
-        "UCI 引擎启动 simulations=%s top_k=%s delay_min=%.3f delay_max=%.3f 日志文件: %s",
+        "UCI 引擎启动 simulations=%s top_k=%s 日志文件: %s",
         simulations,
         top_k,
-        delay_min_secs,
-        delay_max_secs,
         _LOG_FILE,
     )
 
@@ -567,8 +550,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                 send(f"option name Step type spin default {opts['step']} min 0 max 100000000")
                 send(f"option name Simulations type spin default {opts['simulations']} min 16 max 4096")
                 send(f"option name TopK type spin default {opts['top_k']} min 4 max 64")
-                send(f"option name DelayMinSec type string default {opts['delay_min_secs']}")
-                send(f"option name DelayMaxSec type string default {opts['delay_max_secs']}")
                 send("uciok")
 
             elif cmd == "setoption":
@@ -580,32 +561,16 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                     opts["simulations"] = max(16, min(4096, int(val)))
                 elif name == "TopK" and val and val.isdigit():
                     opts["top_k"] = max(4, min(64, int(val)))
-                elif name == "DelayMinSec" and val is not None:
-                    try:
-                        opts["delay_min_secs"] = max(0.0, float(val))
-                        if opts["delay_max_secs"] < opts["delay_min_secs"]:
-                            opts["delay_max_secs"] = opts["delay_min_secs"]
-                    except ValueError:
-                        logger.info("无效 DelayMinSec=%s，忽略", val)
-                elif name == "DelayMaxSec" and val is not None:
-                    try:
-                        opts["delay_max_secs"] = max(0.0, float(val))
-                        if opts["delay_min_secs"] > opts["delay_max_secs"]:
-                            opts["delay_min_secs"] = opts["delay_max_secs"]
-                    except ValueError:
-                        logger.info("无效 DelayMaxSec=%s，忽略", val)
                 elif name:
                     logger.info("收到未实现选项 %s=%s，忽略", name, val)
-                if name in {"Step", "Simulations", "TopK", "DelayMinSec", "DelayMaxSec"}:
+                if name in {"Step", "Simulations", "TopK"}:
                     logger.info(
-                        "设置选项 %s=%s -> step=%s simulations=%s top_k=%s delay_min=%.3f delay_max=%.3f",
+                        "设置选项 %s=%s -> step=%s simulations=%s top_k=%s",
                         name,
                         val,
                         opts["step"],
                         opts["simulations"],
                         opts["top_k"],
-                        opts["delay_min_secs"],
-                        opts["delay_max_secs"],
                     )
 
             elif cmd == "isready":
@@ -660,7 +625,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                         depth = None
                 if not engine.wait_until_ready():
                     err = engine._load_error or "model load failed"
-                    sleep_before_move_output(opts["delay_min_secs"], opts["delay_max_secs"])
                     send(f"info string {err}")
                     send("bestmove 0000")
                     continue
@@ -699,7 +663,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                     if policy_info:
                         top_str = " ".join(f"{p['uci']}({p['weight']:.3f})" for p in policy_info[:6])
                         logger.info("策略 Top-N: %s", top_str)
-                    sleep_before_move_output(opts["delay_min_secs"], opts["delay_max_secs"])
                     send(
                         f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
                         f"nodes {sims} nps {nps} hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
@@ -707,7 +670,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                     send(f"bestmove {move}")
                 else:
                     logger.warning("搜索无合法着法 elapsed_ms=%s", elapsed_ms)
-                    sleep_before_move_output(opts["delay_min_secs"], opts["delay_max_secs"])
                     send("bestmove 0000")
 
             elif cmd == "ucinewgame":
@@ -726,7 +688,6 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
             logger.exception("UCI 命令处理异常 cmd=%s: %s", cmd, e)
             if cmd == "go":
                 try:
-                    sleep_before_move_output(opts["delay_min_secs"], opts["delay_max_secs"])
                     send("info string error")
                     send("bestmove 0000")
                 except Exception:
@@ -747,12 +708,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--simulations", type=int, default=DEFAULT_NUM_SIMULATIONS)
     parser.add_argument("--topk", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--delay-min", type=float, default=DEFAULT_DELAY_MIN_SECS)
-    parser.add_argument("--delay-max", type=float, default=DEFAULT_DELAY_MAX_SECS)
 
     parser.add_argument("--cpu", action="store_true")
 
     args = parser.parse_args()
 
     engine = Engine(args.ckpt, args.step)
-    run_uci(engine, args.simulations, args.topk, args.delay_min, args.delay_max)
+    run_uci(engine, args.simulations, args.topk)
