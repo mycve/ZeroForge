@@ -12,6 +12,8 @@ import logging
 import threading
 from functools import partial
 
+import numpy as np
+
 # ==========================================================
 # JAX 性能设置（必须在 import jax 前）
 # ==========================================================
@@ -370,7 +372,7 @@ class Engine:
         legal_count = int(jnp.sum(legal_mask))
 
         if legal_count == 0:
-            return None, 0.0
+            return None, 0.0, []
 
         top_k = min(top_k, legal_count)
 
@@ -412,7 +414,7 @@ class Engine:
             gumbel_scale=0.0,
         )
 
-        weights = policy.action_weights[0]
+        weights = np.array(policy.action_weights[0])
 
         action = int(jnp.argmax(weights))
 
@@ -422,12 +424,49 @@ class Engine:
 
         val = float(policy.search_tree.node_values[0, 0])
 
-        return move, val
+        # 构建 Top-N 候选（用于日志）
+        top_n = 8
+        top_indices = np.argsort(weights)[::-1][:top_n]
+        policy_info = []
+        for idx in top_indices:
+            w = float(weights[idx])
+            if w <= 1e-6:
+                break
+            fs, ts = action_to_move(int(idx))
+            policy_info.append({"uci": move_to_uci(int(fs), int(ts)), "weight": w})
+
+        return move, val, policy_info
 
 
 # ==========================================================
 # FEN
 # ==========================================================
+
+
+def state_to_fen(state) -> str:
+    """将 XiangqiState 转为 FEN 字符串（用于日志）"""
+    board = np.array(state.board)
+    player = int(state.current_player)
+    PIECE_TO_FEN = {
+        1: "K", 2: "A", 3: "B", 4: "N", 5: "R", 6: "C", 7: "P",
+        -1: "k", -2: "a", -3: "b", -4: "n", -5: "r", -6: "c", -7: "p",
+    }
+    rows = []
+    for r in range(9, -1, -1):
+        r_str, empty = "", 0
+        for c in range(9):
+            p = int(board[r, c])
+            if p == 0:
+                empty += 1
+            else:
+                if empty > 0:
+                    r_str += str(empty)
+                    empty = 0
+                r_str += PIECE_TO_FEN.get(p, "?")
+        if empty > 0:
+            r_str += str(empty)
+        rows.append(r_str)
+    return "/".join(rows) + (" w" if player == 0 else " b")
 
 
 def build_state(env, fen, moves):
@@ -489,6 +528,8 @@ def sleep_before_move_output(delay_min_secs, delay_max_secs):
 def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
 
     state = None
+    last_fen = STARTING_FEN
+    last_moves = []
     opts = {
         "step": engine.step,
         "simulations": simulations,
@@ -592,10 +633,19 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                         moves = parts[j + 1 :]
                 try:
                     state = build_state(engine.env, fen, moves)
-                    logger.info("局面更新 fen=%s moves=%s", fen, len(moves))
+                    last_fen = fen
+                    last_moves = moves
+                    logger.info(
+                        "局面更新 fen=%s moves=%s 着法=[%s]",
+                        fen[:50] + "..." if len(fen) > 50 else fen,
+                        len(moves),
+                        " ".join(moves[:20]) + (" ..." if len(moves) > 20 else ""),
+                    )
                 except (ValueError, KeyError) as e:
                     logger.error("build_state 失败: %s", e)
                     state = build_state(engine.env, STARTING_FEN, [])
+                    last_fen = STARTING_FEN
+                    last_moves = []
 
             elif cmd == "go":
                 depth = None
@@ -613,18 +663,34 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                     continue
                 if state is None:
                     state = build_state(engine.env, STARTING_FEN, [])
+                    last_fen = STARTING_FEN
+                    last_moves = []
                 sims, tk = opts["simulations"], opts["top_k"]
-                logger.info("开始搜索 depth=%s simulations=%s top_k=%s", depth, sims, tk)
+                legal_count = int(jnp.sum(state.legal_action_mask))
+                current_fen = state_to_fen(state)
+                logger.info(
+                    "======== 开始搜索 ======== depth=%s simulations=%s top_k=%s legal_moves=%s",
+                    depth, sims, tk, legal_count,
+                )
+                logger.info("局面 FEN: %s", current_fen)
+                logger.info("历史着法(%s步): %s", len(last_moves), " ".join(last_moves) if last_moves else "(无)")
                 t0 = time.perf_counter()
-                move, val = engine.get_best_move(state, sims, tk)
+                move, val, policy_info = engine.get_best_move(state, sims, tk)
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                nps = (sims * 1000 // elapsed_ms) if elapsed_ms > 0 else 0
                 if move:
                     cp = int(val * 1000)
-                    logger.info("搜索完成 move=%s value=%.4f elapsed_ms=%s", move, val, elapsed_ms)
+                    logger.info(
+                        "======== 搜索完成 ======== bestmove=%s value=%.4f(cp=%s) elapsed_ms=%s nps=%s",
+                        move, val, cp, elapsed_ms, nps,
+                    )
+                    if policy_info:
+                        top_str = " ".join(f"{p['uci']}({p['weight']:.3f})" for p in policy_info[:6])
+                        logger.info("策略 Top-N: %s", top_str)
                     sleep_before_move_output(opts["delay_min_secs"], opts["delay_max_secs"])
                     send(
                         f"info depth 1 seldepth 1 multipv 1 score cp {cp} "
-                        f"nodes {sims} nps 0 hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
+                        f"nodes {sims} nps {nps} hashfull 0 tbhits 0 time {elapsed_ms} pv {move}"
                     )
                     send(f"bestmove {move}")
                 else:
