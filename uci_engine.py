@@ -530,6 +530,7 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
     state = None
     last_fen = STARTING_FEN
     last_moves = []
+    engine_move_count = 0  # 本局引擎已走次数（每输出一次 bestmove 计 1）
     opts = {
         "step": engine.step,
         "simulations": simulations,
@@ -635,10 +636,12 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                     state = build_state(engine.env, fen, moves)
                     last_fen = fen
                     last_moves = moves
+                    half_moves = len(moves)
+                    full_moves = half_moves // 2  # 1回合 = 红1着+黑1着
                     logger.info(
-                        "局面更新 fen=%s moves=%s 着法=[%s]",
-                        fen[:50] + "..." if len(fen) > 50 else fen,
-                        len(moves),
+                        "局面更新 总着数=%s着(约%s回合) 着法=[%s]",
+                        half_moves,
+                        full_moves,
                         " ".join(moves[:20]) + (" ..." if len(moves) > 20 else ""),
                     )
                 except (ValueError, KeyError) as e:
@@ -668,21 +671,30 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
                 sims, tk = opts["simulations"], opts["top_k"]
                 legal_count = int(jnp.sum(state.legal_action_mask))
                 current_fen = state_to_fen(state)
+                half_moves = len(last_moves)
+                full_moves = half_moves // 2
                 logger.info(
-                    "======== 开始搜索 ======== depth=%s simulations=%s top_k=%s legal_moves=%s",
-                    depth, sims, tk, legal_count,
+                    "======== 开始搜索 ======== [本局引擎第%s次走棋] 对局进度=%s着(约%s回合) depth=%s sims=%s top_k=%s legal=%s",
+                    engine_move_count + 1,
+                    half_moves,
+                    full_moves,
+                    depth,
+                    sims,
+                    tk,
+                    legal_count,
                 )
                 logger.info("局面 FEN: %s", current_fen)
-                logger.info("历史着法(%s步): %s", len(last_moves), " ".join(last_moves) if last_moves else "(无)")
+                logger.info("历史着法: %s", " ".join(last_moves) if last_moves else "(无)")
                 t0 = time.perf_counter()
                 move, val, policy_info = engine.get_best_move(state, sims, tk)
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 nps = (sims * 1000 // elapsed_ms) if elapsed_ms > 0 else 0
                 if move:
+                    engine_move_count += 1
                     cp = int(val * 1000)
                     logger.info(
-                        "======== 搜索完成 ======== bestmove=%s value=%.4f(cp=%s) elapsed_ms=%s nps=%s",
-                        move, val, cp, elapsed_ms, nps,
+                        "======== 搜索完成 ======== [本局引擎第%s步] bestmove=%s value=%.4f(cp=%s) elapsed_ms=%s nps=%s",
+                        engine_move_count, move, val, cp, elapsed_ms, nps,
                     )
                     if policy_info:
                         top_str = " ".join(f"{p['uci']}({p['weight']:.3f})" for p in policy_info[:6])
@@ -700,6 +712,7 @@ def run_uci(engine, simulations, top_k, delay_min_secs, delay_max_secs):
 
             elif cmd == "ucinewgame":
                 state = None
+                engine_move_count = 0
                 logger.info("收到 ucinewgame，已重置内部局面")
 
             elif cmd == "stop":
