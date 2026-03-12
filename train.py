@@ -893,9 +893,19 @@ def _load_params_from_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     step: int,
     params_template: dict,
+    opt_state_template: dict,
 ) -> dict:
-    """从 checkpoint 加载指定 step 的 params（用于 ELO 评估的对手模型）"""
-    restore_target = {"params": params_template}
+    """从 checkpoint 加载指定 step 的 params（用于 ELO 评估的对手模型）
+    
+    必须传入完整 restore_target 结构，否则 orbax StandardRestore 会因结构不匹配而失败。
+    """
+    restore_target = {
+        "params": params_template,
+        "opt_state": opt_state_template,
+        "iteration": np.array(0),
+        "frames": np.array(0),
+        "rng_key": jax.random.PRNGKey(0),
+    }
     restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
     return restored["params"]
 
@@ -1059,7 +1069,9 @@ def main():
             rated_iters = [k for k in available_iters if k in iteration_elos]
             ref_iter = max(rated_iters, key=lambda k: iteration_elos[k]) if rated_iters else available_iters[-1]
             ref_reason = "best_elo" if rated_iters else "latest_ckpt"
-            past_params = replicate_to_devices(_load_params_from_checkpoint(ckpt_manager, ref_iter, params_template))
+            past_params = replicate_to_devices(_load_params_from_checkpoint(
+                ckpt_manager, ref_iter, params_template, opt_state_template
+            ))
             rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
             batch_per_eval = config.eval_games
             states_r = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=True)
@@ -1306,7 +1318,9 @@ def main():
                     ref_iter = available_iters[-1]
                     ref_reason = "latest_ckpt"
 
-                past_params = replicate_to_devices(_load_params_from_checkpoint(ckpt_manager, ref_iter, params_template))
+                past_params = replicate_to_devices(_load_params_from_checkpoint(
+                    ckpt_manager, ref_iter, params_template, opt_state_template
+                ))
                 rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
                 batch_per_eval = config.eval_games
                 # 构建初始状态（支持 FEN 批量导入 + 先后手轮换）
