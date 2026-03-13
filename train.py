@@ -81,7 +81,7 @@ class Config:
     # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 96            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
+    top_k: int = 24                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 40  # 前 40 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.2
     
@@ -92,8 +92,8 @@ class Config:
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.5   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 环境规则（符合象棋竞赛规则）
