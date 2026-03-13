@@ -3,7 +3,7 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索，前 20 半步温度采样，后续 argmax
+- Gumbel-Top-k MCTS：搜索内探索，开局根节点 Dirichlet 扰动 + 温度退火采样，后续 argmax
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
@@ -79,12 +79,16 @@ class Config:
     training_batch_size: int = 4096
     td_lambda: float = 0.75
     
-    # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
+    # 自对弈与搜索：Gumbel-Top-k，开局增强探索，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.0
+    selfplay_temperature_steps: int = 28    # 开局前 28 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.20      # 开局起始温度（更鼓励分支展开）
+    selfplay_temperature_final: float = 0.60  # 开局末段温度，避免全程过散
+    opening_dirichlet_steps: int = 24       # 开局前 N 半步对根先验注入 Dirichlet 扰动
+    opening_dirichlet_alpha: float = 0.30
+    opening_dirichlet_epsilon: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_000_000
@@ -130,7 +134,11 @@ def parse_args():
     parser.add_argument("--top-k", type=int, default=None, help="覆盖搜索 max_num_considered_actions")
     parser.add_argument("--selfplay-temperature", type=float, default=None, help="覆盖 selfplay_temperature")
     parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
+    parser.add_argument("--selfplay-temperature-final", type=float, default=None, help="覆盖 selfplay_temperature_final")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
+    parser.add_argument("--opening-dirichlet-steps", type=int, default=None, help="覆盖 opening_dirichlet_steps")
+    parser.add_argument("--opening-dirichlet-alpha", type=float, default=None, help="覆盖 opening_dirichlet_alpha")
+    parser.add_argument("--opening-dirichlet-epsilon", type=float, default=None, help="覆盖 opening_dirichlet_epsilon")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
     return parser.parse_args()
 
@@ -147,7 +155,11 @@ def apply_cli_overrides(args):
         "top_k": args.top_k,
         "selfplay_temperature": args.selfplay_temperature,
         "selfplay_temperature_steps": args.selfplay_temperature_steps,
+        "selfplay_temperature_final": args.selfplay_temperature_final,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
+        "opening_dirichlet_steps": args.opening_dirichlet_steps,
+        "opening_dirichlet_alpha": args.opening_dirichlet_alpha,
+        "opening_dirichlet_epsilon": args.opening_dirichlet_epsilon,
         "eval_gumbel_scale": args.eval_gumbel_scale,
     }
     applied = {}
@@ -219,9 +231,77 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
+if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
+    raise ValueError(
+        "selfplay_temperature 与 selfplay_temperature_final 必须 > 0，"
+        f"当前值: {config.selfplay_temperature}, {config.selfplay_temperature_final}"
+    )
+if config.selfplay_temperature_steps < 0:
+    raise ValueError(
+        f"selfplay_temperature_steps 必须 >= 0，当前值: {config.selfplay_temperature_steps}"
+    )
+if config.opening_dirichlet_steps < 0:
+    raise ValueError(
+        f"opening_dirichlet_steps 必须 >= 0，当前值: {config.opening_dirichlet_steps}"
+    )
+if config.opening_dirichlet_alpha <= 0:
+    raise ValueError(
+        f"opening_dirichlet_alpha 必须 > 0，当前值: {config.opening_dirichlet_alpha}"
+    )
+if not (0.0 <= config.opening_dirichlet_epsilon <= 1.0):
+    raise ValueError(
+        "opening_dirichlet_epsilon 必须在 [0, 1]，"
+        f"当前值: {config.opening_dirichlet_epsilon}"
+    )
 # 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
 # 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
+
+
+def _masked_normalize(x: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
+    """对合法动作子集归一化，非法动作恒为 0。"""
+    masked = jnp.where(legal_mask, x, 0.0)
+    denom = jnp.maximum(jnp.sum(masked, axis=-1, keepdims=True), 1e-10)
+    return jnp.where(legal_mask, masked / denom, 0.0)
+
+
+def _opening_temperature(step_count: jnp.ndarray) -> jnp.ndarray:
+    """开局温度线性退火：前期更散，接近 cutoff 时更稳。"""
+    if config.selfplay_temperature_steps <= 1:
+        return jnp.full_like(step_count, config.selfplay_temperature, dtype=jnp.float32)
+    progress = jnp.clip(
+        step_count.astype(jnp.float32) / float(config.selfplay_temperature_steps - 1),
+        0.0,
+        1.0,
+    )
+    return (
+        config.selfplay_temperature
+        + (config.selfplay_temperature_final - config.selfplay_temperature) * progress
+    ).astype(jnp.float32)
+
+
+def _apply_root_dirichlet_noise(
+    logits: jnp.ndarray,
+    legal_mask: jnp.ndarray,
+    step_count: jnp.ndarray,
+    rng_key,
+) -> jnp.ndarray:
+    """仅在开局对根节点先验注入 Dirichlet 扰动，缓解单线开局坍缩。"""
+    base_probs = _masked_normalize(jax.nn.softmax(logits, axis=-1), legal_mask)
+    if config.opening_dirichlet_steps <= 0 or config.opening_dirichlet_epsilon <= 0.0:
+        return jnp.where(legal_mask, jnp.log(base_probs + 1e-10), jnp.finfo(logits.dtype).min)
+
+    gamma_shape = jnp.full(logits.shape, config.opening_dirichlet_alpha, dtype=logits.dtype)
+    dirichlet_noise = jax.random.gamma(rng_key, gamma_shape)
+    dirichlet_noise = _masked_normalize(dirichlet_noise, legal_mask)
+    mixed_probs = (
+        (1.0 - config.opening_dirichlet_epsilon) * base_probs
+        + config.opening_dirichlet_epsilon * dirichlet_noise
+    )
+    mixed_probs = _masked_normalize(mixed_probs, legal_mask)
+    use_noise = (step_count < config.opening_dirichlet_steps)[:, None]
+    final_probs = jnp.where(use_noise, mixed_probs, base_probs)
+    return jnp.where(legal_mask, jnp.log(final_probs + 1e-10), jnp.finfo(logits.dtype).min)
 
 def replicate_to_devices(pytree):
     """将 pytree 复制到所有设备"""
@@ -344,20 +424,24 @@ def selfplay(params, rng_key, batch_size):
     """
     高性能自玩算子：
     - lax.scan 消除 Python 循环开销
-    - Gumbel-Top-k：探索在搜索内完成，开局对根分布做温度采样，后续直接 argmax
+    - Gumbel-Top-k：探索在搜索内完成，开局额外加入根噪声 + 温度退火采样
     """
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
+        key_dirichlet, key_mcts = jax.random.split(key_search)
         obs = jax.vmap(env.observe)(state)
         logits, value, wdl_logits = forward(params, obs)
         root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
+        logits = _apply_root_dirichlet_noise(
+            logits, state.legal_action_mask, state.step_count, key_dirichlet
+        )
         
         # MCTS 搜索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
         policy_output = mctx.gumbel_muzero_policy(
-            params=params, rng_key=key_search, root=root, recurrent_fn=recurrent_fn,
+            params=params, rng_key=key_mcts, root=root, recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
             max_num_considered_actions=config.top_k,
             invalid_actions=~state.legal_action_mask,
@@ -375,20 +459,22 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
 
-        def _sample_action(w, legal_mask, sample_key):
+        def _sample_action(w, legal_mask, temperature, sample_key):
             # 在 log 空间做温度缩放，避免小概率动作下溢。
-            w_masked = jnp.where(legal_mask, w, 0.0)
-            log_w = jnp.log(w_masked + 1e-10) / config.selfplay_temperature
+            w_masked = _masked_normalize(w, legal_mask)
+            log_w = jnp.log(w_masked + 1e-10) / temperature
             log_w = jnp.where(legal_mask, log_w, -jnp.inf)
             log_w = log_w - jnp.max(log_w)
             probs = jnp.exp(log_w)
-            probs = jnp.where(legal_mask, probs, 0.0)
-            probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
+            probs = _masked_normalize(probs, legal_mask)
             return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
 
-        # 前 20 半步增加根节点多样性，后续回到贪心走子。
+        # 开局阶段做温度退火采样，后续回到贪心走子。
         sample_keys = jax.random.split(key_sample, batch_size)
-        sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
+        sample_temperatures = _opening_temperature(state.step_count)
+        sampled_action = jax.vmap(_sample_action)(
+            action_weights, state.legal_action_mask, sample_temperatures, sample_keys
+        )
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
         greedy_action = jnp.argmax(action_weights_masked, axis=-1)
@@ -408,9 +494,7 @@ def selfplay(params, rng_key, batch_size):
         )
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
-        w_masked = jnp.where(state.legal_action_mask, action_weights, 0.0)
-        total = jnp.sum(w_masked, axis=-1, keepdims=True) + 1e-10
-        p = jnp.where(state.legal_action_mask, w_masked / total, 0.0)
+        p = _masked_normalize(action_weights, state.legal_action_mask)
         root_visit_entropy = -jnp.sum(p * jnp.log(p + 1e-10), axis=-1)
         
         data = SelfplayOutput(
@@ -1199,6 +1283,8 @@ def main():
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
+        f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
+        f"_d{config.opening_dirichlet_steps}e{config.opening_dirichlet_epsilon:.2f}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
     logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
@@ -1245,12 +1331,16 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%.2f->%.2f, dirichlet=%s@alpha=%.2f eps=%.2f",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
+        config.selfplay_temperature_final,
+        config.opening_dirichlet_steps,
+        config.opening_dirichlet_alpha,
+        config.opening_dirichlet_epsilon,
     )
 
     while True:
