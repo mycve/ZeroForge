@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **Gumbel AlphaZero**: Gumbel-Top-k MCTS，探索在搜索内完成；根节点按 visit 权重 argmax，无温度、无采样
+- **Gumbel AlphaZero**: Gumbel-Top-k MCTS，搜索给出根分布；自对弈开局可在 top-k 根走法里按权重采样，评估保持确定性
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint 的完整状态保存，支持无差别恢复
 - **n-step TD**: MuZero 风格的 n-step 时序差分目标，平衡方差与偏差

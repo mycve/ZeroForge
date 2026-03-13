@@ -3,7 +3,7 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索，前 40 半步温度采样，后续 argmax
+- Gumbel-Top-k MCTS：搜索给出根分布，自对弈前几步对 top-k 根走法做加权采样，后续 argmax
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
@@ -78,12 +78,13 @@ class Config:
     training_batch_size: int = 4096
     td_lambda: float = 0.75
     
-    # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
+    # 自对弈与搜索：搜索后前期开局做 top-k 加权采样，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.5
+    selfplay_opening_steps: int = 12      # 前 8 半步从根分布 top-k 采样，后续直接 argmax
+    selfplay_opening_top_k: int = 3      # 开局仅在搜索后的前 k 个候选中采样
+    selfplay_opening_greedy_threshold: float = 0.75  # 最优走法权重过高时直接贪心，避免硬凑多样性
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_500_000
@@ -93,8 +94,8 @@ class Config:
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
-    eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
+    selfplay_gumbel_scale: float = 0.0   # 自对弈默认关闭 Gumbel 噪声，开局多样性由 top-k 采样提供
+    eval_gumbel_scale: float = 0.0       # 评估保持全确定性，结果更稳定
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
@@ -295,7 +296,7 @@ def selfplay(params, rng_key, batch_size):
     """
     高性能自玩算子：
     - lax.scan 消除 Python 循环开销
-    - Gumbel-Top-k：探索在搜索内完成，无需 Dirichlet/温度/根节点采样，根节点直接 argmax
+    - 搜索后前期开局只在 top-k 根走法中按权重采样，避免策略头直接随机带来的偏差
     """
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
@@ -326,25 +327,35 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
 
-        def _sample_action(w, legal_mask, sample_key):
-            # 在 log 空间做温度缩放，避免小概率动作下溢。
-            w_masked = jnp.where(legal_mask, w, 0.0)
-            log_w = jnp.log(w_masked + 1e-10) / config.selfplay_temperature
-            log_w = jnp.where(legal_mask, log_w, -jnp.inf)
-            log_w = log_w - jnp.max(log_w)
-            probs = jnp.exp(log_w)
-            probs = jnp.where(legal_mask, probs, 0.0)
-            probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
-            return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
+        def _sample_opening_action(w, legal_mask, sample_key):
+            # 仅在搜索后的前 k 个根候选中按权重采样，避免尾部低质走法被放大。
+            masked_w = jnp.where(legal_mask, w, -1.0)
+            top_weights, top_indices = jax.lax.top_k(masked_w, config.selfplay_opening_top_k)
+            top_weights = jnp.maximum(top_weights, 0.0)
+            greedy_action = top_indices[0].astype(jnp.int32)
+            total_top_weight = jnp.sum(top_weights)
 
-        # 前 40 半步增加根节点多样性，后续回到贪心走子。
+            def _sample_from_topk():
+                probs = top_weights / jnp.maximum(total_top_weight, 1e-10)
+                chosen = jax.random.choice(sample_key, config.selfplay_opening_top_k, p=probs)
+                return top_indices[chosen].astype(jnp.int32)
+
+            use_greedy = (top_weights[0] >= config.selfplay_opening_greedy_threshold) | (total_top_weight <= 0.0)
+            return jax.lax.cond(
+                use_greedy,
+                lambda _: greedy_action,
+                lambda _: _sample_from_topk(),
+                operand=0,
+            )
+
+        # 前若干半步增加开局多样性，后续回到贪心走子。
         sample_keys = jax.random.split(key_sample, batch_size)
-        sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
+        sampled_action = jax.vmap(_sample_opening_action)(action_weights, state.legal_action_mask, sample_keys)
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
         greedy_action = jnp.argmax(action_weights_masked, axis=-1)
-        use_temperature = state.step_count < config.selfplay_temperature_steps
-        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
+        use_opening_sampling = state.step_count < config.selfplay_opening_steps
+        action = jnp.where(only_one_move, action_idx, jnp.where(use_opening_sampling, sampled_action, greedy_action))
         
         actor = state.current_player
         
@@ -457,14 +468,14 @@ def compute_selfplay_stats(data: SelfplayOutput):
     
     返回 (stats[12], avg_length, entropy_all, entropy_opening, entropy_mid) 均为 float32
     stats: [总局数, 红胜, 黑胜, 和棋, ...]
-    entropy_opening: 前 temperature_steps 半步的熵均值，用于监控开局坍缩
+    entropy_opening: 前 opening_steps 半步的熵均值，用于监控开局坍缩
     entropy_mid: 后续局面的熵均值
     """
     term = data.terminated       # (max_steps, batch)
     winner = data.winner
     reasons = data.draw_reason
     max_steps = term.shape[0]
-    temp_steps = config.selfplay_temperature_steps
+    opening_steps = config.selfplay_opening_steps
 
     first_term = (jnp.cumsum(term, axis=0) == 1) & term
 
@@ -487,11 +498,11 @@ def compute_selfplay_stats(data: SelfplayOutput):
     game_lengths = jnp.where(term, step_idx, max_steps).astype(jnp.float32)
     avg_length = jnp.mean(jnp.min(game_lengths, axis=0))
 
-    # 分段熵：开局（前 temp_steps 半步）vs 中残局，便于监控开局坍缩
+    # 分段熵：开局（前 opening_steps 半步）vs 中残局，便于监控开局坍缩
     sc = data.step_count  # (max_steps, batch)
     ent = data.root_visit_entropy
-    opening_mask = sc < temp_steps
-    mid_mask = sc >= temp_steps
+    opening_mask = sc < opening_steps
+    mid_mask = sc >= opening_steps
     n_open = jnp.maximum(jnp.sum(opening_mask.astype(jnp.float32)), 1.0)
     n_mid = jnp.maximum(jnp.sum(mid_mask.astype(jnp.float32)), 1.0)
     entropy_all = jnp.mean(ent)
@@ -1085,12 +1096,13 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, opening_steps=%s, opening_top_k=%s, greedy_th=%s",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
-        config.selfplay_temperature_steps,
-        config.selfplay_temperature,
+        config.selfplay_opening_steps,
+        config.selfplay_opening_top_k,
+        config.selfplay_opening_greedy_threshold,
     )
 
     while True:
