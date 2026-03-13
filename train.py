@@ -3,12 +3,13 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索给出根分布，自对弈前几步对 top-k 根走法做加权采样，后续 argmax
+- Gumbel-Top-k MCTS：搜索内探索，前 20 半步温度采样，后续 argmax
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -74,28 +75,27 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
+    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.75
+    td_lambda: float = 0.85
     
-    # 自对弈与搜索：搜索后前期开局做 top-k 加权采样，后续 visit argmax
+    # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_opening_steps: int = 12      # 前 8 半步从根分布 top-k 采样，后续直接 argmax
-    selfplay_opening_top_k: int = 3      # 开局仅在搜索后的前 k 个候选中采样
-    selfplay_opening_greedy_threshold: float = 0.75  # 最优走法权重过高时直接贪心，避免硬凑多样性
+    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.5
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_500_000
+    replay_buffer_size: int = 1_000_000
     sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 0.0   # 自对弈默认关闭 Gumbel 噪声，开局多样性由 top-k 采样提供
-    eval_gumbel_scale: float = 0.0       # 评估保持全确定性，结果更稳定
+    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    eval_gumbel_scale: float = 0.10      # 评估仅保留极低扰动，结果更稳定
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
@@ -108,15 +108,26 @@ class Config:
     eval_games: int = 100
     past_model_offset: int = 20
     # Checkpoint 配置
-    ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
+    ckpt_interval: int = 20         # 每 N 次迭代保存 checkpoint
     max_to_keep: int = 20            # 最多保留 N 个 checkpoint
-    keep_period: int = 50           # 每 N 次迭代永久保留一个 checkpoint
+    keep_period: int = 100           # 每 N 次迭代永久保留一个 checkpoint
 
 config = Config()
 _QTRANSFORM = partial(
     mctx.qtransform_completed_by_mix_value,
     value_scale=config.qtransform_value_scale,
 )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="ZeroForge 训练入口")
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
+    )
+    return parser.parse_args()
 
 # ============================================================================
 # 环境和设备
@@ -296,7 +307,7 @@ def selfplay(params, rng_key, batch_size):
     """
     高性能自玩算子：
     - lax.scan 消除 Python 循环开销
-    - 搜索后前期开局只在 top-k 根走法中按权重采样，避免策略头直接随机带来的偏差
+    - Gumbel-Top-k：探索在搜索内完成，开局对根分布做温度采样，后续直接 argmax
     """
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
@@ -327,35 +338,25 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
 
-        def _sample_opening_action(w, legal_mask, sample_key):
-            # 仅在搜索后的前 k 个根候选中按权重采样，避免尾部低质走法被放大。
-            masked_w = jnp.where(legal_mask, w, -1.0)
-            top_weights, top_indices = jax.lax.top_k(masked_w, config.selfplay_opening_top_k)
-            top_weights = jnp.maximum(top_weights, 0.0)
-            greedy_action = top_indices[0].astype(jnp.int32)
-            total_top_weight = jnp.sum(top_weights)
+        def _sample_action(w, legal_mask, sample_key):
+            # 在 log 空间做温度缩放，避免小概率动作下溢。
+            w_masked = jnp.where(legal_mask, w, 0.0)
+            log_w = jnp.log(w_masked + 1e-10) / config.selfplay_temperature
+            log_w = jnp.where(legal_mask, log_w, -jnp.inf)
+            log_w = log_w - jnp.max(log_w)
+            probs = jnp.exp(log_w)
+            probs = jnp.where(legal_mask, probs, 0.0)
+            probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
+            return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
 
-            def _sample_from_topk():
-                probs = top_weights / jnp.maximum(total_top_weight, 1e-10)
-                chosen = jax.random.choice(sample_key, config.selfplay_opening_top_k, p=probs)
-                return top_indices[chosen].astype(jnp.int32)
-
-            use_greedy = (top_weights[0] >= config.selfplay_opening_greedy_threshold) | (total_top_weight <= 0.0)
-            return jax.lax.cond(
-                use_greedy,
-                lambda _: greedy_action,
-                lambda _: _sample_from_topk(),
-                operand=0,
-            )
-
-        # 前若干半步增加开局多样性，后续回到贪心走子。
+        # 前 20 半步增加根节点多样性，后续回到贪心走子。
         sample_keys = jax.random.split(key_sample, batch_size)
-        sampled_action = jax.vmap(_sample_opening_action)(action_weights, state.legal_action_mask, sample_keys)
+        sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
         greedy_action = jnp.argmax(action_weights_masked, axis=-1)
-        use_opening_sampling = state.step_count < config.selfplay_opening_steps
-        action = jnp.where(only_one_move, action_idx, jnp.where(use_opening_sampling, sampled_action, greedy_action))
+        use_temperature = state.step_count < config.selfplay_temperature_steps
+        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
         
         actor = state.current_player
         
@@ -468,14 +469,14 @@ def compute_selfplay_stats(data: SelfplayOutput):
     
     返回 (stats[12], avg_length, entropy_all, entropy_opening, entropy_mid) 均为 float32
     stats: [总局数, 红胜, 黑胜, 和棋, ...]
-    entropy_opening: 前 opening_steps 半步的熵均值，用于监控开局坍缩
+    entropy_opening: 前 temperature_steps 半步的熵均值，用于监控开局坍缩
     entropy_mid: 后续局面的熵均值
     """
     term = data.terminated       # (max_steps, batch)
     winner = data.winner
     reasons = data.draw_reason
     max_steps = term.shape[0]
-    opening_steps = config.selfplay_opening_steps
+    temp_steps = config.selfplay_temperature_steps
 
     first_term = (jnp.cumsum(term, axis=0) == 1) & term
 
@@ -498,11 +499,11 @@ def compute_selfplay_stats(data: SelfplayOutput):
     game_lengths = jnp.where(term, step_idx, max_steps).astype(jnp.float32)
     avg_length = jnp.mean(jnp.min(game_lengths, axis=0))
 
-    # 分段熵：开局（前 opening_steps 半步）vs 中残局，便于监控开局坍缩
+    # 分段熵：开局（前 temp_steps 半步）vs 中残局，便于监控开局坍缩
     sc = data.step_count  # (max_steps, batch)
     ent = data.root_visit_entropy
-    opening_mask = sc < opening_steps
-    mid_mask = sc >= opening_steps
+    opening_mask = sc < temp_steps
+    mid_mask = sc >= temp_steps
     n_open = jnp.maximum(jnp.sum(opening_mask.astype(jnp.float32)), 1.0)
     n_mid = jnp.maximum(jnp.sum(mid_mask.astype(jnp.float32)), 1.0)
     entropy_all = jnp.mean(ent)
@@ -547,6 +548,86 @@ def loss_fn(params, samples: Sample, rng_key):
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
     return total_loss, (policy_loss, value_loss)
+
+
+def _run_recent_checkpoint_eval(
+    current_params,
+    iteration: int,
+    rng_key,
+    ckpt_manager: ocp.CheckpointManager,
+    params_template: dict,
+    opt_state_template: dict,
+    iteration_elos: dict,
+):
+    """按设备分配最近 checkpoint 对手，执行红黑交换评估。"""
+    kept_steps = _get_kept_steps(config.ckpt_dir)
+    available_iters = sorted(k for k in kept_steps if k < iteration)
+    if not available_iters:
+        return None, rng_key
+
+    opponent_steps = _select_eval_opponent_steps(available_iters, num_devices)
+    opponent_params = _load_sharded_eval_opponents(
+        ckpt_manager, opponent_steps, params_template, opt_state_template
+    )
+
+    rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
+    batch_per_eval = config.eval_games
+    states = _build_eval_initial_states(batch_per_eval, sk7)
+    states_r = states
+    states_b = states
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
+        eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
+        states_r = jax.device_put_sharded(
+            [jax.tree.map(lambda x: x[i], states_r) for i in range(num_devices)], devices
+        )
+        states_b = jax.device_put_sharded(
+            [jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices
+        )
+
+    winners_r = evaluate(current_params, opponent_params, states_r, eval_keys_r)
+    winners_b = evaluate(opponent_params, current_params, states_b, eval_keys_b)
+
+    winners_r_np = np.array(jax.device_get(winners_r))
+    winners_b_np = np.array(jax.device_get(winners_b))
+    wins_red = int((winners_r_np == 0).sum())
+    draws_red = int((winners_r_np == -1).sum())
+    losses_red = int((winners_r_np == 1).sum())
+    wins_black = int((winners_b_np == 1).sum())
+    draws_black = int((winners_b_np == -1).sum())
+    losses_black = int((winners_b_np == 0).sum())
+
+    wins = wins_red + wins_black
+    draws = draws_red + draws_black
+    losses = losses_red + losses_black
+    total_games = int(config.eval_games * 2)
+    score = (wins + 0.5 * draws) / total_games
+    decisive_games = wins + losses
+    decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
+
+    ref_elos = [iteration_elos.get(step, 1500.0) for step in opponent_steps]
+    avg_ref_elo = float(np.mean(ref_elos)) if ref_elos else 1500.0
+    elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
+
+    metrics = {
+        "opponent_steps": opponent_steps,
+        "wins_red": wins_red,
+        "draws_red": draws_red,
+        "losses_red": losses_red,
+        "wins_black": wins_black,
+        "draws_black": draws_black,
+        "losses_black": losses_black,
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "total_games": total_games,
+        "score": score,
+        "decisive_win_rate": decisive_win_rate,
+        "avg_ref_elo": avg_ref_elo,
+        "elo": avg_ref_elo + elo_diff,
+    }
+    return metrics, rng_key
 
 def _build_eval_initial_states(batch_size: int, rng_key) -> "XiangqiState":
     """构建评估用初始状态（纯标准初始局面）"""
@@ -882,6 +963,68 @@ def _load_params_from_checkpoint(
     return restored["params"]
 
 
+def _resolve_checkpoint_source(spec: str, default_ckpt_dir: str) -> Tuple[str, int]:
+    """将 step 编号或 checkpoint 路径解析为 (ckpt_dir, step)。"""
+    if spec is None:
+        raise ValueError("checkpoint 来源不能为空")
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("checkpoint 来源不能为空字符串")
+
+    if spec.isdigit():
+        return os.path.abspath(default_ckpt_dir), int(spec)
+
+    abs_path = os.path.abspath(spec)
+    base = os.path.basename(abs_path)
+    if not base.isdigit():
+        raise ValueError(
+            f"无法解析 checkpoint: {spec}。请使用 step 编号，或形如 checkpoints/100 的目录路径。"
+        )
+    if not os.path.isdir(abs_path):
+        raise FileNotFoundError(f"checkpoint 目录不存在: {abs_path}")
+    return os.path.dirname(abs_path), int(base)
+
+
+def _load_init_params_from_source(
+    checkpoint_spec: str,
+    params_template: dict,
+    opt_state_template: dict,
+) -> Tuple[dict, str]:
+    """从指定 checkpoint 导入模型参数，用作训练初始权重。"""
+    ckpt_dir, step = _resolve_checkpoint_source(checkpoint_spec, config.ckpt_dir)
+    ckpt_manager = create_checkpoint_manager(ckpt_dir)
+    params = _load_params_from_checkpoint(ckpt_manager, step, params_template, opt_state_template)
+    source_desc = os.path.join(os.path.abspath(ckpt_dir), str(step))
+    return params, source_desc
+
+
+def _select_eval_opponent_steps(available_iters: List[int], device_count: int) -> List[int]:
+    """为每张设备选择一个最近 checkpoint；不足时循环补齐。"""
+    if not available_iters:
+        return []
+    recent = list(available_iters[-device_count:])
+    base = list(recent)
+    while len(recent) < device_count:
+        recent.append(base[(len(recent) - len(base)) % len(base)])
+    return recent
+
+
+def _load_sharded_eval_opponents(
+    ckpt_manager: ocp.CheckpointManager,
+    opponent_steps: List[int],
+    params_template: dict,
+    opt_state_template: dict,
+):
+    """按设备加载不同 checkpoint 参数，用于多对手评估。"""
+    params_per_device = [
+        _load_params_from_checkpoint(ckpt_manager, step, params_template, opt_state_template)
+        for step in opponent_steps
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return jax.device_put_sharded(params_per_device, devices)
+
+
 def restore_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     params_template: dict,
@@ -948,6 +1091,7 @@ def restore_checkpoint(
 # ============================================================================
 
 def main():
+    args = parse_args()
     logger.info("=" * 50)
     logger.info("ZeroForge - 现代高效架构")
     logger.info("特性: 3分支GNN + factorized policy head + 统一视角训练 + Gumbel-Top-k + TD(λ)")
@@ -1000,8 +1144,21 @@ def main():
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps = restored
         logger.info("[断点续训] 从 iteration=%s 继续训练", iteration)
+        if args.init_checkpoint:
+            logger.info("[Init] 检测到已有训练断点，忽略 --init-checkpoint=%s", args.init_checkpoint)
     else:
-        params = params_template
+        if args.init_checkpoint:
+            try:
+                params, init_source = _load_init_params_from_source(
+                    args.init_checkpoint, params_template, opt_state_template
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"无法导入基础模型 {args.init_checkpoint}，请确认 step 编号或 checkpoint 路径有效"
+                ) from e
+            logger.info("[Init] 已导入基础模型: %s；训练计数从 0 开始", init_source)
+        else:
+            params = params_template
         opt_state = opt_state_template
         iteration = 0
         frames = 0
@@ -1034,75 +1191,47 @@ def main():
     
     # 恢复后若轮到评估（如崩溃在 ckpt 保存后、eval 前），补跑评估
     if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
-        kept_steps = _get_kept_steps(config.ckpt_dir)
-        available_iters = sorted(k for k in kept_steps if k < iteration)
-        if available_iters:
-            logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
-            rated_iters = [k for k in available_iters if k in iteration_elos]
-            ref_iter = max(rated_iters, key=lambda k: iteration_elos[k]) if rated_iters else available_iters[-1]
-            ref_reason = "best_elo" if rated_iters else "latest_ckpt"
-            past_params = replicate_to_devices(_load_params_from_checkpoint(
-                ckpt_manager, ref_iter, params_template, opt_state_template
-            ))
-            rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
-            batch_per_eval = config.eval_games
-            states = _build_eval_initial_states(batch_per_eval, sk7)
-            states_r = states
-            states_b = states
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
-                eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
-                states_r = jax.device_put_sharded([jax.tree.map(lambda x: x[i], states_r) for i in range(num_devices)], devices)
-                states_b = jax.device_put_sharded([jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices)
-            try:
-                winners_r = evaluate(params, past_params, states_r, eval_keys_r)
-                winners_b = evaluate(past_params, params, states_b, eval_keys_b)
-            except Exception as e:
-                logger.exception("[评估错误] 补跑评估失败: %s", e)
-                raise RuntimeError("断点续训补跑评估异常") from e
-            wins_red = int((winners_r == 0).sum())
-            draws_red = int((winners_r == -1).sum())
-            losses_red = int((winners_r == 1).sum())
-            wins_black = int((winners_b == 1).sum())
-            draws_black = int((winners_b == -1).sum())
-            losses_black = int((winners_b == 0).sum())
-            wins = wins_red + wins_black
-            draws = draws_red + draws_black
-            losses = losses_red + losses_black
-            total_games = int(config.eval_games * 2)
-            score = (wins + 0.5 * draws) / total_games
-            decisive_games = wins + losses
-            decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
-            elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
-            iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
-            decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
-            logger.info(
-                "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 得分率 %.2f%% | ELO %.0f",
-                ref_iter,
-                ref_reason,
-                wins,
-                draws,
-                losses,
-                score * 100.0,
-                iteration_elos[iteration],
+        logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
+        try:
+            eval_metrics, rng_key = _run_recent_checkpoint_eval(
+                params, iteration, rng_key, ckpt_manager, params_template, opt_state_template, iteration_elos
             )
-            writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
-            writer.add_scalar("eval/win_rate", wins / total_games, iteration)
-            writer.add_scalar("eval/draw_rate", draws / total_games, iteration)
-            writer.add_scalar("eval/loss_rate", losses / total_games, iteration)
-            writer.add_scalar("eval/score", score, iteration)
-            if decisive_games > 0:
-                writer.add_scalar("eval/decisive_win_rate", decisive_win_rate, iteration)
+        except Exception as e:
+            logger.exception("[评估错误] 补跑评估失败: %s", e)
+            raise RuntimeError("断点续训补跑评估异常") from e
+        if eval_metrics is not None:
+            iteration_elos[iteration] = eval_metrics["elo"]
+            decisive_text = (
+                f'{eval_metrics["decisive_win_rate"]:.2%}'
+                if np.isfinite(eval_metrics["decisive_win_rate"])
+                else "N/A"
+            )
+            logger.info(
+                "评估 vs recent %s: W/D/L %s/%s/%s | 得分率 %.2f%% | AvgRefELO %.0f | ELO %.0f | 决胜胜率 %s",
+                eval_metrics["opponent_steps"],
+                eval_metrics["wins"],
+                eval_metrics["draws"],
+                eval_metrics["losses"],
+                eval_metrics["score"] * 100.0,
+                eval_metrics["avg_ref_elo"],
+                eval_metrics["elo"],
+                decisive_text,
+            )
+            writer.add_scalar("eval/elo", eval_metrics["elo"], iteration)
+            writer.add_scalar("eval/win_rate", eval_metrics["wins"] / eval_metrics["total_games"], iteration)
+            writer.add_scalar("eval/draw_rate", eval_metrics["draws"] / eval_metrics["total_games"], iteration)
+            writer.add_scalar("eval/loss_rate", eval_metrics["losses"] / eval_metrics["total_games"], iteration)
+            writer.add_scalar("eval/score", eval_metrics["score"], iteration)
+            if np.isfinite(eval_metrics["decisive_win_rate"]):
+                writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, opening_steps=%s, opening_top_k=%s, greedy_th=%s",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
-        config.selfplay_opening_steps,
-        config.selfplay_opening_top_k,
-        config.selfplay_opening_greedy_threshold,
+        config.selfplay_temperature_steps,
+        config.selfplay_temperature,
     )
 
     while True:
@@ -1285,93 +1414,47 @@ def main():
             iteration_elos = {k: v for k, v in iteration_elos.items() if k in kept_steps}
         
         if iteration % config.eval_interval == 0:
-            # 评估对手优先选择“历史最佳模型”（按 iteration_elos），
-            # 若无可用 ELO 记录，则退化为最近历史 checkpoint。对手从 orbax checkpoint 加载。
-            kept_steps = _get_kept_steps(config.ckpt_dir)
-            available_iters = sorted(k for k in kept_steps if k < iteration)
-            if available_iters:
-                rated_iters = [k for k in available_iters if k in iteration_elos]
-                if rated_iters:
-                    ref_iter = max(rated_iters, key=lambda k: iteration_elos[k])
-                    ref_reason = "best_elo"
-                else:
-                    ref_iter = available_iters[-1]
-                    ref_reason = "latest_ckpt"
+            try:
+                eval_metrics, rng_key = _run_recent_checkpoint_eval(
+                    params, iteration, rng_key, ckpt_manager, params_template, opt_state_template, iteration_elos
+                )
+            except Exception as e:
+                logger.error("[评估错误] 当前模型 dtype=%s, action_size=%s", config.network_dtype, ACTION_SPACE_SIZE)
+                logger.error("[评估错误] params dtype: %s", jax.tree.leaves(params)[0].dtype)
+                raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
 
-                past_params = replicate_to_devices(_load_params_from_checkpoint(
-                    ckpt_manager, ref_iter, params_template, opt_state_template
-                ))
-                rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
-                batch_per_eval = config.eval_games
-                states = _build_eval_initial_states(batch_per_eval, sk7)
-                states_r = states
-                states_b = states
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", DeprecationWarning)
-                    eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
-                    eval_keys_b = jax.device_put_sharded(list(jax.random.split(sk6, num_devices)), devices)
-                    states_r = jax.device_put_sharded(
-                        [jax.tree.map(lambda x: x[i], states_r) for i in range(num_devices)], devices
-                    )
-                    states_b = jax.device_put_sharded(
-                        [jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices
-                    )
-                
-                try:
-                    winners_r = evaluate(params, past_params, states_r, eval_keys_r)
-                    winners_b = evaluate(past_params, params, states_b, eval_keys_b)
-                except Exception as e:
-                    logger.error("[评估错误] 当前模型 dtype=%s, action_size=%s", config.network_dtype, ACTION_SPACE_SIZE)
-                    logger.error("[评估错误] params dtype: %s", jax.tree.leaves(params)[0].dtype)
-                    logger.error("[评估错误] past_params dtype: %s", jax.tree.leaves(past_params)[0].dtype)
-                    raise RuntimeError("评估阶段发生异常，请检查 GPU/Triton 与模型参数兼容性") from e
-
-                # 当前模型先手（红）与后手（黑）拆分统计，避免“和棋被误判为输”。
-                wins_red = int((winners_r == 0).sum())
-                draws_red = int((winners_r == -1).sum())
-                losses_red = int((winners_r == 1).sum())
-                wins_black = int((winners_b == 1).sum())
-                draws_black = int((winners_b == -1).sum())
-                losses_black = int((winners_b == 0).sum())
-
-                wins = wins_red + wins_black
-                draws = draws_red + draws_black
-                losses = losses_red + losses_black
-                total_games = int(config.eval_games * 2)
-
-                win_rate = wins / total_games
-                draw_rate = draws / total_games
-                loss_rate = losses / total_games
-                score = (wins + 0.5 * draws) / total_games
-                decisive_games = wins + losses
-                decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
-
-                elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
-                iteration_elos[iteration] = iteration_elos.get(ref_iter, 1500.0) + elo_diff
+            if eval_metrics is not None:
+                iteration_elos[iteration] = eval_metrics["elo"]
+                win_rate = eval_metrics["wins"] / eval_metrics["total_games"]
+                draw_rate = eval_metrics["draws"] / eval_metrics["total_games"]
+                loss_rate = eval_metrics["losses"] / eval_metrics["total_games"]
+                score = eval_metrics["score"]
+                decisive_games = eval_metrics["wins"] + eval_metrics["losses"]
+                decisive_win_rate = eval_metrics["decisive_win_rate"]
                 decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
                 logger.info(
-                    "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 胜率 %.2f%% 和率 %.2f%% 负率 %.2f%% | "
-                    "得分率 %.2f%% | 决胜局胜率 %s | ELO %.0f",
-                    ref_iter,
-                    ref_reason,
-                    wins,
-                    draws,
-                    losses,
+                    "评估 vs recent %s: W/D/L %s/%s/%s | 胜率 %.2f%% 和率 %.2f%% 负率 %.2f%% | "
+                    "得分率 %.2f%% | 决胜局胜率 %s | AvgRefELO %.0f | ELO %.0f",
+                    eval_metrics["opponent_steps"],
+                    eval_metrics["wins"],
+                    eval_metrics["draws"],
+                    eval_metrics["losses"],
                     win_rate * 100.0,
                     draw_rate * 100.0,
                     loss_rate * 100.0,
                     score * 100.0,
                     decisive_text,
+                    eval_metrics["avg_ref_elo"],
                     iteration_elos[iteration],
                 )
                 logger.info(
                     "  先手(当前红) W/D/L %s/%s/%s | 后手(当前黑) W/D/L %s/%s/%s",
-                    wins_red,
-                    draws_red,
-                    losses_red,
-                    wins_black,
-                    draws_black,
-                    losses_black,
+                    eval_metrics["wins_red"],
+                    eval_metrics["draws_red"],
+                    eval_metrics["losses_red"],
+                    eval_metrics["wins_black"],
+                    eval_metrics["draws_black"],
+                    eval_metrics["losses_black"],
                 )
                 writer.add_scalar("eval/elo", iteration_elos[iteration], iteration)
                 writer.add_scalar("eval/win_rate", win_rate, iteration)

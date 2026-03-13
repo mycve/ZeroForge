@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **Gumbel AlphaZero**: Gumbel-Top-k MCTS，搜索给出根分布；自对弈开局可在 top-k 根走法里按权重采样，评估保持确定性
+- **Gumbel AlphaZero**: Gumbel-Top-k MCTS，自对弈开局对根分布做温度采样；评估仅保留极低扰动
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint 的完整状态保存，支持无差别恢复
 - **n-step TD**: MuZero 风格的 n-step 时序差分目标，平衡方差与偏差
@@ -38,6 +38,20 @@ python train.py
 - 检测并恢复已有 checkpoint（断点续训）
 - 保存 checkpoint 到 `checkpoints/` 目录
 - 输出日志到 TensorBoard
+
+也可以导入一个指定模型作为基础模型，再从 `iteration=0` 开始自玩训练：
+
+```bash
+# 使用当前 checkpoints 目录下的 step
+python train.py --init-checkpoint 100
+
+# 或直接指定 checkpoint 目录
+python train.py --init-checkpoint checkpoints/100
+```
+
+说明：
+- 如果当前 `checkpoints/` 里已经存在可恢复的训练断点，仍然会优先断点续训
+- `--init-checkpoint` 只在“没有现成训练断点”时生效
 
 ### 3. 监控训练
 
