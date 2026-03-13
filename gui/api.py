@@ -466,6 +466,14 @@ def get_legal_moves_list(jax_state: XiangqiState) -> List[dict]:
     return moves
 
 
+def _move_endpoints(fs, ts) -> tuple[int, int, int, int, int, int]:
+    """将动作端点统一转换为原生 Python int，避免 JSON 序列化异常。"""
+    fs, ts = int(fs), int(ts)
+    fr, fc = fs // 9, fs % 9
+    tr, tc = ts // 9, ts % 9
+    return fs, ts, fr, fc, tr, tc
+
+
 # ============================================================================
 # MCTS 推理
 # ============================================================================
@@ -624,14 +632,12 @@ def get_ai_action(
             if return_policy:
 
                 fs, ts = action_to_move(action)
-
-                fr, fc = fs // 9, fs % 9
-                tr, tc = ts // 9, ts % 9
+                fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
 
                 policy_info = {
                     "top_moves": [
                         {
-                            "action": action,
+                            "action": int(action),
                             "uci": move_to_uci(fs, ts),
                             "weight": 1.0,
                             "prior": 1.0,
@@ -744,9 +750,7 @@ def get_ai_action(
                     continue
 
                 fs, ts = action_to_move(int(idx))
-
-                fr, fc = fs // 9, fs % 9
-                tr, tc = ts // 9, ts % 9
+                fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
 
                 top_moves.append(
                     {
@@ -1172,9 +1176,7 @@ async def ai_think(req: AIThinkRequest):
         for idx in top_indices:
             if prior_probs[idx] > 1e-6:
                 fs, ts = action_to_move(int(idx))
-                fs, ts = int(fs), int(ts)
-                fr, fc = fs // 9, fs % 9
-                tr, tc = ts // 9, ts % 9
+                fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
                 top_moves.append({
                     "action": int(idx),
                     "uci": move_to_uci(fs, ts),
