@@ -80,20 +80,20 @@ class Config:
     
     # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
-    num_simulations: int = 96            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 24                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 40  # 前 40 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.2
+    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.5
     
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000
+    replay_buffer_size: int = 1_500_000
     sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
-    qtransform_value_scale: float = 0.15   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.5   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
+    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.10         # 评估关闭 Gumbel 噪声，结果更稳定
     
     # 环境规则（符合象棋竞赛规则）
@@ -276,6 +276,7 @@ class SelfplayOutput(NamedTuple):
     root_value: jnp.ndarray       # MCTS 搜索后的标量价值估计
     root_wdl: jnp.ndarray        # 网络原始 WDL 概率 (B,3)，用于 WDL TD(λ) bootstrap
     root_visit_entropy: jnp.ndarray  # 根节点 visit 分布熵，用于监控探索程度
+    step_count: jnp.ndarray       # 当前局面步数（半步），用于分段熵统计
 
 class Sample(NamedTuple):
     """训练样本（从 SelfplayOutput 经 compute_targets 得到）"""
@@ -372,6 +373,7 @@ def selfplay(params, rng_key, batch_size):
             root_value=root_value,
             root_wdl=root_wdl,
             root_visit_entropy=root_visit_entropy,
+            step_count=state.step_count,
         )
         
         # 结束后直接重置为标准初始局面
@@ -453,16 +455,19 @@ def compute_targets(data: SelfplayOutput):
 def compute_selfplay_stats(data: SelfplayOutput):
     """在 GPU 上计算自对弈统计标量，仅传回 ~100 字节而非 ~3GB 原始数据
     
-    返回 (stats[12], avg_length, root_visit_entropy_mean) 均为 float32
-    stats: [总局数, 红胜, 黑胜, 和棋, 步数到限, 无吃子到限, 重复和棋, 长将判负, ...]
+    返回 (stats[12], avg_length, entropy_all, entropy_opening, entropy_mid) 均为 float32
+    stats: [总局数, 红胜, 黑胜, 和棋, ...]
+    entropy_opening: 前 temperature_steps 半步的熵均值，用于监控开局坍缩
+    entropy_mid: 后续局面的熵均值
     """
     term = data.terminated       # (max_steps, batch)
     winner = data.winner
     reasons = data.draw_reason
     max_steps = term.shape[0]
-    
+    temp_steps = config.selfplay_temperature_steps
+
     first_term = (jnp.cumsum(term, axis=0) == 1) & term
-    
+
     stats = jnp.stack([
         first_term.sum(),                            # 总对局数
         (first_term & (winner == 0)).sum(),          # 红胜
@@ -477,14 +482,23 @@ def compute_selfplay_stats(data: SelfplayOutput):
         (first_term & (reasons == 7)).sum(),         # 将捉交替判负
         (first_term & (reasons == 8)).sum(),         # 将死/困毙
     ]).astype(jnp.float32)
-    
+
     step_idx = jnp.arange(max_steps)[:, None]
     game_lengths = jnp.where(term, step_idx, max_steps).astype(jnp.float32)
     avg_length = jnp.mean(jnp.min(game_lengths, axis=0))
-    
-    root_visit_entropy_mean = jnp.mean(data.root_visit_entropy)
-    
-    return stats, avg_length, root_visit_entropy_mean
+
+    # 分段熵：开局（前 temp_steps 半步）vs 中残局，便于监控开局坍缩
+    sc = data.step_count  # (max_steps, batch)
+    ent = data.root_visit_entropy
+    opening_mask = sc < temp_steps
+    mid_mask = sc >= temp_steps
+    n_open = jnp.maximum(jnp.sum(opening_mask.astype(jnp.float32)), 1.0)
+    n_mid = jnp.maximum(jnp.sum(mid_mask.astype(jnp.float32)), 1.0)
+    entropy_all = jnp.mean(ent)
+    entropy_opening = jnp.sum(jnp.where(opening_mask, ent, 0.0)) / n_open
+    entropy_mid = jnp.sum(jnp.where(mid_mask, ent, 0.0)) / n_mid
+
+    return stats, avg_length, entropy_all, entropy_opening, entropy_mid
 
 # ============================================================================
 # 训练与评估
@@ -761,6 +775,21 @@ class TrainState(NamedTuple):
     total_opt_steps: int            # 累计优化步数（用于 LR 调度）
 
 
+def _get_kept_steps(ckpt_dir: str) -> set:
+    """从磁盘直接扫描 checkpoint 目录，获取实际存在的 step 集合。
+    避免 orbax all_steps(reload=True) 在异步删除/元数据缺失时报 FileNotFoundError。"""
+    ckpt_root = os.path.abspath(ckpt_dir)
+    if not os.path.isdir(ckpt_root):
+        return set()
+    steps = set()
+    for name in os.listdir(ckpt_root):
+        if name.isdigit():
+            path = os.path.join(ckpt_root, name)
+            if os.path.isdir(path):
+                steps.add(int(name))
+    return steps
+
+
 def create_checkpoint_manager(ckpt_dir: str) -> ocp.CheckpointManager:
     """创建 orbax checkpoint manager
     
@@ -809,7 +838,7 @@ def save_checkpoint(
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
     
     # 单文件 metadata.json：iteration_elos、total_opt_steps（仅保留 orbax 保留的 step 对应的 elo）
-    kept_steps = set(ckpt_manager.all_steps(read=True))
+    kept_steps = _get_kept_steps(config.ckpt_dir)
     elos_to_save = {k: v for k, v in train_state.iteration_elos.items() if k in kept_steps}
     meta_path = os.path.join(os.path.abspath(config.ckpt_dir), "metadata.json")
     with open(meta_path, "w") as f:
@@ -994,7 +1023,7 @@ def main():
     
     # 恢复后若轮到评估（如崩溃在 ckpt 保存后、eval 前），补跑评估
     if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
-        kept_steps = set(ckpt_manager.all_steps(read=True))
+        kept_steps = _get_kept_steps(config.ckpt_dir)
         available_iters = sorted(k for k in kept_steps if k < iteration)
         if available_iters:
             logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
@@ -1099,11 +1128,13 @@ def main():
         new_frames = config.max_steps * config.selfplay_batch_size
 
         # 只传输统计标量（~100 字节），不再传输完整 data（~3GB）
-        stats_dev, avg_len_dev, entropy_dev = gpu_stats
+        stats_dev, avg_len_dev, ent_all_dev, ent_open_dev, ent_mid_dev = gpu_stats
         stats_np = np.array(jax.device_get(stats_dev))
         stats = stats_np.sum(axis=0).astype(np.int64)   # 跨设备求和
         avg_length = float(jax.device_get(avg_len_dev).mean())
-        root_visit_entropy = float(jax.device_get(entropy_dev).mean())
+        root_visit_entropy = float(jax.device_get(ent_all_dev).mean())
+        entropy_opening = float(jax.device_get(ent_open_dev).mean())
+        entropy_mid = float(jax.device_get(ent_mid_dev).mean())
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
@@ -1179,7 +1210,7 @@ def main():
         total_elapsed = time.time() - start_time_total
         logger.info(
             "iter=%3d | ploss=%.4f vloss=%.4f | len=%4.1f fps=%4.0f "
-            "buf=%dk train=%d | ent=%.3f | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
+            "buf=%dk train=%d | ent=%.3f(开%.3f/中%.3f) | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
             iteration,
             policy_loss,
             value_loss,
@@ -1188,6 +1219,8 @@ def main():
             buf_stats["size"] // 1000,
             num_updates,
             root_visit_entropy,
+            entropy_opening,
+            entropy_mid,
             r_wins,
             b_wins,
             draws,
@@ -1203,6 +1236,8 @@ def main():
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
         writer.add_scalar("stats/root_visit_entropy", root_visit_entropy, iteration)
+        writer.add_scalar("stats/entropy_opening", entropy_opening, iteration)
+        writer.add_scalar("stats/entropy_mid", entropy_mid, iteration)
         writer.add_scalar("replay/buffer_size", buf_stats['size'], iteration)
         
         # 胜负和统计 (数量)
@@ -1234,13 +1269,13 @@ def main():
             )
             save_checkpoint(ckpt_manager, train_state, iteration)
             # 裁剪 iteration_elos，与 orbax 保留数量一致，避免内存膨胀
-            kept_steps = set(ckpt_manager.all_steps(read=True))
+            kept_steps = _get_kept_steps(config.ckpt_dir)
             iteration_elos = {k: v for k, v in iteration_elos.items() if k in kept_steps}
         
         if iteration % config.eval_interval == 0:
             # 评估对手优先选择“历史最佳模型”（按 iteration_elos），
             # 若无可用 ELO 记录，则退化为最近历史 checkpoint。对手从 orbax checkpoint 加载。
-            kept_steps = set(ckpt_manager.all_steps(read=True))
+            kept_steps = _get_kept_steps(config.ckpt_dir)
             available_iters = sorted(k for k in kept_steps if k < iteration)
             if available_iters:
                 rated_iters = [k for k in available_iters if k in iteration_elos]
