@@ -75,7 +75,7 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
+    lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
     td_lambda: float = 0.75
     
@@ -83,10 +83,8 @@ class Config:
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 30  # 前 30 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.5
-    opening_force_random_steps: int = 0   # 前 N 半步强制在 top-k 中均匀随机；0=关闭
-    opening_force_random_top_k: int = 3   # 强制随机时仅在前 k 个候选中选
+    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.0
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_000_000
@@ -134,8 +132,6 @@ def parse_args():
     parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
-    parser.add_argument("--opening-force-random-steps", type=int, default=None, help="前 N 半步强制在 top-k 候选中均匀随机")
-    parser.add_argument("--opening-force-random-top-k", type=int, default=None, help="强制随机时的 top-k")
     return parser.parse_args()
 
 
@@ -153,8 +149,6 @@ def apply_cli_overrides(args):
         "selfplay_temperature_steps": args.selfplay_temperature_steps,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
         "eval_gumbel_scale": args.eval_gumbel_scale,
-        "opening_force_random_steps": args.opening_force_random_steps,
-        "opening_force_random_top_k": args.opening_force_random_top_k,
     }
     applied = {}
     for key, value in overrides.items():
@@ -225,14 +219,6 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
-if config.opening_force_random_steps < 0:
-    raise ValueError(f"opening_force_random_steps 必须 >= 0，当前值: {config.opening_force_random_steps}")
-if config.opening_force_random_top_k < 1:
-    raise ValueError(f"opening_force_random_top_k 必须 >= 1，当前值: {config.opening_force_random_top_k}")
-if config.opening_force_random_top_k > ACTION_SPACE_SIZE:
-    raise ValueError(
-        f"opening_force_random_top_k 不能超过动作空间 {ACTION_SPACE_SIZE}，当前值: {config.opening_force_random_top_k}"
-    )
 # 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
 # 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -400,30 +386,14 @@ def selfplay(params, rng_key, batch_size):
             probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
             return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
 
-        def _sample_forced_random_action(w, legal_mask, sample_key):
-            # 仅在搜索 top-k 候选内均匀随机，强行拉开最前期的开局分支。
-            w_masked = jnp.where(legal_mask, w, -1.0)
-            _, top_idx = jax.lax.top_k(w_masked, config.opening_force_random_top_k)
-            top_is_legal = legal_mask[top_idx]
-            top_probs = top_is_legal.astype(jnp.float32)
-            top_probs = top_probs / jnp.maximum(jnp.sum(top_probs), 1.0)
-            chosen = jax.random.choice(sample_key, config.opening_force_random_top_k, p=top_probs)
-            return top_idx[chosen]
-
         # 前 20 半步增加根节点多样性，后续回到贪心走子。
         sample_keys = jax.random.split(key_sample, batch_size)
         sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
-        forced_random_action = jax.vmap(_sample_forced_random_action)(action_weights, state.legal_action_mask, sample_keys)
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
         greedy_action = jnp.argmax(action_weights_masked, axis=-1)
-        use_forced_random = state.step_count < config.opening_force_random_steps
         use_temperature = state.step_count < config.selfplay_temperature_steps
-        action = jnp.where(
-            only_one_move,
-            action_idx,
-            jnp.where(use_forced_random, forced_random_action, jnp.where(use_temperature, sampled_action, greedy_action)),
-        )
+        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
         
         actor = state.current_player
         
@@ -617,7 +587,7 @@ def loss_fn(params, samples: Sample, rng_key):
     return total_loss, (policy_loss, value_loss)
 
 
-def _run_recent_checkpoint_eval(
+def _run_best_checkpoint_eval(
     current_params,
     iteration: int,
     rng_key,
@@ -626,15 +596,22 @@ def _run_recent_checkpoint_eval(
     opt_state_template: dict,
     iteration_elos: dict,
 ):
-    """按设备分配最近 checkpoint 对手，执行红黑交换评估。"""
+    """选择历史最强 checkpoint 作为单一对手，执行红黑交换评估。"""
     kept_steps = _get_kept_steps(config.ckpt_dir)
     available_iters = sorted(k for k in kept_steps if k < iteration)
     if not available_iters:
         return None, rng_key
 
-    opponent_steps = _select_eval_opponent_steps(available_iters, num_devices)
-    opponent_params = _load_sharded_eval_opponents(
-        ckpt_manager, opponent_steps, params_template, opt_state_template
+    rated_iters = [k for k in available_iters if k in iteration_elos]
+    if rated_iters:
+        ref_iter = max(rated_iters, key=lambda k: iteration_elos[k])
+        ref_reason = "best_elo"
+    else:
+        ref_iter = available_iters[-1]
+        ref_reason = "latest_ckpt"
+
+    opponent_params = replicate_to_devices(
+        _load_params_from_checkpoint(ckpt_manager, ref_iter, params_template, opt_state_template)
     )
 
     rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
@@ -673,12 +650,12 @@ def _run_recent_checkpoint_eval(
     decisive_games = wins + losses
     decisive_win_rate = wins / decisive_games if decisive_games > 0 else float("nan")
 
-    ref_elos = [iteration_elos.get(step, 1500.0) for step in opponent_steps]
-    avg_ref_elo = float(np.mean(ref_elos)) if ref_elos else 1500.0
+    ref_elo = float(iteration_elos.get(ref_iter, 1500.0))
     elo_diff = 400.0 * np.log10(score / (1.0 - score)) if 0 < score < 1 else (400 if score >= 1 else -400)
 
     metrics = {
-        "opponent_steps": opponent_steps,
+        "ref_iter": ref_iter,
+        "ref_reason": ref_reason,
         "wins_red": wins_red,
         "draws_red": draws_red,
         "losses_red": losses_red,
@@ -691,8 +668,8 @@ def _run_recent_checkpoint_eval(
         "total_games": total_games,
         "score": score,
         "decisive_win_rate": decisive_win_rate,
-        "avg_ref_elo": avg_ref_elo,
-        "elo": avg_ref_elo + elo_diff,
+        "ref_elo": ref_elo,
+        "elo": ref_elo + elo_diff,
     }
     return metrics, rng_key
 
@@ -1065,33 +1042,6 @@ def _load_init_params_from_source(
     return params, source_desc
 
 
-def _select_eval_opponent_steps(available_iters: List[int], device_count: int) -> List[int]:
-    """为每张设备选择一个最近 checkpoint；不足时循环补齐。"""
-    if not available_iters:
-        return []
-    recent = list(available_iters[-device_count:])
-    base = list(recent)
-    while len(recent) < device_count:
-        recent.append(base[(len(recent) - len(base)) % len(base)])
-    return recent
-
-
-def _load_sharded_eval_opponents(
-    ckpt_manager: ocp.CheckpointManager,
-    opponent_steps: List[int],
-    params_template: dict,
-    opt_state_template: dict,
-):
-    """按设备加载不同 checkpoint 参数，用于多对手评估。"""
-    params_per_device = [
-        _load_params_from_checkpoint(ckpt_manager, step, params_template, opt_state_template)
-        for step in opponent_steps
-    ]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return jax.device_put_sharded(params_per_device, devices)
-
-
 def restore_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     params_template: dict,
@@ -1261,7 +1211,7 @@ def main():
     if restored is not None and iteration % config.eval_interval == 0 and iteration > 0:
         logger.info("[断点续训] 补跑 iteration=%s 的评估...", iteration)
         try:
-            eval_metrics, rng_key = _run_recent_checkpoint_eval(
+            eval_metrics, rng_key = _run_best_checkpoint_eval(
                 params, iteration, rng_key, ckpt_manager, params_template, opt_state_template, iteration_elos
             )
         except Exception as e:
@@ -1275,13 +1225,14 @@ def main():
                 else "N/A"
             )
             logger.info(
-                "评估 vs recent %s: W/D/L %s/%s/%s | 得分率 %.2f%% | AvgRefELO %.0f | ELO %.0f | 决胜胜率 %s",
-                eval_metrics["opponent_steps"],
+                "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 得分率 %.2f%% | RefELO %.0f | ELO %.0f | 决胜胜率 %s",
+                eval_metrics["ref_iter"],
+                eval_metrics["ref_reason"],
                 eval_metrics["wins"],
                 eval_metrics["draws"],
                 eval_metrics["losses"],
                 eval_metrics["score"] * 100.0,
-                eval_metrics["avg_ref_elo"],
+                eval_metrics["ref_elo"],
                 eval_metrics["elo"],
                 decisive_text,
             )
@@ -1294,14 +1245,12 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s, forced_random_steps=%s, forced_random_top_k=%s",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
-        config.opening_force_random_steps,
-        config.opening_force_random_top_k,
     )
 
     while True:
@@ -1485,7 +1434,7 @@ def main():
         
         if iteration % config.eval_interval == 0:
             try:
-                eval_metrics, rng_key = _run_recent_checkpoint_eval(
+                eval_metrics, rng_key = _run_best_checkpoint_eval(
                     params, iteration, rng_key, ckpt_manager, params_template, opt_state_template, iteration_elos
                 )
             except Exception as e:
@@ -1503,9 +1452,10 @@ def main():
                 decisive_win_rate = eval_metrics["decisive_win_rate"]
                 decisive_text = f"{decisive_win_rate:.2%}" if decisive_games > 0 else "N/A"
                 logger.info(
-                    "评估 vs recent %s: W/D/L %s/%s/%s | 胜率 %.2f%% 和率 %.2f%% 负率 %.2f%% | "
-                    "得分率 %.2f%% | 决胜局胜率 %s | AvgRefELO %.0f | ELO %.0f",
-                    eval_metrics["opponent_steps"],
+                    "评估 vs Iter %s (%s): W/D/L %s/%s/%s | 胜率 %.2f%% 和率 %.2f%% 负率 %.2f%% | "
+                    "得分率 %.2f%% | 决胜局胜率 %s | RefELO %.0f | ELO %.0f",
+                    eval_metrics["ref_iter"],
+                    eval_metrics["ref_reason"],
                     eval_metrics["wins"],
                     eval_metrics["draws"],
                     eval_metrics["losses"],
@@ -1514,7 +1464,7 @@ def main():
                     loss_rate * 100.0,
                     score * 100.0,
                     decisive_text,
-                    eval_metrics["avg_ref_elo"],
+                    eval_metrics["ref_elo"],
                     iteration_elos[iteration],
                 )
                 logger.info(
