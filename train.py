@@ -37,7 +37,6 @@ os.makedirs(cache_dir, exist_ok=True)
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
 from xiangqi.mirror import mirror_observation, mirror_policy
-from xiangqi.fen import load_fens_from_file, parse_fen
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
 
@@ -50,6 +49,9 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger("zeroforge")
+# 屏蔽第三方库的控制台输出（orbax、jax、absl 等）
+for _name in ("jax", "jax._src", "orbax", "orbax.checkpoint", "mctx", "absl", "absl.logging"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 # ============================================================================
 # 配置
@@ -78,8 +80,8 @@ class Config:
     
     # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
-    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    num_simulations: int = 96            # Gumbel 低模拟即可，快速生成对局更重要
+    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 40  # 前 40 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.2
     
@@ -104,8 +106,6 @@ class Config:
     eval_interval: int = 20
     eval_games: int = 100
     past_model_offset: int = 20
-    eval_fen_file: Optional[str] = "openings_generated.txt"  # 若指定，从该文件批量加载 FEN 作为起始局面，先后手轮换
-    
     # Checkpoint 配置
     ckpt_interval: int = 10         # 每 N 次迭代保存 checkpoint
     max_to_keep: int = 20            # 最多保留 N 个 checkpoint
@@ -523,85 +523,17 @@ def loss_fn(params, samples: Sample, rng_key):
     total_loss = policy_loss + config.value_loss_weight * value_loss
     return total_loss, (policy_loss, value_loss)
 
-def _build_eval_initial_states(
-    fen_file: Optional[str],
-    batch_size: int,
-    rng_key,
-    for_current_red: bool,
-) -> "XiangqiState":
-    """
-    构建评估用初始状态，支持 FEN 批量导入与先后手轮换。
-    
-    Args:
-        fen_file: FEN 文件路径，None 则用标准初始局面
-        batch_size: 每侧局数（current=red 或 current=black 各 batch_size 局）
-        rng_key: 随机 key（用于标准局面时的 init）
-        for_current_red: True=当前模型执红，False=当前模型执黑
-        
-    Returns:
-        已按设备分片的 XiangqiState，可直接传入 evaluate
-    """
+def _build_eval_initial_states(batch_size: int, rng_key) -> "XiangqiState":
+    """构建评估用初始状态（纯标准初始局面）"""
     batch_per_device = batch_size // num_devices
     if batch_per_device * num_devices != batch_size:
         raise ValueError(f"batch_size {batch_size} 必须整除 num_devices {num_devices}")
-    
-    if fen_file and os.path.exists(fen_file):
-        # 从 FEN 文件加载，先后手轮换
-        fens = load_fens_from_file(fen_file)
-        if not fens:
-            raise ValueError(f"FEN 文件为空: {fen_file}")
-        if for_current_red:
-            logger.info("[评估] FEN 文件 %s 共 %s 条局面，先后手轮换", fen_file, len(fens))
-        # 先后手轮换：偶数索引→current=red，奇数索引→current=black
-        boards_r, players_r = [], []
-        boards_b, players_b = [], []
-        for i, (board, player) in enumerate(fens):
-            if i % 2 == 0:
-                # 当前模型执红：需红方行棋，否则镜像
-                if player == 0:
-                    boards_r.append(board)
-                    players_r.append(0)
-                else:
-                    b_mirror = np.array(-np.flip(board, axis=-1), dtype=np.int8)
-                    boards_r.append(b_mirror)
-                    players_r.append(0)
-            else:
-                # 当前模型执黑：需黑方行棋，否则镜像
-                if player == 1:
-                    boards_b.append(board)
-                    players_b.append(1)
-                else:
-                    b_mirror = np.array(-np.flip(board, axis=-1), dtype=np.int8)
-                    boards_b.append(b_mirror)
-                    players_b.append(1)
-        # 选对应侧并补齐到 batch_size
-        if for_current_red:
-            boards, players = boards_r, players_r
-        else:
-            boards, players = boards_b, players_b
-        # 用标准局面补齐
-        std_board, _ = parse_fen("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w")
-        while len(boards) < batch_size:
-            boards.append(std_board)
-            players.append(0 if for_current_red else 1)
-        boards = np.stack(boards[:batch_size], axis=0).astype(np.int8)
-        players = np.array(players[:batch_size], dtype=np.int32)
-        boards_jax = jnp.array(boards)
-        players_jax = jnp.array(players)
-        states_flat = jax.vmap(env.init_from_board)(boards_jax, players_jax)
-    elif fen_file:
-        logger.warning("[评估] FEN 文件不存在 %s，改用标准初始局面", fen_file)
-        keys = jax.random.split(rng_key, batch_size)
-        states_flat = jax.vmap(env.init)(keys)
-    else:
-        # 标准初始局面
-        keys = jax.random.split(rng_key, batch_size)
-        states_flat = jax.vmap(env.init)(keys)
-    
-    # 按设备分片供 pmap 使用
+    keys = jax.random.split(rng_key, batch_size)
+    states_flat = jax.vmap(env.init)(keys)
+
     def _shard(x):
         return x.reshape(num_devices, batch_per_device, *x.shape[1:])
-    
+
     return jax.tree.map(_shard, states_flat)
 
 
@@ -1074,8 +1006,9 @@ def main():
             ))
             rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
             batch_per_eval = config.eval_games
-            states_r = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=True)
-            states_b = _build_eval_initial_states(config.eval_fen_file, batch_per_eval, sk7, for_current_red=False)
+            states = _build_eval_initial_states(batch_per_eval, sk7)
+            states_r = states
+            states_b = states
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
@@ -1323,13 +1256,9 @@ def main():
                 ))
                 rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
                 batch_per_eval = config.eval_games
-                # 构建初始状态（支持 FEN 批量导入 + 先后手轮换）
-                states_r = _build_eval_initial_states(
-                    config.eval_fen_file, batch_per_eval, sk7, for_current_red=True
-                )
-                states_b = _build_eval_initial_states(
-                    config.eval_fen_file, batch_per_eval, sk7, for_current_red=False
-                )
+                states = _build_eval_initial_states(batch_per_eval, sk7)
+                states_r = states
+                states_b = states
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
                     eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)

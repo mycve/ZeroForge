@@ -39,22 +39,22 @@
                             <svg :viewBox="`0 0 ${baseSvgWidth} ${baseSvgHeight}`"
                                  class="block"
                                  :style="boardStyle">
-                            <!-- 箭头定义 -->
+                            <!-- 箭头定义（markerUnits=userSpaceOnUse 确保箭头尺寸稳定显示）-->
                             <defs>
-                                <marker id="arrowhead-1" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
-                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.9"/>
+                                <marker id="arrowhead-1" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="10" refX="12" refY="3" orient="auto" viewBox="0 0 12 6">
+                                    <polygon points="0 0, 12 3, 0 6" fill="#9C27B0" stroke="none"/>
                                 </marker>
-                                <marker id="arrowhead-2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
-                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.7"/>
+                                <marker id="arrowhead-2" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="10" refX="12" refY="3" orient="auto" viewBox="0 0 12 6">
+                                    <polygon points="0 0, 12 3, 0 6" fill="#AB47BC" stroke="none"/>
                                 </marker>
-                                <marker id="arrowhead-3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
-                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.5"/>
+                                <marker id="arrowhead-3" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="10" refX="12" refY="3" orient="auto" viewBox="0 0 12 6">
+                                    <polygon points="0 0, 12 3, 0 6" fill="#BA68C8" stroke="none"/>
                                 </marker>
-                                <marker id="arrowhead-4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
-                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.3"/>
+                                <marker id="arrowhead-4" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="10" refX="12" refY="3" orient="auto" viewBox="0 0 12 6">
+                                    <polygon points="0 0, 12 3, 0 6" fill="#CE93D8" stroke="none"/>
                                 </marker>
-                                <marker id="arrowhead-5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
-                                    <polygon points="0 0, 10 3, 0 6" fill="#9C27B0" opacity="0.2"/>
+                                <marker id="arrowhead-5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="10" refX="12" refY="3" orient="auto" viewBox="0 0 12 6">
+                                    <polygon points="0 0, 12 3, 0 6" fill="#E1BEE7" stroke="none"/>
                                 </marker>
                             </defs>
                             
@@ -119,21 +119,6 @@
                                     :cy="displayY(move[0])"
                                     r="7" fill="#4CAF50" opacity="0.7"/>
                             
-                            <!-- 策略箭头 -->
-                            <g v-if="policyInfo && policyInfo.top_moves && showPolicyArrows">
-                                <line v-for="(move, idx) in policyInfo.top_moves.slice(0, 5)"
-                                      :key="`arrow-${idx}`"
-                                      :x1="getArrowStartX(move)"
-                                      :y1="getArrowStartY(move)"
-                                      :x2="getArrowEndX(move)"
-                                      :y2="getArrowEndY(move)"
-                                      :stroke="getArrowColor(idx)"
-                                      :stroke-width="getArrowWidth(idx, move.weight)"
-                                      :opacity="getArrowOpacity(idx)"
-                                      :marker-end="`url(#arrowhead-${idx + 1})`"
-                                      stroke-linecap="round"/>
-                            </g>
-                            
                             <!-- 棋子 -->
                             <g v-for="(row, r) in board" :key="r">
                                 <g v-for="(piece, c) in row" :key="`${r}-${c}`">
@@ -150,6 +135,22 @@
                                         </text>
                                     </template>
                                 </g>
+                            </g>
+                            
+                            <!-- 策略箭头（置于棋子之上，确保可见）-->
+                            <g v-if="policyInfo && policyInfo.top_moves && showPolicyArrows">
+                                <line v-for="(move, idx) in policyInfo.top_moves.slice(0, 5)"
+                                      :key="`arrow-${idx}`"
+                                      v-show="move.from && move.to && (move.from[0] !== move.to[0] || move.from[1] !== move.to[1])"
+                                      :x1="getArrowStartX(move)"
+                                      :y1="getArrowStartY(move)"
+                                      :x2="getArrowEndX(move)"
+                                      :y2="getArrowEndY(move)"
+                                      :stroke="getArrowColor(idx)"
+                                      :stroke-width="getArrowWidth(idx, move.weight)"
+                                      :opacity="getArrowOpacity(idx)"
+                                      :marker-end="`url(#arrowhead-${idx + 1})`"
+                                      stroke-linecap="round"/>
                             </g>
                             
                             <!-- 点击区域（扩大触摸范围）；翻转时 rect 位置随棋盘翻转 -->
@@ -593,14 +594,23 @@
                 setTimeout(() => { message.value = ''; }, 3000);
             };
             
-            // 箭头辅助函数（使用API返回的from/to坐标）
+            // 箭头辅助函数（使用API返回的from/to坐标，含空值防护）
             const getArrowStartX = (move) => {
+                if (!move?.from || !Array.isArray(move.from)) return 0;
                 return baseMargin + move.from[1] * baseCellSize;
             };
-            
-            const getArrowStartY = (move) => displayY(move.from[0]);
-            const getArrowEndX = (move) => baseMargin + move.to[1] * baseCellSize;
-            const getArrowEndY = (move) => displayY(move.to[0]);
+            const getArrowStartY = (move) => {
+                if (!move?.from || !Array.isArray(move.from)) return 0;
+                return displayY(move.from[0]);
+            };
+            const getArrowEndX = (move) => {
+                if (!move?.to || !Array.isArray(move.to)) return 0;
+                return baseMargin + move.to[1] * baseCellSize;
+            };
+            const getArrowEndY = (move) => {
+                if (!move?.to || !Array.isArray(move.to)) return 0;
+                return displayY(move.to[0]);
+            };
             
             const getArrowColor = (idx) => {
                 // 使用紫色系，避免和现有高亮冲突
