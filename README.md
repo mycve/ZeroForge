@@ -47,6 +47,16 @@ python train.py --init-checkpoint 100
 
 # 或直接指定 checkpoint 目录
 python train.py --init-checkpoint checkpoints/100
+
+# 导入强模型后，用更保守的参数继续训练
+python train.py --init-checkpoint checkpoints/100 \
+  --learning-rate 5e-5 \
+  --sample-reuse-times 1 \
+  --selfplay-temperature-steps 30 \
+  --selfplay-gumbel-scale 0.5
+
+# 前 3 半步强制在 top-3 候选中均匀随机
+python train.py --opening-force-random-steps 3 --opening-force-random-top-k 3
 ```
 
 说明：

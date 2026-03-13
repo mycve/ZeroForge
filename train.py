@@ -77,15 +77,17 @@ class Config:
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.85
+    td_lambda: float = 0.75
     
     # 自对弈与搜索：Gumbel-Top-k，前期开局温度采样，后续 visit argmax
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 20  # 前 20 半步用温度采样，后续直接 argmax
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 30  # 前 30 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.5
-    
+    opening_force_random_steps: int = 0   # 前 N 半步强制在 top-k 中均匀随机；0=关闭
+    opening_force_random_top_k: int = 3   # 强制随机时仅在前 k 个候选中选
+
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_000_000
     sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
@@ -112,13 +114,6 @@ class Config:
     max_to_keep: int = 20            # 最多保留 N 个 checkpoint
     keep_period: int = 100           # 每 N 次迭代永久保留一个 checkpoint
 
-config = Config()
-_QTRANSFORM = partial(
-    mctx.qtransform_completed_by_mix_value,
-    value_scale=config.qtransform_value_scale,
-)
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="ZeroForge 训练入口")
     parser.add_argument(
@@ -127,7 +122,55 @@ def parse_args():
         default=None,
         help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
     )
+    parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
+    parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
+    parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
+    parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
+    parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
+    parser.add_argument("--sample-reuse-times", type=int, default=None, help="覆盖 sample_reuse_times")
+    parser.add_argument("--num-simulations", type=int, default=None, help="覆盖 num_simulations")
+    parser.add_argument("--top-k", type=int, default=None, help="覆盖搜索 max_num_considered_actions")
+    parser.add_argument("--selfplay-temperature", type=float, default=None, help="覆盖 selfplay_temperature")
+    parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
+    parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
+    parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
+    parser.add_argument("--opening-force-random-steps", type=int, default=None, help="前 N 半步强制在 top-k 候选中均匀随机")
+    parser.add_argument("--opening-force-random-top-k", type=int, default=None, help="强制随机时的 top-k")
     return parser.parse_args()
+
+
+def apply_cli_overrides(args):
+    overrides = {
+        "learning_rate": args.learning_rate,
+        "td_lambda": args.td_lambda,
+        "training_batch_size": args.training_batch_size,
+        "selfplay_batch_size": args.selfplay_batch_size,
+        "replay_buffer_size": args.replay_buffer_size,
+        "sample_reuse_times": args.sample_reuse_times,
+        "num_simulations": args.num_simulations,
+        "top_k": args.top_k,
+        "selfplay_temperature": args.selfplay_temperature,
+        "selfplay_temperature_steps": args.selfplay_temperature_steps,
+        "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
+        "eval_gumbel_scale": args.eval_gumbel_scale,
+        "opening_force_random_steps": args.opening_force_random_steps,
+        "opening_force_random_top_k": args.opening_force_random_top_k,
+    }
+    applied = {}
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(config, key, value)
+            applied[key] = value
+    return applied
+
+
+config = Config()
+CLI_ARGS = parse_args()
+CLI_OVERRIDES = apply_cli_overrides(CLI_ARGS)
+_QTRANSFORM = partial(
+    mctx.qtransform_completed_by_mix_value,
+    value_scale=config.qtransform_value_scale,
+)
 
 # ============================================================================
 # 环境和设备
@@ -182,6 +225,14 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
+if config.opening_force_random_steps < 0:
+    raise ValueError(f"opening_force_random_steps 必须 >= 0，当前值: {config.opening_force_random_steps}")
+if config.opening_force_random_top_k < 1:
+    raise ValueError(f"opening_force_random_top_k 必须 >= 1，当前值: {config.opening_force_random_top_k}")
+if config.opening_force_random_top_k > ACTION_SPACE_SIZE:
+    raise ValueError(
+        f"opening_force_random_top_k 不能超过动作空间 {ACTION_SPACE_SIZE}，当前值: {config.opening_force_random_top_k}"
+    )
 # 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
 # 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
 _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
@@ -349,14 +400,30 @@ def selfplay(params, rng_key, batch_size):
             probs = probs / jnp.maximum(jnp.sum(probs), 1e-10)
             return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
 
+        def _sample_forced_random_action(w, legal_mask, sample_key):
+            # 仅在搜索 top-k 候选内均匀随机，强行拉开最前期的开局分支。
+            w_masked = jnp.where(legal_mask, w, -1.0)
+            _, top_idx = jax.lax.top_k(w_masked, config.opening_force_random_top_k)
+            top_is_legal = legal_mask[top_idx]
+            top_probs = top_is_legal.astype(jnp.float32)
+            top_probs = top_probs / jnp.maximum(jnp.sum(top_probs), 1.0)
+            chosen = jax.random.choice(sample_key, config.opening_force_random_top_k, p=top_probs)
+            return top_idx[chosen]
+
         # 前 20 半步增加根节点多样性，后续回到贪心走子。
         sample_keys = jax.random.split(key_sample, batch_size)
         sampled_action = jax.vmap(_sample_action)(action_weights, state.legal_action_mask, sample_keys)
+        forced_random_action = jax.vmap(_sample_forced_random_action)(action_weights, state.legal_action_mask, sample_keys)
         _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
         action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
         greedy_action = jnp.argmax(action_weights_masked, axis=-1)
+        use_forced_random = state.step_count < config.opening_force_random_steps
         use_temperature = state.step_count < config.selfplay_temperature_steps
-        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
+        action = jnp.where(
+            only_one_move,
+            action_idx,
+            jnp.where(use_forced_random, forced_random_action, jnp.where(use_temperature, sampled_action, greedy_action)),
+        )
         
         actor = state.current_player
         
@@ -1091,10 +1158,11 @@ def restore_checkpoint(
 # ============================================================================
 
 def main():
-    args = parse_args()
     logger.info("=" * 50)
     logger.info("ZeroForge - 现代高效架构")
     logger.info("特性: 3分支GNN + factorized policy head + 统一视角训练 + Gumbel-Top-k + TD(λ)")
+    if CLI_OVERRIDES:
+        logger.info("[CLI] 覆盖参数: %s", CLI_OVERRIDES)
     
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
@@ -1144,17 +1212,17 @@ def main():
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps = restored
         logger.info("[断点续训] 从 iteration=%s 继续训练", iteration)
-        if args.init_checkpoint:
-            logger.info("[Init] 检测到已有训练断点，忽略 --init-checkpoint=%s", args.init_checkpoint)
+        if CLI_ARGS.init_checkpoint:
+            logger.info("[Init] 检测到已有训练断点，忽略 --init-checkpoint=%s", CLI_ARGS.init_checkpoint)
     else:
-        if args.init_checkpoint:
+        if CLI_ARGS.init_checkpoint:
             try:
                 params, init_source = _load_init_params_from_source(
-                    args.init_checkpoint, params_template, opt_state_template
+                    CLI_ARGS.init_checkpoint, params_template, opt_state_template
                 )
             except Exception as e:
                 raise RuntimeError(
-                    f"无法导入基础模型 {args.init_checkpoint}，请确认 step 编号或 checkpoint 路径有效"
+                    f"无法导入基础模型 {CLI_ARGS.init_checkpoint}，请确认 step 编号或 checkpoint 路径有效"
                 ) from e
             logger.info("[Init] 已导入基础模型: %s；训练计数从 0 开始", init_source)
         else:
@@ -1226,12 +1294,14 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%s, forced_random_steps=%s, forced_random_top_k=%s",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
+        config.opening_force_random_steps,
+        config.opening_force_random_top_k,
     )
 
     while True:

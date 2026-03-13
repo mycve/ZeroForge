@@ -745,10 +745,6 @@ def get_ai_action(
             top_moves = []
 
             for idx in top_indices:
-
-                if improved_policy[idx] <= 1e-6:
-                    continue
-
                 fs, ts = action_to_move(int(idx))
                 fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
 
@@ -1174,16 +1170,15 @@ async def ai_think(req: AIThinkRequest):
         top_indices = np.argsort(prior_probs)[::-1][:min(req.opening_top_k, len(legal_actions))]
         top_moves = []
         for idx in top_indices:
-            if prior_probs[idx] > 1e-6:
-                fs, ts = action_to_move(int(idx))
-                fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
-                top_moves.append({
-                    "action": int(idx),
-                    "uci": move_to_uci(fs, ts),
-                    "prior": float(prior_probs[idx]),
-                    "from": [fr, fc],
-                    "to": [tr, tc],
-                })
+            fs, ts = action_to_move(int(idx))
+            fs, ts, fr, fc, tr, tc = _move_endpoints(fs, ts)
+            top_moves.append({
+                "action": int(idx),
+                "uci": move_to_uci(fs, ts),
+                "prior": float(prior_probs[idx]),
+                "from": [fr, fc],
+                "to": [tr, tc],
+            })
         
         # 从Top-K中随机选择
         if len(top_moves) > 0:
