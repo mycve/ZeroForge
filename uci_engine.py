@@ -89,11 +89,6 @@ MCTS_QTRANSFORM = partial(
 DEFAULT_NUM_SIMULATIONS = 2048
 DEFAULT_TOP_K = 32
 
-# 开局阶段（前 N 完整回合，1回合=2半着）使用较低算力
-OPENING_FULL_MOVES = 4  # 前4回合
-OPENING_SIMS = 128
-OPENING_TOP_K = 16
-
 # 日志写入磁盘（与 uci_engine.py 同目录），走法等信息由 send() 输出到 stdout
 _LOG_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG_FILE = os.path.join(_LOG_DIR, "zeroforge_uci.log")
@@ -665,17 +660,11 @@ def run_uci(engine, simulations, top_k):
                     last_moves = []
                 half_moves = len(last_moves)
                 full_moves = half_moves // 2
-                # 开局前 N 回合用较低算力
-                if full_moves < OPENING_FULL_MOVES:
-                    sims, tk = OPENING_SIMS, OPENING_TOP_K
-                else:
-                    sims, tk = opts["simulations"], opts["top_k"]
+                sims, tk = opts["simulations"], opts["top_k"]
                 legal_count = int(jnp.sum(state.legal_action_mask))
                 current_fen = state_to_fen(state)
-                phase = "开局" if full_moves < OPENING_FULL_MOVES else "中残局"
                 logger.info(
-                    "======== 开始搜索 ======== [%s] 本局引擎第%s次走棋 对局进度=%s着(约%s回合) depth=%s sims=%s top_k=%s legal=%s",
-                    phase,
+                    "======== 开始搜索 ======== 本局引擎第%s次走棋 对局进度=%s着(约%s回合) depth=%s sims=%s top_k=%s legal=%s",
                     engine_move_count + 1,
                     half_moves,
                     full_moves,
