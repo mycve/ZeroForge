@@ -83,10 +83,10 @@ class Config:
     selfplay_batch_size: int = 1024
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 28    # 开局前 28 半步用温度采样，后续直接 argmax
+    selfplay_temperature_steps: int = 20    # 开局前 20 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.20      # 开局起始温度（更鼓励分支展开）
     selfplay_temperature_final: float = 0.60  # 开局末段温度，避免全程过散
-    opening_dirichlet_steps: int = 24       # 开局前 N 半步对根先验注入 Dirichlet 扰动
+    opening_dirichlet_steps: int = 14       # 开局前 N 半步对根先验注入 Dirichlet 扰动
     opening_dirichlet_alpha: float = 0.30
     opening_dirichlet_epsilon: float = 0.25
 
