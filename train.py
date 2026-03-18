@@ -65,7 +65,7 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
+    num_channels: int = 96   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 8       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
@@ -75,23 +75,23 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
+    lr_min_ratio: float = 0.02        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.75
+    td_lambda: float = 0.95
     
     # 自对弈与搜索：Gumbel-Top-k，开局增强探索，后续 visit argmax
-    selfplay_batch_size: int = 1024
+    selfplay_batch_size: int = 512
     num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 24    # 开局前 24 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.20      # 开局起始温度（更鼓励分支展开）
+    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 30    # 开局前 24 半步用温度采样，后续直接 argmax
+    selfplay_temperature: float = 1.00      # 开局起始温度（更鼓励分支展开）
     selfplay_temperature_final: float = 0.60  # 开局末段温度，避免全程过散
-    opening_dirichlet_steps: int = 20       # 开局前 N 半步对根先验注入 Dirichlet 扰动
+    opening_dirichlet_steps: int = 16       # 开局前 N 半步对根先验注入 Dirichlet 扰动
     opening_dirichlet_alpha: float = 0.30
     opening_dirichlet_epsilon: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000
+    replay_buffer_size: int = 1_500_000
     sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
