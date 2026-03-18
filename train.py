@@ -16,6 +16,7 @@ import sys
 import time
 import json
 import warnings
+from functools import lru_cache
 from functools import partial
 from typing import NamedTuple, Optional, List, Tuple
 
@@ -37,7 +38,8 @@ os.makedirs(cache_dir, exist_ok=True)
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
-from xiangqi.mirror import mirror_observation, mirror_policy
+from xiangqi.fen import load_fens_from_file
+from xiangqi.mirror import mirror_observation, mirror_policy, mirror_board_swap_colors
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
 
@@ -110,6 +112,7 @@ class Config:
     # ELO 评估
     eval_interval: int = 20
     eval_games: int = 100
+    eval_fens_path: str = "eval_fens.txt"
     past_model_offset: int = 20
     # Checkpoint 配置
     ckpt_interval: int = 20         # 每 N 次迭代保存 checkpoint
@@ -688,21 +691,19 @@ def _run_best_checkpoint_eval(
 
     rated_iters = [k for k in available_iters if k in iteration_elos]
     if rated_iters:
-        ref_iter = max(rated_iters, key=lambda k: iteration_elos[k])
+        ref_iter = max(rated_iters, key=lambda k: (iteration_elos[k], k))
         ref_reason = "best_elo"
     else:
         ref_iter = available_iters[-1]
-        ref_reason = "latest_ckpt"
+        ref_reason = "bootstrap_unrated_ckpt"
 
     opponent_params = replicate_to_devices(
         _load_params_from_checkpoint(ckpt_manager, ref_iter, params_template, opt_state_template)
     )
 
-    rng_key, sk5, sk6, sk7 = jax.random.split(rng_key, 4)
+    rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
     batch_per_eval = config.eval_games
-    states = _build_eval_initial_states(batch_per_eval, sk7)
-    states_r = states
-    states_b = states
+    states_r, states_b = _build_eval_initial_states(batch_per_eval)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         eval_keys_r = jax.device_put_sharded(list(jax.random.split(sk5, num_devices)), devices)
@@ -757,18 +758,46 @@ def _run_best_checkpoint_eval(
     }
     return metrics, rng_key
 
-def _build_eval_initial_states(batch_size: int, rng_key) -> "XiangqiState":
-    """构建评估用初始状态（纯标准初始局面）"""
+@lru_cache(maxsize=None)
+def _load_eval_fen_pool(eval_fens_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """加载固定评估 FEN 集，返回 (boards, players)。"""
+    abs_path = os.path.abspath(eval_fens_path)
+    fen_items = load_fens_from_file(abs_path)
+    if not fen_items:
+        raise ValueError(f"评估 FEN 文件为空: {abs_path}")
+
+    boards = np.stack([board for board, _player in fen_items]).astype(np.int8)
+    players = np.array([player for _board, player in fen_items], dtype=np.int32)
+    logger.info("[Eval FEN] 已加载 %s 个评估局面: %s", len(fen_items), abs_path)
+    return boards, players
+
+
+def _build_eval_initial_states(batch_size: int) -> Tuple["XiangqiState", "XiangqiState"]:
+    """基于固定评估 FEN 构建红黑交换评估局面。"""
     batch_per_device = batch_size // num_devices
     if batch_per_device * num_devices != batch_size:
         raise ValueError(f"batch_size {batch_size} 必须整除 num_devices {num_devices}")
-    keys = jax.random.split(rng_key, batch_size)
-    states_flat = jax.vmap(env.init)(keys)
+
+    boards_np, players_np = _load_eval_fen_pool(config.eval_fens_path)
+    if batch_size > len(boards_np):
+        logger.info(
+            "[Eval FEN] 评估对局数 %s 超过 FEN 数 %s，按固定顺序循环复用",
+            batch_size,
+            len(boards_np),
+        )
+    sample_idx = np.arange(batch_size) % len(boards_np)
+    boards = jnp.asarray(boards_np[sample_idx], dtype=jnp.int8)
+    players = jnp.asarray(players_np[sample_idx], dtype=jnp.int32)
+
+    states_red_flat = jax.vmap(lambda b, p: env.init_from_board(b, p))(boards, players)
+    swapped_boards = jax.vmap(mirror_board_swap_colors)(boards)
+    swapped_players = jnp.int32(1) - players
+    states_black_flat = jax.vmap(lambda b, p: env.init_from_board(b, p))(swapped_boards, swapped_players)
 
     def _shard(x):
         return x.reshape(num_devices, batch_per_device, *x.shape[1:])
 
-    return jax.tree.map(_shard, states_flat)
+    return jax.tree.map(_shard, states_red_flat), jax.tree.map(_shard, states_black_flat)
 
 
 @jax.pmap

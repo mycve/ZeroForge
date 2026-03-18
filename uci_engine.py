@@ -269,7 +269,6 @@ class Engine:
 
         if step is None:
             self._load_error = "未找到 checkpoint"
-            logger.error(self._load_error)
             return False
 
         try:
@@ -288,7 +287,6 @@ class Engine:
 
         if params is None:
             self._load_error = "checkpoint 无 params"
-            logger.error(self._load_error)
             return False
 
         self._build_runtime(params)
@@ -307,10 +305,7 @@ class Engine:
             ok = self._load_impl()
         except Exception as e:
             self._load_error = str(e)
-            logger.exception("后台加载失败: %s", e)
         finally:
-            if not ok and self.params is None and self._load_error:
-                logger.error("模型未就绪: %s", self._load_error)
             self._load_done.set()
 
     # ------------------------------------------------------
@@ -376,10 +371,7 @@ class Engine:
             action = int(jnp.argmax(legal_mask))
             from_sq, to_sq = action_to_move(action)
             move = move_to_uci(int(from_sq), int(to_sq))
-            logger.debug("唯一合法走法，直接返回: %s", move)
             return move, 0.0, [{"uci": move, "weight": 1.0, "visits": 0, "cp": 0}]
-
-        top_k = min(top_k, legal_count)
 
         obs = self.env.observe(state)[None]
 
@@ -487,7 +479,7 @@ def state_to_fen(state) -> str:
 
 
 def build_state(env, fen, moves):
-    """从 FEN 和走法列表构建局面，非法走法会跳过并记录"""
+    """从 FEN 和走法列表构建局面，非法走法直接跳过。"""
     board, player = parse_fen(fen)
     state = env.init_from_board(
         jnp.array(board, dtype=jnp.int8),
@@ -501,13 +493,11 @@ def build_state(env, fen, moves):
             f, t = uci_to_move(m[:4])
             action = int(move_to_action(jnp.int32(f), jnp.int32(t)))
             if action < 0:
-                logger.error("非法走法(动作-1): %s", m[:4])
                 continue
             state = env.step(state, jnp.int32(action))
             if state.terminated:
                 break
-        except (ValueError, IndexError, KeyError) as e:
-            logger.error("解析走法失败 %r: %s", m[:4], e)
+        except (ValueError, IndexError, KeyError):
             continue
     return state
 
@@ -602,8 +592,7 @@ def run_uci(engine, simulations, top_k):
             elif cmd == "isready":
                 if engine.params is None:
                     logger.info("收到 isready，等待后台加载完成 loading=%s", engine.is_loading())
-                    if not engine.wait_until_ready():
-                        logger.error("isready 等待结束但模型未就绪: %s", engine._load_error)
+                    engine.wait_until_ready()
                 send("readyok")
 
             elif cmd == "position":
@@ -635,8 +624,7 @@ def run_uci(engine, simulations, top_k):
                         full_moves,
                         " ".join(moves[:20]) + (" ..." if len(moves) > 20 else ""),
                     )
-                except (ValueError, KeyError) as e:
-                    logger.error("build_state 失败: %s", e)
+                except (ValueError, KeyError):
                     state = build_state(engine.env, STARTING_FEN, [])
                     last_fen = STARTING_FEN
                     last_moves = []
@@ -703,7 +691,6 @@ def run_uci(engine, simulations, top_k):
                         )
                     send(f"bestmove {move}")
                 else:
-                    logger.warning("搜索无合法着法 elapsed_ms=%s", elapsed_ms)
                     send("bestmove 0000")
 
             elif cmd == "ucinewgame":
@@ -718,8 +705,7 @@ def run_uci(engine, simulations, top_k):
                 logger.info("收到 quit，退出 UCI 循环")
                 break
 
-        except Exception as e:
-            logger.exception("UCI 命令处理异常 cmd=%s: %s", cmd, e)
+        except Exception:
             if cmd == "go":
                 try:
                     send("info string error")
