@@ -74,7 +74,7 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.02        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.55
+    td_lambda: float = 0.45
     
     # 自对弈与搜索：Gumbel-Top-k，全程保持探索，避免过早坍缩为单线自博弈
     selfplay_batch_size: int = 1024
