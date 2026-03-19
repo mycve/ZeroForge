@@ -3,7 +3,7 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索，开局根节点 Dirichlet 扰动 + 温度退火采样，后续 argmax
+- Gumbel-Top-k MCTS：搜索内探索，全程根节点 Dirichlet 扰动 + 温度退火采样（下限 0.10）
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
@@ -71,35 +71,34 @@ class Config:
     learning_rate: float = 2e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 200000     # 余弦周期（opt steps）
+    lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.02        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.95
+    td_lambda: float = 0.55
     
-    # 自对弈与搜索：Gumbel-Top-k，开局增强探索，后续 visit argmax
+    # 自对弈与搜索：Gumbel-Top-k，全程保持探索，避免过早坍缩为单线自博弈
     selfplay_batch_size: int = 1024
     num_simulations: int = 64            # Gumbel 低模拟即可，快速生成对局更重要
-    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 30    # 开局前 30 半步用温度采样，后续直接 argmax
-    selfplay_temperature: float = 1.00      # 开局起始温度（更鼓励分支展开）
-    selfplay_temperature_final: float = 0.30  # 开局末段温度，避免全程过散
-    opening_dirichlet_steps: int = 20       # 开局前 N 半步对根先验注入 Dirichlet 扰动
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 30    # 前 30 半步线性退火，后续保持尾温 0.10 持续采样
+    selfplay_temperature: float = 1.00      # 自对弈起始温度（更鼓励分支展开）
+    selfplay_temperature_final: float = 0.10  # 温度退火下限；达到后全程保持，避免过早贪心坍缩
     opening_dirichlet_alpha: float = 0.30
     opening_dirichlet_epsilon: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 4_000_000
-    sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
+    replay_buffer_size: int = 2_000_000
+    sample_reuse_times: int = 1         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
-    eval_gumbel_scale: float = 0.10      # 评估仅保留极低扰动，结果更稳定
+    eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 300              # 总步数 400 步（200回合）判和
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 3     # 非将非捉重复局面 3 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
@@ -134,7 +133,6 @@ def parse_args():
     parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
     parser.add_argument("--selfplay-temperature-final", type=float, default=None, help="覆盖 selfplay_temperature_final")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
-    parser.add_argument("--opening-dirichlet-steps", type=int, default=None, help="覆盖 opening_dirichlet_steps")
     parser.add_argument("--opening-dirichlet-alpha", type=float, default=None, help="覆盖 opening_dirichlet_alpha")
     parser.add_argument("--opening-dirichlet-epsilon", type=float, default=None, help="覆盖 opening_dirichlet_epsilon")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
@@ -155,7 +153,6 @@ def apply_cli_overrides(args):
         "selfplay_temperature_steps": args.selfplay_temperature_steps,
         "selfplay_temperature_final": args.selfplay_temperature_final,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
-        "opening_dirichlet_steps": args.opening_dirichlet_steps,
         "opening_dirichlet_alpha": args.opening_dirichlet_alpha,
         "opening_dirichlet_epsilon": args.opening_dirichlet_epsilon,
         "eval_gumbel_scale": args.eval_gumbel_scale,
@@ -238,10 +235,6 @@ if config.selfplay_temperature_steps < 0:
     raise ValueError(
         f"selfplay_temperature_steps 必须 >= 0，当前值: {config.selfplay_temperature_steps}"
     )
-if config.opening_dirichlet_steps < 0:
-    raise ValueError(
-        f"opening_dirichlet_steps 必须 >= 0，当前值: {config.opening_dirichlet_steps}"
-    )
 if config.opening_dirichlet_alpha <= 0:
     raise ValueError(
         f"opening_dirichlet_alpha 必须 > 0，当前值: {config.opening_dirichlet_alpha}"
@@ -264,29 +257,30 @@ def _masked_normalize(x: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
 
 
 def _opening_temperature(step_count: jnp.ndarray) -> jnp.ndarray:
-    """开局温度线性退火：前期更散，接近 cutoff 时更稳。"""
+    """全程温度退火：前期更散，达到下限后保持稳定小温度采样。"""
     if config.selfplay_temperature_steps <= 1:
-        return jnp.full_like(step_count, config.selfplay_temperature, dtype=jnp.float32)
+        temp = config.selfplay_temperature_final
+        return jnp.full_like(step_count, temp, dtype=jnp.float32)
     progress = jnp.clip(
         step_count.astype(jnp.float32) / float(config.selfplay_temperature_steps - 1),
         0.0,
         1.0,
     )
-    return (
+    temp = (
         config.selfplay_temperature
         + (config.selfplay_temperature_final - config.selfplay_temperature) * progress
-    ).astype(jnp.float32)
+    )
+    return jnp.maximum(temp, config.selfplay_temperature_final).astype(jnp.float32)
 
 
 def _apply_root_dirichlet_noise(
     logits: jnp.ndarray,
     legal_mask: jnp.ndarray,
-    step_count: jnp.ndarray,
     rng_key,
 ) -> jnp.ndarray:
-    """仅在开局对根节点先验注入 Dirichlet 扰动，缓解单线开局坍缩。"""
+    """对根节点先验注入 Dirichlet 扰动；启用后全程生效，缓解整体自博弈坍缩。"""
     base_probs = _masked_normalize(jax.nn.softmax(logits, axis=-1), legal_mask)
-    if config.opening_dirichlet_steps <= 0 or config.opening_dirichlet_epsilon <= 0.0:
+    if config.opening_dirichlet_epsilon <= 0.0:
         return jnp.where(legal_mask, jnp.log(base_probs + 1e-10), jnp.finfo(logits.dtype).min)
 
     gamma_shape = jnp.full(logits.shape, config.opening_dirichlet_alpha, dtype=logits.dtype)
@@ -296,9 +290,7 @@ def _apply_root_dirichlet_noise(
         (1.0 - config.opening_dirichlet_epsilon) * base_probs
         + config.opening_dirichlet_epsilon * dirichlet_noise
     )
-    mixed_probs = _masked_normalize(mixed_probs, legal_mask)
-    use_noise = (step_count < config.opening_dirichlet_steps)[:, None]
-    final_probs = jnp.where(use_noise, mixed_probs, base_probs)
+    final_probs = _masked_normalize(mixed_probs, legal_mask)
     return jnp.where(legal_mask, jnp.log(final_probs + 1e-10), jnp.finfo(logits.dtype).min)
 
 def replicate_to_devices(pytree):
@@ -422,7 +414,7 @@ def selfplay(params, rng_key, batch_size):
     """
     高性能自玩算子：
     - lax.scan 消除 Python 循环开销
-    - Gumbel-Top-k：探索在搜索内完成，开局额外加入根噪声 + 温度退火采样
+    - Gumbel-Top-k：探索在搜索内完成，并辅以全程根噪声 + 温度退火采样
     """
     def step_fn(state, key):
         key_search, key_sample, key_reset = jax.random.split(key, 3)
@@ -433,7 +425,7 @@ def selfplay(params, rng_key, batch_size):
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = _apply_root_dirichlet_noise(
-            logits, state.legal_action_mask, state.step_count, key_dirichlet
+            logits, state.legal_action_mask, key_dirichlet
         )
         
         # MCTS 搜索
@@ -467,17 +459,13 @@ def selfplay(params, rng_key, batch_size):
             probs = _masked_normalize(probs, legal_mask)
             return jax.random.choice(sample_key, ACTION_SPACE_SIZE, p=probs)
 
-        # 开局阶段做温度退火采样，后续回到贪心走子。
+        # 全程做温度退火采样；达到下限后维持小温度，避免中残局完全贪心。
         sample_keys = jax.random.split(key_sample, batch_size)
         sample_temperatures = _opening_temperature(state.step_count)
         sampled_action = jax.vmap(_sample_action)(
             action_weights, state.legal_action_mask, sample_temperatures, sample_keys
         )
-        _MASK_VAL = -1e9  # 非法动作掩码，避免 -inf 带来的数值隐患
-        action_weights_masked = jnp.where(state.legal_action_mask, action_weights, _MASK_VAL)
-        greedy_action = jnp.argmax(action_weights_masked, axis=-1)
-        use_temperature = state.step_count < config.selfplay_temperature_steps
-        action = jnp.where(only_one_move, action_idx, jnp.where(use_temperature, sampled_action, greedy_action))
+        action = jnp.where(only_one_move, action_idx, sampled_action)
         
         actor = state.current_player
         
@@ -1308,7 +1296,7 @@ def main():
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
-        f"_d{config.opening_dirichlet_steps}e{config.opening_dirichlet_epsilon:.2f}"
+        f"_da{config.opening_dirichlet_alpha:.2f}_de{config.opening_dirichlet_epsilon:.2f}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
     logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
@@ -1355,14 +1343,14 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_steps=%s, temp=%.2f->%.2f, dirichlet=%s@alpha=%.2f eps=%.2f",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), dirichlet=fullgame(enabled=%s) alpha=%.2f eps=%.2f",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
         config.selfplay_temperature_final,
-        config.opening_dirichlet_steps,
+        config.opening_dirichlet_epsilon > 0.0,
         config.opening_dirichlet_alpha,
         config.opening_dirichlet_epsilon,
     )
