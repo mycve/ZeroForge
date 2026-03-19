@@ -19,11 +19,6 @@ import warnings
 from functools import lru_cache
 from functools import partial
 from typing import NamedTuple, Optional, List, Tuple
-
-# 显存分配策略：减少碎片导致的大块申请失败（需在 import jax 前设置）
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -82,18 +77,18 @@ class Config:
     td_lambda: float = 0.95
     
     # 自对弈与搜索：Gumbel-Top-k，开局增强探索，后续 visit argmax
-    selfplay_batch_size: int = 512
-    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
+    selfplay_batch_size: int = 1024
+    num_simulations: int = 64            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 30    # 开局前 24 半步用温度采样，后续直接 argmax
+    selfplay_temperature_steps: int = 30    # 开局前 30 半步用温度采样，后续直接 argmax
     selfplay_temperature: float = 1.00      # 开局起始温度（更鼓励分支展开）
-    selfplay_temperature_final: float = 0.60  # 开局末段温度，避免全程过散
-    opening_dirichlet_steps: int = 16       # 开局前 N 半步对根先验注入 Dirichlet 扰动
+    selfplay_temperature_final: float = 0.30  # 开局末段温度，避免全程过散
+    opening_dirichlet_steps: int = 20       # 开局前 N 半步对根先验注入 Dirichlet 扰动
     opening_dirichlet_alpha: float = 0.30
     opening_dirichlet_epsilon: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_500_000
+    replay_buffer_size: int = 4_000_000
     sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
@@ -106,7 +101,7 @@ class Config:
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
-    repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
+    repetition_threshold: int = 3     # 非将非捉重复局面 3 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
     
     # ELO 评估
