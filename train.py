@@ -3,7 +3,7 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索，全程根节点 Dirichlet 扰动 + 温度退火采样（下限 0.10）
+- Gumbel-Top-k MCTS：搜索内探索 + 温度退火采样（下限 0.10，可选根节点 Dirichlet 扰动）
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
 - 标准 ELO 评估
@@ -62,7 +62,7 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 96   # 128 是当前稳妥默认；96 更快但上限略低
+    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 8       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
@@ -72,23 +72,25 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.02        # 最低 LR = peak × 0.01 = 1e-5
+    lr_min_ratio: float = 0.2        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
     td_lambda: float = 0.45
+    search_value_loss_weight: float = 1.0
+    wdl_loss_weight: float = 0.5
     
     # 自对弈与搜索：Gumbel-Top-k，全程保持探索，避免过早坍缩为单线自博弈
-    selfplay_batch_size: int = 1024
-    num_simulations: int = 64            # Gumbel 低模拟即可，快速生成对局更重要
+    selfplay_batch_size: int = 512
+    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 30    # 前 30 半步线性退火，后续保持尾温 0.10 持续采样
     selfplay_temperature: float = 1.00      # 自对弈起始温度（更鼓励分支展开）
     selfplay_temperature_final: float = 0.10  # 温度退火下限；达到后全程保持，避免过早贪心坍缩
     opening_dirichlet_alpha: float = 0.30
-    opening_dirichlet_epsilon: float = 0.25
+    opening_dirichlet_epsilon: float = 0.0
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 2_000_000
-    sample_reuse_times: int = 1         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
+    replay_buffer_size: int = 1_000_000
+    sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
     
     # 损失权重
     value_loss_weight: float = 1.0
@@ -123,6 +125,8 @@ def parse_args():
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
+    parser.add_argument("--search-value-loss-weight", type=float, default=None, help="覆盖 search_value_loss_weight")
+    parser.add_argument("--wdl-loss-weight", type=float, default=None, help="覆盖 wdl_loss_weight")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
@@ -143,6 +147,8 @@ def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
         "td_lambda": args.td_lambda,
+        "search_value_loss_weight": args.search_value_loss_weight,
+        "wdl_loss_weight": args.wdl_loss_weight,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
@@ -226,6 +232,16 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
+if config.search_value_loss_weight < 0:
+    raise ValueError(
+        "search_value_loss_weight 必须 >= 0，"
+        f"当前值: {config.search_value_loss_weight}"
+    )
+if config.wdl_loss_weight < 0:
+    raise ValueError(
+        "wdl_loss_weight 必须 >= 0，"
+        f"当前值: {config.wdl_loss_weight}"
+    )
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
     raise ValueError(
         "selfplay_temperature 与 selfplay_temperature_final 必须 > 0，"
@@ -278,7 +294,7 @@ def _apply_root_dirichlet_noise(
     legal_mask: jnp.ndarray,
     rng_key,
 ) -> jnp.ndarray:
-    """对根节点先验注入 Dirichlet 扰动；启用后全程生效，缓解整体自博弈坍缩。"""
+    """可选地对根节点先验注入 Dirichlet 扰动。"""
     base_probs = _masked_normalize(jax.nn.softmax(logits, axis=-1), legal_mask)
     if config.opening_dirichlet_epsilon <= 0.0:
         return jnp.where(legal_mask, jnp.log(base_probs + 1e-10), jnp.finfo(logits.dtype).min)
@@ -401,6 +417,7 @@ class Sample(NamedTuple):
     """训练样本（从 SelfplayOutput 经 compute_targets 得到）"""
     obs: jnp.ndarray
     policy_tgt: jnp.ndarray       # 策略目标，与 obs 保持同一归一化视角
+    value_tgt: jnp.ndarray        # 标量搜索价值 TD(λ) 目标（主价值监督）
     wdl_tgt: jnp.ndarray         # WDL TD(λ) 目标 (B,3)：[W, D, L] 概率分布
     mask: jnp.ndarray            # 有效步掩码（游戏结束前）
 
@@ -508,14 +525,10 @@ def selfplay(params, rng_key, batch_size):
 
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
-    """WDL TD(λ) 目标计算 - 在 [W, D, L] 三分量上独立做 TD(λ)
-    
-    与标量 TD(λ) 的区别：
-    - bootstrap 用网络原始 WDL 概率（而非 MCTS 标量值）
-    - 视角翻转用 W↔L 互换（对手的 [W,D,L] -> 我方的 [L,D,W]）
-    - 游戏结果直接映射为 one-hot WDL（reward +1/0/-1 -> [W,D,L]）
-    
-    输出 Sample：policy_tgt 与 obs 使用同一归一化视角。
+    """计算训练目标。
+
+    - value_tgt: 用搜索后的 root_value 做 TD(λ) 标量目标，兼顾密集监督与终局锚点。
+    - wdl_tgt: 保留 WDL TD(λ) 目标，作为价值头的语义辅助监督。
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     lam = config.td_lambda
@@ -523,7 +536,10 @@ def compute_targets(data: SelfplayOutput):
     # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # s_{t+1} 的 WDL 预测，用于 bootstrap
+    # s_{t+1} 的搜索价值 / WDL 预测，用于 bootstrap
+    value_next = jnp.concatenate(
+        [data.root_value[1:], jnp.zeros((1, batch_size), dtype=data.root_value.dtype)], axis=0
+    )
     wdl_next = jnp.concatenate(
         [data.root_wdl[1:], jnp.zeros((1, batch_size, 3))], axis=0
     )
@@ -536,32 +552,43 @@ def compute_targets(data: SelfplayOutput):
         jnp.maximum(-data.reward, 0.0),       # L
     ], axis=-1)  # (max_steps, batch_size, 3)
     
-    def scan_fn(carry_wdl, inputs):
-        """从后向前计算 WDL λ-return
-        
-        carry_wdl: G_{t+1} WDL，从 step t+1 的 actor 视角
-        非终局：G_t = flip((1-λ) * WDL(s_{t+1}) + λ * G_{t+1})
-        终局：G_t = reward_wdl
-        """
-        reward_wdl_t, terminated_t, wdl_next_t = inputs
-        # 混合 bootstrap 和递推
-        blended = (1.0 - lam) * wdl_next_t + lam * carry_wdl
+    def scan_fn(carry, inputs):
+        """从后向前同时计算标量 value 与 WDL 的 TD(λ) 目标。"""
+        carry_value, carry_wdl = carry
+        reward_t, reward_wdl_t, terminated_t, discount_t, value_next_t, wdl_next_t = inputs
+
+        value_blended = (1.0 - lam) * value_next_t + lam * carry_value
+        g_value = reward_t + discount_t * value_blended
+
+        wdl_blended = (1.0 - lam) * wdl_next_t + lam * carry_wdl
         # 视角翻转：对手的 [W, D, L] → 我方的 [L, D, W]
-        flipped = blended[:, ::-1]
+        flipped = wdl_blended[:, ::-1]
         # 终局用游戏结果，非终局用翻转后的混合值
         g_wdl = jnp.where(terminated_t[:, None], reward_wdl_t, flipped)
-        return g_wdl, g_wdl
+        return (g_value, g_wdl), (g_value, g_wdl)
     
-    _, wdl_tgt_rev = jax.lax.scan(
+    (_, _), (value_tgt_rev, wdl_tgt_rev) = jax.lax.scan(
         scan_fn,
-        jnp.zeros((batch_size, 3)),
-        (reward_wdl[::-1], data.terminated[::-1], wdl_next[::-1]),
+        (
+            jnp.zeros((batch_size,), dtype=data.root_value.dtype),
+            jnp.zeros((batch_size, 3), dtype=data.root_wdl.dtype),
+        ),
+        (
+            data.reward[::-1],
+            reward_wdl[::-1],
+            data.terminated[::-1],
+            data.discount[::-1],
+            value_next[::-1],
+            wdl_next[::-1],
+        ),
     )
+    value_tgt = value_tgt_rev[::-1]
     wdl_tgt = wdl_tgt_rev[::-1]
 
     return Sample(
         obs=data.obs, 
         policy_tgt=data.action_weights, 
+        value_tgt=value_tgt,
         wdl_tgt=wdl_tgt,
         mask=value_mask,
     )
@@ -627,7 +654,7 @@ def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
     - 策略损失：交叉熵。policy_tgt 与 obs 处于同一归一化视角，可直接比较。
-    - 价值损失：WDL 交叉熵（比标量 MSE 梯度信号更强，精确区分"和棋"与"不确定"）
+    - 价值损失：搜索 value TD(λ) 为主，WDL 交叉熵为辅。
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
@@ -638,23 +665,34 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
 
-    logits, _value, wdl_logits = forward(params, obs, is_training=True, rng_key=rng_dropout)
+    logits, value_pred, wdl_logits = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
     logits = logits.astype(jnp.float32)
+    value_pred = value_pred.astype(jnp.float32)
     wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
+    value_tgt = samples.value_tgt.astype(jnp.float32)
     wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
 
     # 策略损失（交叉熵）
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
-    # 价值损失：WDL 交叉熵（目标已由 compute_targets 正确计算）
-    value_loss_per = -jnp.sum(wdl_tgt * jax.nn.log_softmax(wdl_logits, axis=-1), axis=-1)
-    value_loss = jnp.sum(value_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+    # 搜索 value 监督：用搜索改进后的 root_value 递推目标，避免 value 主要靠自举学自己。
+    scalar_loss_per = optax.huber_loss(value_pred, value_tgt, delta=1.0)
+    scalar_loss = jnp.sum(scalar_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+
+    # WDL 监督保留为辅助锚点，帮助区分和棋与不确定局面。
+    wdl_loss_per = -jnp.sum(wdl_tgt * jax.nn.log_softmax(wdl_logits, axis=-1), axis=-1)
+    wdl_loss = jnp.sum(wdl_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
+
+    value_loss = (
+        config.search_value_loss_weight * scalar_loss
+        + config.wdl_loss_weight * wdl_loss
+    )
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
-    return total_loss, (policy_loss, value_loss)
+    return total_loss, (policy_loss, value_loss, scalar_loss, wdl_loss)
 
 
 def _run_best_checkpoint_eval(
@@ -880,13 +918,14 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 class ReplayBuffer:
     """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）
     
-    存储：obs, policy_tgt(与 obs 同视角), wdl_tgt, mask
+    存储：obs, policy_tgt(与 obs 同视角), value_tgt, wdl_tgt, mask
     """
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
         self.max_size = max_size
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
         self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
+        self.value_tgt = np.zeros((max_size,), dtype=np.float32)
         self.wdl_tgt = np.zeros((max_size, 3), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
         self.ptr = 0
@@ -905,11 +944,12 @@ class ReplayBuffer:
         return np.random.default_rng(int(seed))
 
     def add(self, samples: Sample):
-        """存入样本（JAX -> NumPy，含 obs/policy_tgt/wdl_tgt/mask）"""
+        """存入样本（JAX -> NumPy，含 obs/policy_tgt/value_tgt/wdl_tgt/mask）"""
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
+        value_flat = samples_np.value_tgt.reshape(-1)
         wdl_flat = samples_np.wdl_tgt.reshape(-1, 3)
         mask_flat = samples_np.mask.reshape(-1)
         
@@ -918,6 +958,7 @@ class ReplayBuffer:
         
         self.obs[indices] = obs_flat
         self.policy_tgt[indices] = policy_flat
+        self.value_tgt[indices] = value_flat
         self.wdl_tgt[indices] = wdl_flat
         self.mask[indices] = mask_flat
         self.ptr = (self.ptr + n_new) % self.max_size
@@ -943,12 +984,14 @@ class ReplayBuffer:
         
         obs_batch = self.obs[idx]
         policy_batch = self.policy_tgt[idx]
+        value_batch = self.value_tgt[idx]
         wdl_batch = self.wdl_tgt[idx]
         mask_batch = self.mask[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
+            value_tgt=jnp.asarray(value_batch),
             wdl_tgt=jnp.asarray(wdl_batch),
             mask=jnp.asarray(mask_batch),
         )
@@ -963,13 +1006,16 @@ class ReplayBuffer:
     def state_dict(self):
         return {
             "obs": self.obs, "policy_tgt": self.policy_tgt,
-            "wdl_tgt": self.wdl_tgt, "mask": self.mask,
+            "value_tgt": self.value_tgt, "wdl_tgt": self.wdl_tgt, "mask": self.mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
     def load_state_dict(self, state):
         loaded_obs = np.array(state["obs"])
         loaded_policy = np.array(state["policy_tgt"])
+        loaded_value = np.array(
+            state.get("value_tgt", np.array(state["wdl_tgt"])[:, 0] - np.array(state["wdl_tgt"])[:, 2])
+        )
         loaded_wdl = np.array(state["wdl_tgt"])
         loaded_mask = np.array(state["mask"])
         loaded_size = int(state["size"])
@@ -979,6 +1025,7 @@ class ReplayBuffer:
         if old_max <= self.max_size:
             self.obs[:old_max] = loaded_obs
             self.policy_tgt[:old_max] = loaded_policy
+            self.value_tgt[:old_max] = loaded_value
             self.wdl_tgt[:old_max] = loaded_wdl
             self.mask[:old_max] = loaded_mask
             self.size = actual_samples
@@ -986,6 +1033,7 @@ class ReplayBuffer:
         else:
             self.obs[:] = loaded_obs[:self.max_size]
             self.policy_tgt[:] = loaded_policy[:self.max_size]
+            self.value_tgt[:] = loaded_value[:self.max_size]
             self.wdl_tgt[:] = loaded_wdl[:self.max_size]
             self.mask[:] = loaded_mask[:self.max_size]
             self.size = self.max_size
@@ -1247,7 +1295,12 @@ def main():
         config.lr_cosine_steps // 266,
         config.lr_warmup_steps,
     )
-    logger.info("[TD(λ)] 固定 λ=%s", config.td_lambda)
+    logger.info(
+        "[TD(λ)] 固定 λ=%s | value_loss: search=%.2f wdl=%.2f",
+        config.td_lambda,
+        config.search_value_loss_weight,
+        config.wdl_loss_weight,
+    )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
@@ -1284,9 +1337,9 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        grads, (ploss, vloss, svloss, wdloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, ploss, vloss
+        return optax.apply_updates(params, updates), opt_state, ploss, vloss, svloss, wdloss
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1343,7 +1396,7 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), dirichlet=fullgame(enabled=%s) alpha=%.2f eps=%.2f",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), dirichlet(enabled=%s) alpha=%.2f eps=%.2f",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
@@ -1422,14 +1475,16 @@ def main():
                     list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
             return batch, keys
 
-        ploss_acc, vloss_acc = None, None
+        ploss_acc, vloss_acc, svloss_acc, wdloss_acc = None, None, None, None
         next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
 
         for i in range(num_updates):
             batch, train_keys = next_batch, next_keys
             
             try:
-                params, opt_state, ploss, vloss = train_step(params, opt_state, batch, train_keys)
+                params, opt_state, ploss, vloss, svloss, wdloss = train_step(
+                    params, opt_state, batch, train_keys
+                )
             except jax.errors.JaxRuntimeError as e:
                 msg = str(e).lower()
                 if ("resource_exhausted" in msg) or ("out of memory" in msg):
@@ -1446,10 +1501,12 @@ def main():
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
-                ploss_acc, vloss_acc = ploss, vloss
+                ploss_acc, vloss_acc, svloss_acc, wdloss_acc = ploss, vloss, svloss, wdloss
             else:
                 ploss_acc = ploss_acc + ploss
                 vloss_acc = vloss_acc + vloss
+                svloss_acc = svloss_acc + svloss
+                wdloss_acc = wdloss_acc + wdloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
@@ -1458,9 +1515,13 @@ def main():
         if num_updates > 0:
             policy_loss = float(ploss_acc.mean() / num_updates)
             value_loss = float(vloss_acc.mean() / num_updates)
+            search_value_loss = float(svloss_acc.mean() / num_updates)
+            wdl_loss = float(wdloss_acc.mean() / num_updates)
         else:
             policy_loss = 0.0
             value_loss = 0.0
+            search_value_loss = 0.0
+            wdl_loss = 0.0
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
@@ -1471,11 +1532,13 @@ def main():
         buf_stats = replay_buffer.stats()
         total_elapsed = time.time() - start_time_total
         logger.info(
-            "iter=%3d | ploss=%.4f vloss=%.4f | len=%4.1f fps=%4.0f "
+            "iter=%3d | ploss=%.4f vloss=%.4f (sv=%.4f wdl=%.4f) | len=%4.1f fps=%4.0f "
             "buf=%dk train=%d | ent=%.3f(开%.3f/中%.3f) | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
             iteration,
             policy_loss,
             value_loss,
+            search_value_loss,
+            wdl_loss,
             avg_length,
             fps,
             buf_stats["size"] // 1000,
@@ -1494,6 +1557,8 @@ def main():
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
+        writer.add_scalar("train/search_value_loss", search_value_loss, iteration)
+        writer.add_scalar("train/wdl_loss", wdl_loss, iteration)
         writer.add_scalar("train/lr", base_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
