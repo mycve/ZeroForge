@@ -76,7 +76,7 @@ class Config:
     lr_min_ratio: float = 0.2        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
-    policy_label_smoothing: float = 0.03   # 策略标签平滑，抑制 MCTS 尖锐目标导致的过自信
+    policy_label_smoothing: float = 0.01   # 策略标签平滑，抑制 MCTS 尖锐目标导致的过自信
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
