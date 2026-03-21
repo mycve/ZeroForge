@@ -3,9 +3,10 @@
 ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
-- Gumbel-Top-k MCTS：搜索内探索 + 温度退火采样（下限 0.10，可选根节点 Dirichlet 扰动）
+- Gumbel-Top-k MCTS：搜索质量优先（80 sim），温度退火采样（下限 0.25）
 - 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
 - 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
+- WDL bootstrap：用搜索校正后的 root_value 构造，减少自举偏差
 - 标准 ELO 评估
 """
 
@@ -74,23 +75,20 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.45
-    search_value_loss_weight: float = 1.0
-    wdl_loss_weight: float = 0.5
+    td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    policy_label_smoothing: float = 0.03   # 策略标签平滑，抑制 MCTS 尖锐目标导致的过自信
     
-    # 自对弈与搜索：Gumbel-Top-k，全程保持探索，避免过早坍缩为单线自博弈
-    selfplay_batch_size: int = 512
-    num_simulations: int = 40            # Gumbel 低模拟即可，快速生成对局更重要
+    # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
+    selfplay_batch_size: int = 256       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 96            # 96 次模拟显著提升搜索质量，训练目标更可靠
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 30    # 前 30 半步线性退火，后续保持尾温 0.10 持续采样
-    selfplay_temperature: float = 1.00      # 自对弈起始温度（更鼓励分支展开）
-    selfplay_temperature_final: float = 0.10  # 温度退火下限；达到后全程保持，避免过早贪心坍缩
-    opening_dirichlet_alpha: float = 0.30
-    opening_dirichlet_epsilon: float = 0.0
+    selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
+    selfplay_temperature: float = 1.00      # 自对弈起始温度
+    selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000
-    sample_reuse_times: int = 2         # 2 是当前推荐默认；1 更稳，3 以上更容易吃旧样本
+    replay_buffer_size: int = 500_000    # 配合 batch_size=256，约 10 轮填满
+    sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     
     # 损失权重
     value_loss_weight: float = 1.0
@@ -125,8 +123,7 @@ def parse_args():
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
-    parser.add_argument("--search-value-loss-weight", type=float, default=None, help="覆盖 search_value_loss_weight")
-    parser.add_argument("--wdl-loss-weight", type=float, default=None, help="覆盖 wdl_loss_weight")
+    parser.add_argument("--policy-label-smoothing", type=float, default=None, help="覆盖 policy_label_smoothing")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
@@ -137,8 +134,6 @@ def parse_args():
     parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
     parser.add_argument("--selfplay-temperature-final", type=float, default=None, help="覆盖 selfplay_temperature_final")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
-    parser.add_argument("--opening-dirichlet-alpha", type=float, default=None, help="覆盖 opening_dirichlet_alpha")
-    parser.add_argument("--opening-dirichlet-epsilon", type=float, default=None, help="覆盖 opening_dirichlet_epsilon")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
     return parser.parse_args()
 
@@ -147,8 +142,7 @@ def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
         "td_lambda": args.td_lambda,
-        "search_value_loss_weight": args.search_value_loss_weight,
-        "wdl_loss_weight": args.wdl_loss_weight,
+        "policy_label_smoothing": args.policy_label_smoothing,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
@@ -159,8 +153,6 @@ def apply_cli_overrides(args):
         "selfplay_temperature_steps": args.selfplay_temperature_steps,
         "selfplay_temperature_final": args.selfplay_temperature_final,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
-        "opening_dirichlet_alpha": args.opening_dirichlet_alpha,
-        "opening_dirichlet_epsilon": args.opening_dirichlet_epsilon,
         "eval_gumbel_scale": args.eval_gumbel_scale,
     }
     applied = {}
@@ -232,15 +224,9 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
-if config.search_value_loss_weight < 0:
+if not (0.0 <= config.policy_label_smoothing < 1.0):
     raise ValueError(
-        "search_value_loss_weight 必须 >= 0，"
-        f"当前值: {config.search_value_loss_weight}"
-    )
-if config.wdl_loss_weight < 0:
-    raise ValueError(
-        "wdl_loss_weight 必须 >= 0，"
-        f"当前值: {config.wdl_loss_weight}"
+        f"policy_label_smoothing 必须在 [0, 1)，当前值: {config.policy_label_smoothing}"
     )
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
     raise ValueError(
@@ -250,15 +236,6 @@ if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
 if config.selfplay_temperature_steps < 0:
     raise ValueError(
         f"selfplay_temperature_steps 必须 >= 0，当前值: {config.selfplay_temperature_steps}"
-    )
-if config.opening_dirichlet_alpha <= 0:
-    raise ValueError(
-        f"opening_dirichlet_alpha 必须 > 0，当前值: {config.opening_dirichlet_alpha}"
-    )
-if not (0.0 <= config.opening_dirichlet_epsilon <= 1.0):
-    raise ValueError(
-        "opening_dirichlet_epsilon 必须在 [0, 1]，"
-        f"当前值: {config.opening_dirichlet_epsilon}"
     )
 # 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
 # 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
@@ -288,26 +265,6 @@ def _opening_temperature(step_count: jnp.ndarray) -> jnp.ndarray:
     )
     return jnp.maximum(temp, config.selfplay_temperature_final).astype(jnp.float32)
 
-
-def _apply_root_dirichlet_noise(
-    logits: jnp.ndarray,
-    legal_mask: jnp.ndarray,
-    rng_key,
-) -> jnp.ndarray:
-    """可选地对根节点先验注入 Dirichlet 扰动。"""
-    base_probs = _masked_normalize(jax.nn.softmax(logits, axis=-1), legal_mask)
-    if config.opening_dirichlet_epsilon <= 0.0:
-        return jnp.where(legal_mask, jnp.log(base_probs + 1e-10), jnp.finfo(logits.dtype).min)
-
-    gamma_shape = jnp.full(logits.shape, config.opening_dirichlet_alpha, dtype=logits.dtype)
-    dirichlet_noise = jax.random.gamma(rng_key, gamma_shape)
-    dirichlet_noise = _masked_normalize(dirichlet_noise, legal_mask)
-    mixed_probs = (
-        (1.0 - config.opening_dirichlet_epsilon) * base_probs
-        + config.opening_dirichlet_epsilon * dirichlet_noise
-    )
-    final_probs = _masked_normalize(mixed_probs, legal_mask)
-    return jnp.where(legal_mask, jnp.log(final_probs + 1e-10), jnp.finfo(logits.dtype).min)
 
 def replicate_to_devices(pytree):
     """将 pytree 复制到所有设备"""
@@ -434,16 +391,13 @@ def selfplay(params, rng_key, batch_size):
     - Gumbel-Top-k：探索在搜索内完成，并辅以全程根噪声 + 温度退火采样
     """
     def step_fn(state, key):
-        key_search, key_sample, key_reset = jax.random.split(key, 3)
-        key_dirichlet, key_mcts = jax.random.split(key_search)
+        key_mcts, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
         logits, value, wdl_logits = forward(params, obs)
-        root_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) WDL 概率
+        raw_wdl = jax.nn.softmax(wdl_logits, axis=-1)  # (B, 3) 网络原始 WDL
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
-        logits = _apply_root_dirichlet_noise(
-            logits, state.legal_action_mask, key_dirichlet
-        )
+        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
         
         # MCTS 搜索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
@@ -457,7 +411,19 @@ def selfplay(params, rng_key, batch_size):
         )
         action_weights = policy_output.action_weights
         root_value = policy_output.search_tree.node_values[:, 0]
-        
+
+        # 用搜索校正后的 root_value 构造 WDL bootstrap：
+        # 保留网络 Draw 概率作为锚点，按 root_value 重新分配 W/L 质量。
+        # 比直接用网络原始 WDL 更准确，因为搜索已经修正了价值估计。
+        search_v = jnp.clip(root_value, -1.0, 1.0)
+        raw_d = raw_wdl[:, 1]
+        wl_mass = jnp.clip(1.0 - raw_d, 0.0, 1.0)
+        root_wdl = jnp.stack([
+            wl_mass * (1.0 + search_v) * 0.5,   # W
+            raw_d,                                 # D（保留网络估计）
+            wl_mass * (1.0 - search_v) * 0.5,   # L
+        ], axis=-1)
+
         # 仅有一个合法走法的局面：直接用唯一走法覆盖 MCTS 结果
         legal_counts = jnp.sum(state.legal_action_mask, axis=-1)
         only_one_move = legal_counts == 1
@@ -465,6 +431,7 @@ def selfplay(params, rng_key, batch_size):
         one_hot = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
+        root_wdl = jnp.where(only_one_move[:, None], raw_wdl, root_wdl)
 
         def _sample_action(w, legal_mask, temperature, sample_key):
             # 在 log 空间做温度缩放，避免小概率动作下溢。
@@ -527,8 +494,8 @@ def selfplay(params, rng_key, batch_size):
 def compute_targets(data: SelfplayOutput):
     """计算训练目标。
 
-    - value_tgt: 用搜索后的 root_value 做 TD(λ) 标量目标，兼顾密集监督与终局锚点。
-    - wdl_tgt: 保留 WDL TD(λ) 目标，作为价值头的语义辅助监督。
+    - value_tgt: 搜索校正后的 root_value TD(λ) 标量目标。
+    - wdl_tgt: 搜索校正后的 WDL TD(λ) 目标（root_wdl 已用 root_value 调整过）。
     """
     max_steps, batch_size = data.reward.shape[0], data.reward.shape[1]
     lam = config.td_lambda
@@ -536,7 +503,7 @@ def compute_targets(data: SelfplayOutput):
     # 掩码：游戏结束前的步骤参与训练
     value_mask = jnp.cumsum(data.terminated[::-1, :], axis=0)[::-1, :] >= 1
     
-    # s_{t+1} 的搜索价值 / WDL 预测，用于 bootstrap
+    # s_{t+1} 的搜索校正后价值 / WDL，用于 bootstrap
     value_next = jnp.concatenate(
         [data.root_value[1:], jnp.zeros((1, batch_size), dtype=data.root_value.dtype)], axis=0
     )
@@ -653,8 +620,8 @@ def compute_selfplay_stats(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵。policy_tgt 与 obs 处于同一归一化视角，可直接比较。
-    - 价值损失：搜索 value TD(λ) 为主，WDL 交叉熵为辅。
+    - 策略损失：交叉熵 + label smoothing，抑制 MCTS 尖锐目标导致的过自信。
+    - 价值损失：WDL 交叉熵（KataGo 标准做法，scalar value = W-L 已隐式监督）。
     """
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
@@ -665,34 +632,27 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
 
-    logits, value_pred, wdl_logits = forward(params, obs, is_training=True, rng_key=rng_dropout)
+    logits, _, wdl_logits = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
     logits = logits.astype(jnp.float32)
-    value_pred = value_pred.astype(jnp.float32)
     wdl_logits = wdl_logits.astype(jnp.float32)
     policy_tgt = policy_tgt.astype(jnp.float32)
-    value_tgt = samples.value_tgt.astype(jnp.float32)
-    wdl_tgt = samples.wdl_tgt.astype(jnp.float32)  # (B, 3) WDL 概率分布
+    wdl_tgt = samples.wdl_tgt.astype(jnp.float32)
 
-    # 策略损失（交叉熵）
+    # 策略损失：label smoothing 防止 logit 被推向 ±∞
+    eps = config.policy_label_smoothing
+    if eps > 0:
+        n_actions = logits.shape[-1]
+        policy_tgt = (1.0 - eps) * policy_tgt + eps / n_actions
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
-    
-    # 搜索 value 监督：用搜索改进后的 root_value 递推目标，避免 value 主要靠自举学自己。
-    scalar_loss_per = optax.huber_loss(value_pred, value_tgt, delta=1.0)
-    scalar_loss = jnp.sum(scalar_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
-    # WDL 监督保留为辅助锚点，帮助区分和棋与不确定局面。
+    # 价值损失：WDL 交叉熵
     wdl_loss_per = -jnp.sum(wdl_tgt * jax.nn.log_softmax(wdl_logits, axis=-1), axis=-1)
-    wdl_loss = jnp.sum(wdl_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
-
-    value_loss = (
-        config.search_value_loss_weight * scalar_loss
-        + config.wdl_loss_weight * wdl_loss
-    )
+    value_loss = jnp.sum(wdl_loss_per * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
     
     total_loss = policy_loss + config.value_loss_weight * value_loss
-    return total_loss, (policy_loss, value_loss, scalar_loss, wdl_loss)
+    return total_loss, (policy_loss, value_loss)
 
 
 def _run_best_checkpoint_eval(
@@ -1296,10 +1256,10 @@ def main():
         config.lr_warmup_steps,
     )
     logger.info(
-        "[TD(λ)] 固定 λ=%s | value_loss: search=%.2f wdl=%.2f",
+        "[TD(λ)] 固定 λ=%s | value_loss_weight=%.2f | policy_label_smoothing=%.3f",
         config.td_lambda,
-        config.search_value_loss_weight,
-        config.wdl_loss_weight,
+        config.value_loss_weight,
+        config.policy_label_smoothing,
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
@@ -1337,19 +1297,18 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, (ploss, vloss, svloss, wdloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        grads, (ploss, vloss) = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, ploss, vloss, svloss, wdloss
+        return optax.apply_updates(params, updates), opt_state, ploss, vloss
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
-        f"_td{config.td_lambda}_vw{config.value_loss_weight}"
+        f"_td{config.td_lambda}_vw{config.value_loss_weight}_ls{config.policy_label_smoothing}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
-        f"_da{config.opening_dirichlet_alpha:.2f}_de{config.opening_dirichlet_epsilon:.2f}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
     logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
@@ -1396,16 +1355,14 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), dirichlet(enabled=%s) alpha=%.2f eps=%.2f",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), label_smoothing=%.3f",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
         config.selfplay_temperature_final,
-        config.opening_dirichlet_epsilon > 0.0,
-        config.opening_dirichlet_alpha,
-        config.opening_dirichlet_epsilon,
+        config.policy_label_smoothing,
     )
 
     while True:
@@ -1475,14 +1432,14 @@ def main():
                     list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
             return batch, keys
 
-        ploss_acc, vloss_acc, svloss_acc, wdloss_acc = None, None, None, None
+        ploss_acc, vloss_acc = None, None
         next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
 
         for i in range(num_updates):
             batch, train_keys = next_batch, next_keys
             
             try:
-                params, opt_state, ploss, vloss, svloss, wdloss = train_step(
+                params, opt_state, ploss, vloss = train_step(
                     params, opt_state, batch, train_keys
                 )
             except jax.errors.JaxRuntimeError as e:
@@ -1501,12 +1458,10 @@ def main():
             
             # 累积损失（保持在 GPU），只在最后同步
             if ploss_acc is None:
-                ploss_acc, vloss_acc, svloss_acc, wdloss_acc = ploss, vloss, svloss, wdloss
+                ploss_acc, vloss_acc = ploss, vloss
             else:
                 ploss_acc = ploss_acc + ploss
                 vloss_acc = vloss_acc + vloss
-                svloss_acc = svloss_acc + svloss
-                wdloss_acc = wdloss_acc + wdloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
@@ -1515,13 +1470,9 @@ def main():
         if num_updates > 0:
             policy_loss = float(ploss_acc.mean() / num_updates)
             value_loss = float(vloss_acc.mean() / num_updates)
-            search_value_loss = float(svloss_acc.mean() / num_updates)
-            wdl_loss = float(wdloss_acc.mean() / num_updates)
         else:
             policy_loss = 0.0
             value_loss = 0.0
-            search_value_loss = 0.0
-            wdl_loss = 0.0
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
@@ -1532,13 +1483,11 @@ def main():
         buf_stats = replay_buffer.stats()
         total_elapsed = time.time() - start_time_total
         logger.info(
-            "iter=%3d | ploss=%.4f vloss=%.4f (sv=%.4f wdl=%.4f) | len=%4.1f fps=%4.0f "
+            "iter=%3d | ploss=%.4f vloss=%.4f | len=%4.1f fps=%4.0f "
             "buf=%dk train=%d | ent=%.3f(开%.3f/中%.3f) | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
             iteration,
             policy_loss,
             value_loss,
-            search_value_loss,
-            wdl_loss,
             avg_length,
             fps,
             buf_stats["size"] // 1000,
@@ -1557,8 +1506,6 @@ def main():
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
-        writer.add_scalar("train/search_value_loss", search_value_loss, iteration)
-        writer.add_scalar("train/wdl_loss", wdl_loss, iteration)
         writer.add_scalar("train/lr", base_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)
