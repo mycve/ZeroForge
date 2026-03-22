@@ -282,13 +282,10 @@ class PolicyHead(nn.Module):
 # ============================================================================
 
 class ValueHead(nn.Module):
-    """WDL (Win/Draw/Loss) value head
+    """标量价值头：Win / Draw / Loss 三个 logits 参数化局面，value = p_W − p_L（∈ [-1,1]）。
 
-    四路池化（attention + mean + max + std）→ MLP → 3-class softmax
-    std 池化刻画局面不确定性，丰富价值表示。
-    输出: (value_scalar, wdl_logits)
-      - value_scalar: W - L ∈ [-1, 1]，供 MCTS 使用
-      - wdl_logits: (B, 3) 原始 logits，供交叉熵 loss 使用
+    四路池化（attention + mean + max + std）→ MLP → Dense(3)。
+    训练只对 **标量 value** 与 **value_tgt**（MCTS 根价值 TD(λ)）做 MSE，梯度回传至三 logits；**不做**三分类交叉熵。
     """
     model_dim: int
     dtype: jnp.dtype = jnp.float32
@@ -309,10 +306,10 @@ class ValueHead(nn.Module):
         fused = nn.Dense(self.model_dim, dtype=self.dtype, name="fc2")(fused)
         fused = nn.silu(fused)
 
-        wdl_logits = nn.Dense(3, dtype=self.dtype, name="wdl_out")(fused)  # (B, 3)
-        wdl_probs = nn.softmax(wdl_logits, axis=-1)
-        value = wdl_probs[:, 0] - wdl_probs[:, 2]  # W - L
-        return value, wdl_logits
+        value_logits = nn.Dense(3, dtype=self.dtype, name="value_logits")(fused)  # (B, 3)
+        probs = nn.softmax(value_logits, axis=-1)
+        value = probs[:, 0] - probs[:, 2]  # W - L
+        return value, value_logits
 
 
 # ============================================================================
@@ -323,10 +320,10 @@ class AlphaZeroNetwork(nn.Module):
     """精简 3 分支 GNN AlphaZero 网络（Local 8 邻居 + Row + Col，无 Global）
 
     输入: (B, C, H, W) 观察张量（126 通道 = 9 帧 × 14 棋子类型）
-    输出: (policy_logits, value, wdl_logits)
+    输出: (policy_logits, value, value_logits)
         - policy_logits: (B, ACTION_SPACE_SIZE)
-        - value: (B,) in [-1, 1]  (= W - L，供 MCTS 使用)
-        - wdl_logits: (B, 3) 原始 logits (供训练 cross-entropy loss)
+        - value: (B,) in [-1, 1]，由 value_logits 经 softmax 得 p_W、p_L 后 value = p_W − p_L
+        - value_logits: (B, 3)；价值损失为 MSE(value, value_tgt)，不单独对 logits 做 CE
     """
     action_space_size: int = ACTION_SPACE_SIZE
     channels: int = 128
@@ -343,7 +340,10 @@ class AlphaZeroNetwork(nn.Module):
         self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(
+        self, x: jnp.ndarray, train: bool = True
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """返回 (policy_logits, value, value_logits)。"""
         if x.ndim != 4:
             raise ValueError(f"输入必须是 4D (B,C,H,W), 实际 ndim={x.ndim}")
         if x.shape[2] != BOARD_HEIGHT or x.shape[3] != BOARD_WIDTH:
@@ -460,9 +460,9 @@ class AlphaZeroNetwork(nn.Module):
             dtype=self.dtype,
         )(h, self.action_from_idx, self.action_to_idx)
 
-        value, wdl_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
+        value, value_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
         return (
             policy_logits.astype(jnp.float32),
             value.astype(jnp.float32),
-            wdl_logits.astype(jnp.float32),
+            value_logits.astype(jnp.float32),
         )
