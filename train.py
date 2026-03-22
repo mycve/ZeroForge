@@ -80,7 +80,7 @@ class Config:
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 96            # 96 次模拟显著提升搜索质量，训练目标更可靠
+    num_simulations: int = 32            # 96 次模拟显著提升搜索质量，训练目标更可靠
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
     selfplay_temperature: float = 1.00      # 自对弈起始温度
