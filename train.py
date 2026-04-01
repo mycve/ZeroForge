@@ -76,7 +76,6 @@ class Config:
     lr_min_ratio: float = 0.2        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
-    policy_label_smoothing: float = 0.01   # 策略标签平滑，抑制 MCTS 尖锐目标导致的过自信
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
@@ -123,7 +122,6 @@ def parse_args():
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
-    parser.add_argument("--policy-label-smoothing", type=float, default=None, help="覆盖 policy_label_smoothing")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
@@ -142,7 +140,6 @@ def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
         "td_lambda": args.td_lambda,
-        "policy_label_smoothing": args.policy_label_smoothing,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
@@ -224,10 +221,6 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
-if not (0.0 <= config.policy_label_smoothing < 1.0):
-    raise ValueError(
-        f"policy_label_smoothing 必须在 [0, 1)，当前值: {config.policy_label_smoothing}"
-    )
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
     raise ValueError(
         "selfplay_temperature 与 selfplay_temperature_final 必须 > 0，"
@@ -578,7 +571,7 @@ def compute_selfplay_stats(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵 + label smoothing，拟合 mctx 的 action_weights。
+    - 策略损失：交叉熵，拟合 mctx 的 action_weights。
     - 价值损失：MSE(value, value_tgt)；value 由 value_logits 导出（p_W − p_L）。
     """
     obs = samples.obs.astype(jnp.float32)
@@ -597,11 +590,7 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
 
-    # 策略损失：label smoothing 防止 logit 被推向 ±∞
-    eps = config.policy_label_smoothing
-    if eps > 0:
-        n_actions = logits.shape[-1]
-        policy_tgt = (1.0 - eps) * policy_tgt + eps / n_actions
+    # 策略损失：直接蒸馏 MCTS 目标分布
     policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
@@ -711,7 +700,7 @@ def _load_eval_fen_pool(eval_fens_path: str) -> Tuple[np.ndarray, np.ndarray]:
     return boards, players
 
 
-def _build_eval_initial_states(batch_size: int) -> Tuple["XiangqiState", "XiangqiState"]:
+def _build_eval_initial_states(batch_size: int):
     """基于固定评估 FEN 构建红黑交换评估局面。"""
     batch_per_device = batch_size // num_devices
     if batch_per_device * num_devices != batch_size:
@@ -1204,10 +1193,9 @@ def main():
         config.lr_warmup_steps,
     )
     logger.info(
-        "[TD(λ)] 固定 λ=%s | value_loss_weight=%.2f | policy_label_smoothing=%.3f",
+        "[TD(λ)] 固定 λ=%s | value_loss_weight=%.2f",
         config.td_lambda,
         config.value_loss_weight,
-        config.policy_label_smoothing,
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
@@ -1254,7 +1242,7 @@ def main():
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
-        f"_td{config.td_lambda}_vw{config.value_loss_weight}_ls{config.policy_label_smoothing}"
+        f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
     )
@@ -1303,14 +1291,13 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), label_smoothing=%.3f",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold)",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
         config.selfplay_temperature_final,
-        config.policy_label_smoothing,
     )
 
     while True:
