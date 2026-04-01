@@ -64,7 +64,7 @@ class Config:
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
     num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
-    num_blocks: int = 8       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
+    num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -79,15 +79,15 @@ class Config:
     policy_label_smoothing: float = 0.01   # 策略标签平滑，抑制 MCTS 尖锐目标导致的过自信
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
+    selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 40            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
     selfplay_temperature: float = 1.00      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000    # 配合 batch_size=256，约 10 轮填满
+    replay_buffer_size: int = 2_000_000    # 配合 batch_size=256，约 10 轮填满
     sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     
     # 损失权重
@@ -105,7 +105,7 @@ class Config:
     
     # ELO 评估
     eval_interval: int = 20
-    eval_games: int = 100
+    eval_games: int = 96
     eval_fens_path: str = "eval_fens.txt"
     past_model_offset: int = 20
     # Checkpoint 配置
