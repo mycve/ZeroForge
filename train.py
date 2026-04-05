@@ -577,9 +577,9 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = samples.obs.astype(jnp.float32)
     policy_tgt = samples.policy_tgt
 
-    # 随机左右镜像增强（30% 概率）
+    # 随机左右镜像增强（70% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
-    do_mirror = jax.random.bernoulli(rng_mirror, 0.3)
+    do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
     obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
     policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
 
