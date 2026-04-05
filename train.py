@@ -79,27 +79,27 @@ class Config:
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 2048       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 16            # 增大可提升 MCTS 质量（更耗算力）
+    num_simulations: int = 24            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.5  # 尾温 0.5 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 2_500_000    # 配合 batch_size=256，约 10 轮填满
+    replay_buffer_size: int = 1_500_000    # 配合 batch_size=256，约 10 轮填满
     sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.5   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
     max_steps: int = 300              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
-    repetition_threshold: int = 5     # 非将非捉重复局面 3 次判和
+    repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
     
     # ELO 评估
