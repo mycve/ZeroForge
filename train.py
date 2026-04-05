@@ -75,18 +75,18 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.98              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 2048       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
+    num_simulations: int = 16            # 增大可提升 MCTS 质量（更耗算力）
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
     selfplay_temperature: float = 1.0      # 自对弈起始温度
-    selfplay_temperature_final: float = 0.8  # 尾温 0.8 保证中残局仍有分支多样性
+    selfplay_temperature_final: float = 0.5  # 尾温 0.5 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 5_000_000    # 配合 batch_size=256，约 10 轮填满
+    replay_buffer_size: int = 2_500_000    # 配合 batch_size=256，约 10 轮填满
     sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     
     # 损失权重
