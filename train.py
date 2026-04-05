@@ -73,27 +73,27 @@ class Config:
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.2        # 最低 LR = peak × 0.01 = 1e-5
+    lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 4096
-    td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    td_lambda: float = 0.98              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 64            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 4                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 80    # 缓退火 80 半步，给开局充分探索时间
-    selfplay_temperature: float = 1.00      # 自对弈起始温度
-    selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
+    selfplay_batch_size: int = 2048       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 20            # 增大可提升 MCTS 质量（更耗算力）
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 60    # 缓退火 60 半步，给开局充分探索时间
+    selfplay_temperature: float = 1.0      # 自对弈起始温度
+    selfplay_temperature_final: float = 0.8  # 尾温 0.8 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000    # 配合 batch_size=256，约 10 轮填满
+    replay_buffer_size: int = 5_000_000    # 配合 batch_size=256，约 10 轮填满
     sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     
     # 损失权重
     value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    selfplay_gumbel_scale: float = 1.5   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
