@@ -75,7 +75,7 @@ class Config:
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
-    training_batch_size: int = 4096
+    training_batch_size: int = 4096 * 2
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
@@ -566,7 +566,7 @@ def loss_fn(params, samples: Sample, rng_key):
 
     # 随机左右镜像增强（70% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
-    do_mirror = jax.random.bernoulli(rng_mirror, 0.1)
+    do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
 
     def _apply_mirror(args):
         obs_in, idx_in, prob_in = args
