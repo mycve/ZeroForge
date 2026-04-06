@@ -5,7 +5,7 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 架构：
 - Gumbel-Top-k MCTS：模拟次数见 `Config.num_simulations`；温度退火采样（下限见 `selfplay_temperature_final`）
 - 视角归一化：obs 始终以当前行棋方为视角；策略目标与 obs 保持同一视角
-- 镜像增强：70% 概率左右翻转 obs 与策略目标
+- 镜像增强：默认 30% 概率左右翻转 obs 与策略目标
 - 价值：策略蒸馏 `action_weights`；价值为 MCTS 根 `root_value` 的 TD(λ) 标量目标，对网络 `value`（由 `value_logits` 得 W−L）做 MSE
 - 标准 ELO 评估
 """
@@ -89,6 +89,7 @@ class Config:
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_500_000    # 配合 batch_size=256，约 10 轮填满
     sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
+    mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
     value_loss_weight: float = 1.0
@@ -134,6 +135,7 @@ def parse_args():
     parser.add_argument("--selfplay-temperature-final", type=float, default=None, help="覆盖 selfplay_temperature_final")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
+    parser.add_argument("--mirror-augmentation-prob", type=float, default=None, help="覆盖 mirror_augmentation_prob")
     return parser.parse_args()
 
 
@@ -152,6 +154,7 @@ def apply_cli_overrides(args):
         "selfplay_temperature_final": args.selfplay_temperature_final,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
         "eval_gumbel_scale": args.eval_gumbel_scale,
+        "mirror_augmentation_prob": args.mirror_augmentation_prob,
     }
     applied = {}
     for key, value in overrides.items():
@@ -210,6 +213,11 @@ if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
 if config.selfplay_temperature_steps < 0:
     raise ValueError(
         f"selfplay_temperature_steps 必须 >= 0，当前值: {config.selfplay_temperature_steps}"
+    )
+if not 0.0 <= config.mirror_augmentation_prob <= 1.0:
+    raise ValueError(
+        "mirror_augmentation_prob 必须在 [0, 1] 内，"
+        f"当前值: {config.mirror_augmentation_prob}"
     )
 # 预计算 180° 旋转索引：action i -> action rotate(i)，用于黑方视角与绝对坐标系互转
 # 动作空间始终以红方（绝对）坐标系定义，黑方时 obs 翻转、logits 需旋转后与绝对目标对齐
@@ -564,9 +572,9 @@ def loss_fn(params, samples: Sample, rng_key):
     policy_idx = samples.policy_idx.astype(jnp.int32)
     policy_prob = samples.policy_prob.astype(jnp.float32)
 
-    # 随机左右镜像增强（70% 概率）
+    # 随机左右镜像增强（默认 30% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
-    do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
+    do_mirror = jax.random.bernoulli(rng_mirror, config.mirror_augmentation_prob)
 
     def _apply_mirror(args):
         obs_in, idx_in, prob_in = args
