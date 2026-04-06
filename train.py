@@ -5,7 +5,7 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 架构：
 - Gumbel-Top-k MCTS：模拟次数见 `Config.num_simulations`；温度退火采样（下限见 `selfplay_temperature_final`）
 - 视角归一化：obs 始终以当前行棋方为视角；策略目标与 obs 保持同一视角
-- 镜像增强：30% 概率左右翻转 obs 与策略目标
+- 镜像增强：70% 概率左右翻转 obs 与策略目标
 - 价值：策略蒸馏 `action_weights`；价值为 MCTS 根 `root_value` 的 TD(λ) 标量目标，对网络 `value`（由 `value_logits` 得 W−L）做 MSE
 - 标准 ELO 评估
 """
@@ -67,15 +67,15 @@ class Config:
     num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
-    network_dtype: str = "bfloat16"
+    network_dtype: str = "float32"
     
     # 训练超参数
-    learning_rate: float = 2e-4       # AdamW 起始 LR
+    learning_rate: float = 3e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
+    lr_cosine_steps: int = 150000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.1        # 最低 LR = peak × 0.01 = 1e-5
-    training_batch_size: int = 4096 * 2
+    training_batch_size: int = 1024 * 8
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
