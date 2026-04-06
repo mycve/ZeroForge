@@ -73,7 +73,7 @@ class Config:
     learning_rate: float = 2e-4       # AdamW 起始 LR
     lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
+    lr_cosine_steps: int = 30000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 1024 * 8
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
@@ -83,11 +83,11 @@ class Config:
     num_simulations: int = 24            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
     selfplay_temperature_steps: int = 30    # 缓退火 30 半步，给开局充分探索时间
-    selfplay_temperature: float = 1.0      # 自对弈起始温度
+    selfplay_temperature: float = 1.2      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_500_000    # 配合 batch_size=256，约 10 轮填满
+    replay_buffer_size: int = 1_500_000    # 配合 batch_size=2048，约 4 轮填满
     sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
