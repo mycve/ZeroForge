@@ -6,6 +6,7 @@ ZeroForge UCI 引擎（高性能 + JAX 编译缓存）
 import os
 import sys
 import time
+import gc
 import argparse
 import logging
 import threading
@@ -131,6 +132,7 @@ class Engine:
         self._load_done = threading.Event()
         self._load_thread = None
         self._load_error = ""
+        self._search_count = 0
 
     # ------------------------------------------------------
 
@@ -443,6 +445,14 @@ class Engine:
                 "visits": visits,
                 "cp": cp,
             })
+
+        del summary
+        del policy
+        del root
+
+        self._search_count += 1
+        if self._search_count % 16 == 0:
+            gc.collect()
 
         return move, val, policy_info
 

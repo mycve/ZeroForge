@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import asyncio
+import gc
 import subprocess
 import threading
 import queue
@@ -70,11 +71,13 @@ PIKAFISH_PATH = Path(__file__).parent.parent / "pikafish"
 class UCIEngine:
     """UCI 引擎封装，全局单例"""
     
+    _QUEUE_MAXSIZE = 2048
+
     def __init__(self, path: str):
         self.path = path
         self.process = None
-        self.output_queue = queue.Queue()
-        self.stderr_queue = queue.Queue()
+        self.output_queue = queue.Queue(maxsize=self._QUEUE_MAXSIZE)
+        self.stderr_queue = queue.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._stop_event = threading.Event()
         self.lock = threading.Lock()
         self.ready = False
@@ -94,6 +97,17 @@ class UCIEngine:
             except queue.Empty:
                 break
         return items
+
+    def _push_queue(self, q: queue.Queue, line: str):
+        while True:
+            try:
+                q.put_nowait(line)
+                return
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    return
 
     def start(self) -> bool:
         """启动引擎"""
@@ -140,13 +154,13 @@ class UCIEngine:
         while not self._stop_event.is_set() and self.process and self.process.poll() is None:
             line = self.process.stdout.readline()
             if line:
-                self.output_queue.put(line.strip())
+                self._push_queue(self.output_queue, line.strip())
 
     def _read_stderr(self):
         while not self._stop_event.is_set() and self.process and self.process.poll() is None:
             line = self.process.stderr.readline()
             if line:
-                self.stderr_queue.put(line.strip())
+                self._push_queue(self.stderr_queue, line.strip())
 
     def send(self, cmd: str):
         if self.process and self.process.stdin:
@@ -238,6 +252,8 @@ class UCIEngine:
                     self.process.kill()
                     self.process.wait(timeout=2)
             self.process = None
+        self._clear_queue(self.output_queue)
+        self._clear_queue(self.stderr_queue)
 
 
 # 全局 UCI 引擎实例
@@ -446,6 +462,40 @@ def list_checkpoints(ckpt_dir: str) -> List[int]:
         if os.path.isdir(os.path.join(ckpt_dir, d)) and d.isdigit():
             steps.append(int(d))
     return sorted(steps, reverse=True)
+
+
+def snapshot_jax_state(state: XiangqiState) -> XiangqiState:
+    """将 JAX 状态转为 CPU 快照，避免历史记录长期占用设备内存。"""
+    return jax.tree_util.tree_map(lambda x: np.array(x, copy=True), state)
+
+
+def restore_jax_state(snapshot: XiangqiState) -> XiangqiState:
+    """将 CPU 快照恢复为 JAX 状态。"""
+    return jax.tree_util.tree_map(jnp.asarray, snapshot)
+
+
+def make_history_entry(
+    state: XiangqiState,
+    board: np.ndarray,
+    current_player: int,
+    last_move,
+    last_move_uci: str,
+    ai_value: float,
+    uci_score: Optional[int],
+    game_over: bool,
+    winner: int,
+):
+    return {
+        'jax_state': snapshot_jax_state(state),
+        'last_move': last_move,
+        'last_move_uci': last_move_uci,
+        'ai_value': ai_value,
+        'uci_score': uci_score,
+        'board': board.copy(),
+        'current_player': current_player,
+        'game_over': game_over,
+        'winner': winner,
+    }
 
 
 def get_legal_moves_list(jax_state: XiangqiState) -> List[dict]:
@@ -766,6 +816,10 @@ def get_ai_action(
                 "is_forced": False,
             }
 
+        del summary
+        del policy_output
+        del root
+
         return action, search_value, policy_info
 # ============================================================================
 # API 模型
@@ -900,17 +954,20 @@ async def new_game(req: NewGameRequest):
     )
     
     # 保存初始状态到历史（第0步）
-    game_state.history.append({
-        'jax_state': jax_state,
-        'last_move': None,
-        'last_move_uci': '',
-        'ai_value': 0.0,
-        'uci_score': None,
-        'board': board.copy(),
-        'current_player': player,
-        'game_over': False,
-        'winner': -1,
-    })
+    game_state.history.append(
+        make_history_entry(
+            state=jax_state,
+            board=board,
+            current_player=player,
+            last_move=None,
+            last_move_uci='',
+            ai_value=0.0,
+            uci_score=None,
+            game_over=False,
+            winner=-1,
+        )
+    )
+    gc.collect()
     
     return await get_status()
 
@@ -935,6 +992,7 @@ async def make_move(req: MoveRequest):
         game_state.history = game_state.history[:game_state.current_history_index + 1]
         game_state.move_history = game_state.move_history[:game_state.current_history_index]  # move_history比history少一个（初始状态没有move）
         game_state.current_history_index = -1  # 回到最新状态
+        gc.collect()
     
     # 执行着法
     fs, ts = action_to_move(req.action)
@@ -962,17 +1020,19 @@ async def make_move(req: MoveRequest):
     })
     
     # 将走完后的状态保存到历史
-    game_state.history.append({
-        'jax_state': new_jax_state,
-        'last_move': (fr, fc, tr, tc),
-        'last_move_uci': uci_move,
-        'ai_value': game_state.ai_value,
-        'uci_score': game_state.uci_score,
-        'board': game_state.board.copy(),
-        'current_player': game_state.current_player,
-        'game_over': game_state.game_over,
-        'winner': game_state.winner,
-    })
+    game_state.history.append(
+        make_history_entry(
+            state=new_jax_state,
+            board=game_state.board,
+            current_player=game_state.current_player,
+            last_move=(fr, fc, tr, tc),
+            last_move_uci=uci_move,
+            ai_value=game_state.ai_value,
+            uci_score=game_state.uci_score,
+            game_over=game_state.game_over,
+            winner=game_state.winner,
+        )
+    )
     
     return await get_status()
 
@@ -999,7 +1059,7 @@ async def undo_move():
     
     # 恢复到该状态
     h = game_state.history[game_state.current_history_index]
-    game_state.jax_state = h['jax_state']
+    game_state.jax_state = restore_jax_state(h['jax_state'])
     game_state.board = h['board'].copy()
     game_state.current_player = h['current_player']
     game_state.last_move = h['last_move']
@@ -1036,7 +1096,7 @@ async def forward_move():
         h = game_state.history[game_state.current_history_index]
     
     # 恢复到该状态
-    game_state.jax_state = h['jax_state']
+    game_state.jax_state = restore_jax_state(h['jax_state'])
     game_state.board = h['board'].copy()
     game_state.current_player = h['current_player']
     game_state.last_move = h['last_move']
@@ -1081,7 +1141,7 @@ async def goto_step(req: GotoStepRequest):
         h = game_state.history[target_step]
     
     # 恢复到该状态
-    game_state.jax_state = h['jax_state']
+    game_state.jax_state = restore_jax_state(h['jax_state'])
     game_state.board = h['board'].copy()
     game_state.current_player = h['current_player']
     game_state.last_move = h['last_move']
