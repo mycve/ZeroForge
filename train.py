@@ -71,9 +71,9 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 2000       # 预热步数
+    lr_warmup_steps: int = 500       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 30000     # 余弦周期（opt steps）
+    lr_cosine_steps: int = 20000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
     training_batch_size: int = 1024 * 8
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
