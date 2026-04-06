@@ -566,7 +566,7 @@ def loss_fn(params, samples: Sample, rng_key):
 
     # 随机左右镜像增强（70% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
-    do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
+    do_mirror = jax.random.bernoulli(rng_mirror, 0.1)
 
     def _apply_mirror(args):
         obs_in, idx_in, prob_in = args
