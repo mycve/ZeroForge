@@ -71,19 +71,19 @@ class Config:
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 500       # 预热步数
+    lr_warmup_steps: int = 2000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 20000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.01        # 最低 LR = peak × 0.01 = 1e-5
+    lr_cosine_steps: int = 60000     # 余弦周期（opt steps）
+    lr_min_ratio: float = 0.05        # 最低 LR = peak × 0.1 = 2e-5
     training_batch_size: int = 1024 * 8
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 2048       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 24            # 增大可提升 MCTS 质量（更耗算力）
+    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 30    # 缓退火 30 半步，给开局充分探索时间
-    selfplay_temperature: float = 1.2      # 自对弈起始温度
+    selfplay_temperature_steps: int = 40    # 缓退火 40 半步，给开局充分探索时间
+    selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
