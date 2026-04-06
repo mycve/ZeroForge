@@ -4,8 +4,8 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 
 架构：
 - Gumbel-Top-k MCTS：模拟次数见 `Config.num_simulations`；温度退火采样（下限见 `selfplay_temperature_final`）
-- 视角归一化：obs 始终以当前行棋方为视角；policy_tgt 与 obs 保持同一视角
-- 镜像增强：30% 概率左右翻转 obs 与 policy_tgt
+- 视角归一化：obs 始终以当前行棋方为视角；策略目标与 obs 保持同一视角
+- 镜像增强：30% 概率左右翻转 obs 与策略目标
 - 价值：策略蒸馏 `action_weights`；价值为 MCTS 根 `root_value` 的 TD(λ) 标量目标，对网络 `value`（由 `value_logits` 得 W−L）做 MSE
 - 标准 ELO 评估
 """
@@ -36,7 +36,7 @@ os.makedirs(cache_dir, exist_ok=True)
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
 from xiangqi.fen import load_fens_from_file
-from xiangqi.mirror import mirror_observation, mirror_policy, mirror_board_swap_colors
+from xiangqi.mirror import mirror_action, mirror_observation, mirror_board_swap_colors
 from networks.alphazero import AlphaZeroNetwork
 from tensorboardX import SummaryWriter
 
@@ -189,26 +189,6 @@ def _align_to_device_multiple(value: int, field_name: str) -> int:
     if aligned != value:
         logger.info("[Config] %s 从 %s 自动调整为 %s (num_devices=%s)", field_name, value, aligned, num_devices)
     return aligned
-
-
-def _shard_batch_for_devices(batch_flat):
-    """将平铺 batch 安全切分到多设备，必要时裁掉尾部样本。"""
-    first_leaf = jax.tree.leaves(batch_flat)[0]
-    total = int(first_leaf.shape[0])
-    if total < num_devices:
-        raise ValueError(
-            f"训练 batch 太小: {total} < num_devices({num_devices})，请增大 training_batch_size"
-        )
-    per_device = total // num_devices
-    usable = per_device * num_devices
-    if usable != total:
-        logger.info("[Batch] 训练 batch %s 无法整除设备数 %s，自动裁剪为 %s", total, num_devices, usable)
-
-    def _reshape(x):
-        x = x[:usable]
-        return x.reshape((num_devices, per_device) + x.shape[1:])
-
-    return jax.tree.map(_reshape, batch_flat)
 
 
 # 动态设备数下的批量自动对齐（避免 reshape/device_put_sharded 错误）
@@ -367,7 +347,8 @@ class SelfplayOutput(NamedTuple):
 class Sample(NamedTuple):
     """训练样本（从 SelfplayOutput 经 compute_targets 得到）"""
     obs: jnp.ndarray
-    policy_tgt: jnp.ndarray       # 策略目标，与 obs 保持同一归一化视角
+    policy_idx: jnp.ndarray       # 稀疏策略目标的动作索引 (top-k)
+    policy_prob: jnp.ndarray      # 稀疏策略目标的概率 (top-k)
     value_tgt: jnp.ndarray        # MCTS 根价值 TD(λ) 标量目标（与 Gumbel AlphaZero / mctx 一致）
     mask: jnp.ndarray            # 有效步掩码（游戏结束前）
 
@@ -472,7 +453,7 @@ def selfplay(params, rng_key, batch_size):
 def compute_targets(data: SelfplayOutput):
     """计算训练目标（与 mctx / Gumbel MuZero 推荐一致）。
 
-    - policy_tgt：MCTS 的 action_weights（策略蒸馏）。
+    - policy_target：MCTS 的 action_weights（策略蒸馏），以 top-k 稀疏格式存储，减少回放搬运。
     - value_tgt：对 **MCTS 根标量 root_value** 做 TD(λ) 备份；损失为 MSE(value, value_tgt)，
       value 由 ValueHead 的 value_logits 经 softmax 得 W−L。
     """
@@ -504,10 +485,14 @@ def compute_targets(data: SelfplayOutput):
         ),
     )
     value_tgt = value_tgt_rev[::-1]
+    policy_prob, policy_idx = jax.lax.top_k(data.action_weights, config.top_k)
+    policy_denom = jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
+    policy_prob = (policy_prob / policy_denom).astype(jnp.float32)
 
     return Sample(
         obs=data.obs, 
-        policy_tgt=data.action_weights, 
+        policy_idx=policy_idx.astype(jnp.int32),
+        policy_prob=policy_prob,
         value_tgt=value_tgt,
         mask=value_mask,
     )
@@ -572,36 +557,38 @@ def compute_selfplay_stats(data: SelfplayOutput):
 def loss_fn(params, samples: Sample, rng_key):
     """损失函数
     
-    - 策略损失：交叉熵，拟合 mctx 的 action_weights。
+    - 策略损失：稀疏交叉熵，拟合 mctx 的 top-k action_weights。
     - 价值损失：MSE(value, value_tgt)；value 由 value_logits 导出（p_W − p_L）。
     """
     obs = samples.obs.astype(jnp.float32)
-    policy_tgt = samples.policy_tgt
+    policy_idx = samples.policy_idx.astype(jnp.int32)
+    policy_prob = samples.policy_prob.astype(jnp.float32)
 
     # 随机左右镜像增强（70% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
     do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
 
     def _apply_mirror(args):
-        obs_in, policy_in = args
-        return jax.vmap(mirror_observation)(obs_in), jax.vmap(mirror_policy)(policy_in)
+        obs_in, idx_in, prob_in = args
+        return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in
 
-    obs, policy_tgt = jax.lax.cond(
+    obs, policy_idx, policy_prob = jax.lax.cond(
         do_mirror,
         _apply_mirror,
         lambda args: args,
-        (obs, policy_tgt),
+        (obs, policy_idx, policy_prob),
     )
 
     logits, value, _ = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
-    policy_tgt = policy_tgt.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
 
-    # 策略损失：直接蒸馏 MCTS 目标分布
-    policy_ce = optax.softmax_cross_entropy(logits, policy_tgt)
+    # 稀疏策略损失：仅对非零目标动作做 gather，避免在回放中搬运完整 2086 维分布
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    sparse_log_probs = jnp.take_along_axis(log_probs, policy_idx, axis=-1)
+    policy_ce = -jnp.sum(policy_prob * sparse_log_probs, axis=-1)
     policy_loss = jnp.sum(policy_ce * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
     # 价值损失：MSE，对 MCTS 根价值 TD 目标回归标量 value（经 value_logits 可导）
@@ -835,13 +822,14 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 class ReplayBuffer:
     """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）
     
-    仅存储有效样本：obs, policy_tgt(与 obs 同视角), value_tgt(MCTS TD 标量), mask
+    仅存储有效样本：obs, 稀疏策略目标(与 obs 同视角), value_tgt(MCTS TD 标量), mask
     """
     
-    def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
+    def __init__(self, max_size: int, obs_shape: tuple, policy_target_size: int):
         self.max_size = max_size
         self.obs = np.zeros((max_size, *obs_shape), dtype=np.uint8)
-        self.policy_tgt = np.zeros((max_size, action_size), dtype=np.float32)
+        self.policy_idx = np.zeros((max_size, policy_target_size), dtype=np.uint16)
+        self.policy_prob = np.zeros((max_size, policy_target_size), dtype=np.float16)
         self.value_tgt = np.zeros((max_size,), dtype=np.float32)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
         self.ptr = 0
@@ -864,7 +852,8 @@ class ReplayBuffer:
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
-        policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
+        policy_idx_flat = samples_np.policy_idx.reshape(-1, samples_np.policy_idx.shape[-1]).astype(np.uint16)
+        policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float16)
         value_flat = samples_np.value_tgt.reshape(-1)
         mask_flat = samples_np.mask.reshape(-1)
 
@@ -873,14 +862,16 @@ class ReplayBuffer:
             return
 
         obs_flat = obs_flat[valid_mask]
-        policy_flat = policy_flat[valid_mask]
+        policy_idx_flat = policy_idx_flat[valid_mask]
+        policy_prob_flat = policy_prob_flat[valid_mask]
         value_flat = value_flat[valid_mask]
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
         
         self.obs[indices] = obs_flat
-        self.policy_tgt[indices] = policy_flat
+        self.policy_idx[indices] = policy_idx_flat
+        self.policy_prob[indices] = policy_prob_flat
         self.value_tgt[indices] = value_flat
         self.mask[indices] = True
         self.ptr = (self.ptr + n_new) % self.max_size
@@ -890,7 +881,7 @@ class ReplayBuffer:
     def sample(self, batch_size: int, rng_key):
         """均匀采样，转回 JAX 数组
         
-        obs 保持 uint8 以减小 CPU→GPU 带宽，loss_fn 内再转为 float32。
+        obs 保持 uint8，策略目标保持稀疏格式，以减小 CPU→GPU 带宽。
         """
         if self.size <= 0:
             raise ValueError("ReplayBuffer 为空，无法采样")
@@ -900,15 +891,47 @@ class ReplayBuffer:
         idx = rng.integers(valid_size, size=batch_size)
         
         obs_batch = self.obs[idx]
-        policy_batch = self.policy_tgt[idx]
+        policy_idx_batch = self.policy_idx[idx]
+        policy_prob_batch = self.policy_prob[idx]
         value_batch = self.value_tgt[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
-            policy_tgt=jnp.asarray(policy_batch),
+            policy_idx=jnp.asarray(policy_idx_batch, dtype=jnp.int32),
+            policy_prob=jnp.asarray(policy_prob_batch, dtype=jnp.float32),
             value_tgt=jnp.asarray(value_batch),
             mask=jnp.ones((batch_size,), dtype=jnp.bool_),
         )
+        return sample, idx.astype(np.int64)
+
+    def sample_sharded(self, batch_size: int, rng_key):
+        """均匀采样后直接按设备分片上传，减少中间大数组搬运。"""
+        if batch_size <= 0 or batch_size % num_devices != 0:
+            raise ValueError(
+                f"batch_size={batch_size} 必须是正数且能整除 num_devices({num_devices})"
+            )
+        if self.size <= 0:
+            raise ValueError("ReplayBuffer 为空，无法采样")
+
+        rng = self._build_rng(rng_key)
+        idx = rng.integers(self.size, size=batch_size)
+        per_device = batch_size // num_devices
+
+        obs_batch = self.obs[idx].reshape((num_devices, per_device, *self.obs.shape[1:]))
+        policy_idx_batch = self.policy_idx[idx].reshape((num_devices, per_device, self.policy_idx.shape[1]))
+        policy_prob_batch = self.policy_prob[idx].reshape((num_devices, per_device, self.policy_prob.shape[1]))
+        value_batch = self.value_tgt[idx].reshape((num_devices, per_device))
+        mask_batch = np.ones((num_devices, per_device), dtype=np.bool_)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            sample = Sample(
+                obs=jax.device_put_sharded([obs_batch[i] for i in range(num_devices)], devices),
+                policy_idx=jax.device_put_sharded([policy_idx_batch[i] for i in range(num_devices)], devices),
+                policy_prob=jax.device_put_sharded([policy_prob_batch[i] for i in range(num_devices)], devices),
+                value_tgt=jax.device_put_sharded([value_batch[i] for i in range(num_devices)], devices),
+                mask=jax.device_put_sharded([mask_batch[i] for i in range(num_devices)], devices),
+            )
         return sample, idx.astype(np.int64)
 
     def cleanup(self):
@@ -919,17 +942,34 @@ class ReplayBuffer:
 
     def state_dict(self):
         return {
-            "obs": self.obs, "policy_tgt": self.policy_tgt,
+            "obs": self.obs,
+            "policy_idx": self.policy_idx,
+            "policy_prob": self.policy_prob,
             "value_tgt": self.value_tgt, "mask": self.mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
 
     def load_state_dict(self, state):
         loaded_obs = np.array(state["obs"])
-        loaded_policy = np.array(state["policy_tgt"])
         loaded_value = np.array(state["value_tgt"])
         loaded_size = min(int(state["size"]), self.max_size, loaded_obs.shape[0])
         loaded_ptr = int(state["ptr"]) % max(loaded_size, 1)
+
+        if "policy_idx" in state and "policy_prob" in state:
+            loaded_policy_idx = np.array(state["policy_idx"], dtype=np.uint16)
+            loaded_policy_prob = np.array(state["policy_prob"], dtype=np.float16)
+        elif "policy_tgt" in state:
+            loaded_policy_dense = np.array(state["policy_tgt"], dtype=np.float32)
+            k = self.policy_idx.shape[1]
+            part_idx = np.argpartition(loaded_policy_dense, -k, axis=-1)[:, -k:]
+            part_prob = np.take_along_axis(loaded_policy_dense, part_idx, axis=-1)
+            order = np.argsort(-part_prob, axis=-1)
+            loaded_policy_idx = np.take_along_axis(part_idx, order, axis=-1).astype(np.uint16)
+            loaded_policy_prob = np.take_along_axis(part_prob, order, axis=-1)
+            denom = np.maximum(loaded_policy_prob.sum(axis=-1, keepdims=True), 1e-8)
+            loaded_policy_prob = (loaded_policy_prob / denom).astype(np.float16)
+        else:
+            raise ValueError("checkpoint replay buffer 缺少 policy_idx/policy_prob 或旧版 policy_tgt")
 
         if loaded_obs.shape[0] < loaded_size:
             raise ValueError("checkpoint replay buffer 数据不完整")
@@ -944,15 +984,18 @@ class ReplayBuffer:
                 start = (loaded_ptr - loaded_size) % loaded_obs.shape[0]
                 idx = (np.arange(loaded_size) + start) % loaded_obs.shape[0]
                 loaded_obs = loaded_obs[idx]
-                loaded_policy = loaded_policy[idx]
+                loaded_policy_idx = loaded_policy_idx[idx]
+                loaded_policy_prob = loaded_policy_prob[idx]
                 loaded_value = loaded_value[idx]
             else:
                 loaded_obs = loaded_obs[:loaded_size]
-                loaded_policy = loaded_policy[:loaded_size]
+                loaded_policy_idx = loaded_policy_idx[:loaded_size]
+                loaded_policy_prob = loaded_policy_prob[:loaded_size]
                 loaded_value = loaded_value[:loaded_size]
 
             self.obs[:loaded_size] = loaded_obs
-            self.policy_tgt[:loaded_size] = loaded_policy
+            self.policy_idx[:loaded_size] = loaded_policy_idx
+            self.policy_prob[:loaded_size] = loaded_policy_prob
             self.value_tgt[:loaded_size] = loaded_value
 
         if loaded_size < self.max_size:
@@ -1183,11 +1226,11 @@ def main():
     # 创建必要目录
     os.makedirs(config.ckpt_dir, exist_ok=True)
     
-    # 初始化经验回放缓冲区 (JAX 环形缓冲区)
+    # 初始化经验回放缓冲区 (NumPy 环形缓冲区)
     replay_buffer = ReplayBuffer(
         max_size=config.replay_buffer_size,
         obs_shape=(NUM_OBSERVATION_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH),
-        action_size=ACTION_SPACE_SIZE,
+        policy_target_size=config.top_k,
     )
     
     # 初始化模型模板 (用于恢复时的结构参考)
@@ -1383,9 +1426,8 @@ def main():
         rng_key = sample_keys[0]
         
         def _prefetch_batch(key_idx):
-            """CPU 采样 + 异步传输到 GPU（双缓冲预读取）"""
-            batch_flat, _ = replay_buffer.sample(config.training_batch_size, sample_keys[key_idx])
-            batch = _shard_batch_for_devices(batch_flat)
+            """CPU 采样 + 直接按设备分片上传（双缓冲预读取）"""
+            batch, _ = replay_buffer.sample_sharded(config.training_batch_size, sample_keys[key_idx])
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 keys = jax.device_put_sharded(
