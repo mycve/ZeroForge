@@ -211,6 +211,13 @@ def _shard_batch_for_devices(batch_flat):
     return jax.tree.map(_reshape, batch_flat)
 
 
+def _slice_sharded_batch_group(batch_group, batch_idx: int, batch_per_device: int):
+    """从已分片的大 batch 中切出一个 micro-batch。"""
+    start = batch_idx * batch_per_device
+    end = start + batch_per_device
+    return jax.tree.map(lambda x: x[:, start:end], batch_group)
+
+
 # 动态设备数下的批量自动对齐（避免 reshape/device_put_sharded 错误）
 config.selfplay_batch_size = _align_to_device_multiple(config.selfplay_batch_size, "selfplay_batch_size")
 config.training_batch_size = _align_to_device_multiple(config.training_batch_size, "training_batch_size")
@@ -1382,50 +1389,70 @@ def main():
         sample_keys = jax.random.split(rng_key, num_updates + 1)
         rng_key = sample_keys[0]
         
-        def _prefetch_batch(key_idx):
-            """CPU 采样 + 异步传输到 GPU（双缓冲预读取）"""
-            batch_flat, _ = replay_buffer.sample(config.training_batch_size, sample_keys[key_idx])
-            batch = _shard_batch_for_devices(batch_flat)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                keys = jax.device_put_sharded(
-                    list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
-            return batch, keys
+        train_batch_per_device = config.training_batch_size // num_devices
+        prefetch_group_updates = min(4, num_updates)
+
+        def _prefetch_batch_group(update_start: int):
+            """一次预取多个 update 的训练数据，减少 CPU 采样与传输频率。"""
+            group_updates = min(prefetch_group_updates, num_updates - update_start)
+            total_batch = config.training_batch_size * group_updates
+            batch_flat, _ = replay_buffer.sample(total_batch, sample_keys[update_start + 1])
+            batch_group = _shard_batch_for_devices(batch_flat)
+            key_group = sample_keys[update_start + 1:update_start + 1 + group_updates]
+            return batch_group, key_group
 
         ploss_acc, vloss_acc = None, None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
-                prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
+                prefetch_executor.submit(_prefetch_batch_group, 0) if num_updates > 0 else None
             )
+            processed_updates = 0
 
-            for i in range(num_updates):
-                batch, train_keys = next_future.result()
-                if i + 1 < num_updates:
-                    next_future = prefetch_executor.submit(_prefetch_batch, i + 2)
+            while processed_updates < num_updates:
+                batch_group, key_group = next_future.result()
+                group_updates = int(key_group.shape[0])
+                next_group_start = processed_updates + group_updates
+                if next_group_start < num_updates:
+                    next_future = prefetch_executor.submit(_prefetch_batch_group, next_group_start)
                 else:
                     next_future = None
 
-                try:
-                    params, opt_state, ploss, vloss = train_step(
-                        params, opt_state, batch, train_keys
+                for local_idx in range(group_updates):
+                    batch = _slice_sharded_batch_group(
+                        batch_group,
+                        local_idx,
+                        train_batch_per_device,
                     )
-                except jax.errors.JaxRuntimeError as e:
-                    msg = str(e).lower()
-                    if ("resource_exhausted" in msg) or ("out of memory" in msg):
-                        raise RuntimeError(
-                            "训练显存不足（OOM）。建议进一步降低: "
-                            f"training_batch_size({config.training_batch_size}), "
-                            f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
-                            f"selfplay_batch_size({config.selfplay_batch_size})."
-                        ) from e
-                    raise
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        train_keys = jax.device_put_sharded(
+                            list(jax.random.split(key_group[local_idx], num_devices)),
+                            devices,
+                        )
 
-                # 累积损失（保持在 GPU），只在最后同步
-                if ploss_acc is None:
-                    ploss_acc, vloss_acc = ploss, vloss
-                else:
-                    ploss_acc = ploss_acc + ploss
-                    vloss_acc = vloss_acc + vloss
+                    try:
+                        params, opt_state, ploss, vloss = train_step(
+                            params, opt_state, batch, train_keys
+                        )
+                    except jax.errors.JaxRuntimeError as e:
+                        msg = str(e).lower()
+                        if ("resource_exhausted" in msg) or ("out of memory" in msg):
+                            raise RuntimeError(
+                                "训练显存不足（OOM）。建议进一步降低: "
+                                f"training_batch_size({config.training_batch_size}), "
+                                f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
+                                f"selfplay_batch_size({config.selfplay_batch_size})."
+                            ) from e
+                        raise
+
+                    # 累积损失（保持在 GPU），只在最后同步
+                    if ploss_acc is None:
+                        ploss_acc, vloss_acc = ploss, vloss
+                    else:
+                        ploss_acc = ploss_acc + ploss
+                        vloss_acc = vloss_acc + vloss
+
+                    processed_updates += 1
         
         # 累计优化器步数
         total_opt_steps += num_updates
