@@ -17,6 +17,7 @@ import sys
 import time
 import json
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from functools import partial
 from typing import NamedTuple, Optional, List, Tuple
@@ -580,8 +581,17 @@ def loss_fn(params, samples: Sample, rng_key):
     # 随机左右镜像增强（70% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
     do_mirror = jax.random.bernoulli(rng_mirror, 0.7)
-    obs = jnp.where(do_mirror, jax.vmap(mirror_observation)(obs), obs)
-    policy_tgt = jnp.where(do_mirror, jax.vmap(mirror_policy)(policy_tgt), policy_tgt)
+
+    def _apply_mirror(args):
+        obs_in, policy_in = args
+        return jax.vmap(mirror_observation)(obs_in), jax.vmap(mirror_policy)(policy_in)
+
+    obs, policy_tgt = jax.lax.cond(
+        do_mirror,
+        _apply_mirror,
+        lambda args: args,
+        (obs, policy_tgt),
+    )
 
     logits, value, _ = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
@@ -825,7 +835,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
 class ReplayBuffer:
     """纯 NumPy 环形缓冲区，均匀采样（AlphaZero 标准）
     
-    存储：obs, policy_tgt(与 obs 同视角), value_tgt(MCTS TD 标量), mask
+    仅存储有效样本：obs, policy_tgt(与 obs 同视角), value_tgt(MCTS TD 标量), mask
     """
     
     def __init__(self, max_size: int, obs_shape: tuple, action_size: int):
@@ -850,13 +860,21 @@ class ReplayBuffer:
         return np.random.default_rng(int(seed))
 
     def add(self, samples: Sample):
-        """存入样本（JAX -> NumPy，含 obs/policy_tgt/value_tgt/mask）"""
+        """存入样本（JAX -> NumPy），并在入库前裁掉终局后的无效步。"""
         samples_np = jax.device_get(samples)
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_flat = samples_np.policy_tgt.reshape(-1, *samples_np.policy_tgt.shape[3:])
         value_flat = samples_np.value_tgt.reshape(-1)
         mask_flat = samples_np.mask.reshape(-1)
+
+        valid_mask = mask_flat.astype(np.bool_)
+        if not np.any(valid_mask):
+            return
+
+        obs_flat = obs_flat[valid_mask]
+        policy_flat = policy_flat[valid_mask]
+        value_flat = value_flat[valid_mask]
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -864,7 +882,7 @@ class ReplayBuffer:
         self.obs[indices] = obs_flat
         self.policy_tgt[indices] = policy_flat
         self.value_tgt[indices] = value_flat
-        self.mask[indices] = mask_flat
+        self.mask[indices] = True
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
         self.total_added += n_new
@@ -879,23 +897,17 @@ class ReplayBuffer:
 
         rng = self._build_rng(rng_key)
         valid_size = self.size
-        pool_mask = self.mask[:valid_size]
-        pool_idx = np.flatnonzero(pool_mask)
-        if pool_idx.size == 0:
-            pool_idx = np.arange(valid_size, dtype=np.int64)
-
-        idx = rng.choice(pool_idx, size=batch_size, replace=True)
+        idx = rng.integers(valid_size, size=batch_size)
         
         obs_batch = self.obs[idx]
         policy_batch = self.policy_tgt[idx]
         value_batch = self.value_tgt[idx]
-        mask_batch = self.mask[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_tgt=jnp.asarray(policy_batch),
             value_tgt=jnp.asarray(value_batch),
-            mask=jnp.asarray(mask_batch),
+            mask=jnp.ones((batch_size,), dtype=jnp.bool_),
         )
         return sample, idx.astype(np.int64)
 
@@ -916,26 +928,39 @@ class ReplayBuffer:
         loaded_obs = np.array(state["obs"])
         loaded_policy = np.array(state["policy_tgt"])
         loaded_value = np.array(state["value_tgt"])
-        loaded_mask = np.array(state["mask"])
-        loaded_size = int(state["size"])
-        loaded_ptr = int(state["ptr"])
-        old_max = loaded_obs.shape[0]
-        actual_samples = min(loaded_size, old_max)
-        if old_max <= self.max_size:
-            self.obs[:old_max] = loaded_obs
-            self.policy_tgt[:old_max] = loaded_policy
-            self.value_tgt[:old_max] = loaded_value
-            self.mask[:old_max] = loaded_mask
-            self.size = actual_samples
-            self.ptr = loaded_ptr % self.max_size
-        else:
-            self.obs[:] = loaded_obs[:self.max_size]
-            self.policy_tgt[:] = loaded_policy[:self.max_size]
-            self.value_tgt[:] = loaded_value[:self.max_size]
-            self.mask[:] = loaded_mask[:self.max_size]
-            self.size = self.max_size
-            self.ptr = 0
-        self.total_added = int(state["total_added"])
+        loaded_size = min(int(state["size"]), self.max_size, loaded_obs.shape[0])
+        loaded_ptr = int(state["ptr"]) % max(loaded_size, 1)
+
+        if loaded_obs.shape[0] < loaded_size:
+            raise ValueError("checkpoint replay buffer 数据不完整")
+
+        if loaded_size > 0:
+            if state["mask"] is not None:
+                loaded_mask = np.array(state["mask"][:loaded_size], dtype=np.bool_)
+                if not np.all(loaded_mask):
+                    raise ValueError("checkpoint replay buffer 含无效样本；当前版本不再兼容旧格式")
+
+            if loaded_obs.shape[0] > self.max_size:
+                start = (loaded_ptr - loaded_size) % loaded_obs.shape[0]
+                idx = (np.arange(loaded_size) + start) % loaded_obs.shape[0]
+                loaded_obs = loaded_obs[idx]
+                loaded_policy = loaded_policy[idx]
+                loaded_value = loaded_value[idx]
+            else:
+                loaded_obs = loaded_obs[:loaded_size]
+                loaded_policy = loaded_policy[:loaded_size]
+                loaded_value = loaded_value[:loaded_size]
+
+            self.obs[:loaded_size] = loaded_obs
+            self.policy_tgt[:loaded_size] = loaded_policy
+            self.value_tgt[:loaded_size] = loaded_value
+
+        if loaded_size < self.max_size:
+            self.mask[loaded_size:] = False
+        self.mask[:loaded_size] = True
+        self.size = loaded_size
+        self.ptr = loaded_size % self.max_size
+        self.total_added = max(int(state["total_added"]), loaded_size)
 
 # ============================================================================
 # Checkpoint 管理 (使用 orbax 官方方案)
@@ -1368,35 +1393,39 @@ def main():
             return batch, keys
 
         ploss_acc, vloss_acc = None, None
-        next_batch, next_keys = _prefetch_batch(1) if num_updates > 0 else (None, None)
+        with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
+            next_future = (
+                prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
+            )
 
-        for i in range(num_updates):
-            batch, train_keys = next_batch, next_keys
-            
-            try:
-                params, opt_state, ploss, vloss = train_step(
-                    params, opt_state, batch, train_keys
-                )
-            except jax.errors.JaxRuntimeError as e:
-                msg = str(e).lower()
-                if ("resource_exhausted" in msg) or ("out of memory" in msg):
-                    raise RuntimeError(
-                        "训练显存不足（OOM）。建议进一步降低: "
-                        f"training_batch_size({config.training_batch_size}), "
-                        f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
-                        f"selfplay_batch_size({config.selfplay_batch_size})."
-                    ) from e
-                raise
+            for i in range(num_updates):
+                batch, train_keys = next_future.result()
+                if i + 1 < num_updates:
+                    next_future = prefetch_executor.submit(_prefetch_batch, i + 2)
+                else:
+                    next_future = None
 
-            if i + 1 < num_updates:
-                next_batch, next_keys = _prefetch_batch(i + 2)
-            
-            # 累积损失（保持在 GPU），只在最后同步
-            if ploss_acc is None:
-                ploss_acc, vloss_acc = ploss, vloss
-            else:
-                ploss_acc = ploss_acc + ploss
-                vloss_acc = vloss_acc + vloss
+                try:
+                    params, opt_state, ploss, vloss = train_step(
+                        params, opt_state, batch, train_keys
+                    )
+                except jax.errors.JaxRuntimeError as e:
+                    msg = str(e).lower()
+                    if ("resource_exhausted" in msg) or ("out of memory" in msg):
+                        raise RuntimeError(
+                            "训练显存不足（OOM）。建议进一步降低: "
+                            f"training_batch_size({config.training_batch_size}), "
+                            f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
+                            f"selfplay_batch_size({config.selfplay_batch_size})."
+                        ) from e
+                    raise
+
+                # 累积损失（保持在 GPU），只在最后同步
+                if ploss_acc is None:
+                    ploss_acc, vloss_acc = ploss, vloss
+                else:
+                    ploss_acc = ploss_acc + ploss
+                    vloss_acc = vloss_acc + vloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
