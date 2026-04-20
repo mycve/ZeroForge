@@ -159,6 +159,21 @@ _ACTION_TO_MOVE = {idx: move for idx, move in enumerate(_ALL_MOVES)}
 _ACTION_TO_FROM_SQ = jnp.array([move[0] for move in _ALL_MOVES], dtype=jnp.int32)
 _ACTION_TO_TO_SQ = jnp.array([move[1] for move in _ALL_MOVES], dtype=jnp.int32)
 
+# 每个动作的棋盘 Chebyshev 跨度 max(|Δr|,|Δc|)，即纵/横向直线时的「格子数」(1..9)；
+# 马(2,1)、象(2,2) 等同为跨度 2，供策略头显式感知距离先验。
+_ACTION_CHEBYSHEV_SPAN = jnp.array(
+    [
+        max(
+            abs((t // BOARD_WIDTH) - (f // BOARD_WIDTH)),
+            abs((t % BOARD_WIDTH) - (f % BOARD_WIDTH)),
+        )
+        for f, t in _ALL_MOVES
+    ],
+    dtype=jnp.int32,
+)
+# nn.Embed 用下标 0..8 对应跨度 1..9（棋盘直线最长 9 格）
+_ACTION_SPAN_EMBED_IDX = jnp.clip(_ACTION_CHEBYSHEV_SPAN - 1, 0, max(BOARD_HEIGHT, BOARD_WIDTH) - 2)
+
 # 180度旋转动作映射表 (用于视角归一化)
 def _build_action_rotate_table():
     rotate_table = jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.int32)

@@ -21,17 +21,25 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from functools import partial
 from typing import NamedTuple, Optional, List, Tuple
+
+# --- JAX 持久化编译缓存（必须在 import jax 之前设置）---
+# 二次启动可复用 XLA 编译结果，显著缩短首步等待；目录默认可通过环境变量覆盖。
+_JAX_CACHE_DIR = os.environ.get("JAX_COMPILATION_CACHE_DIR")
+if not _JAX_CACHE_DIR:
+    _JAX_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "jax_cache"))
+os.makedirs(_JAX_CACHE_DIR, exist_ok=True)
+os.environ["JAX_COMPILATION_CACHE_DIR"] = _JAX_CACHE_DIR
+# 小编译也缓存；大条目不跳过（与 uci_engine 一致）
+os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1")
+os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import mctx
 import orbax.checkpoint as ocp
-
-# --- JAX 编译缓存配置 ---
-# 开启持久化编译缓存，二次启动秒开
-cache_dir = os.path.abspath("jax_cache")
-os.makedirs(cache_dir, exist_ok=True)
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
@@ -75,8 +83,8 @@ class Config:
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
     lr_cosine_steps: int = 120000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.05        # 最低 LR = peak × 0.1 = 2e-5
-    training_batch_size: int = 1024 * 8
-    td_lambda: float = 0.85              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    training_batch_size: int = 4096
+    td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
@@ -87,7 +95,7 @@ class Config:
     selfplay_temperature_final: float = 0.25  # 尾温 0.25 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 800_000    # 配合 batch_size=2048，约 4 轮填满
+    replay_buffer_size: int = 600_000    # 配合 batch_size=2048，约 4 轮填满
     sample_reuse_times: int = 5          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     

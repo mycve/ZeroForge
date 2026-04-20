@@ -22,6 +22,7 @@ from xiangqi.actions import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
     ACTION_SPACE_SIZE,
+    _ACTION_SPAN_EMBED_IDX,
     _ACTION_TO_FROM_SQ,
     _ACTION_TO_TO_SQ,
 )
@@ -234,14 +235,22 @@ class PolicyHead(nn.Module):
     """Factorized from/to policy head.
 
     将动作分解为 (from_square, to_square) 对，用点积评分:
-    score(a) = base_factorized(a) + correction_delta(a) + global
+    score(a) = base_factorized(a) + correction_delta(a) + grid_span_ctx(a)
+    其中 grid_span_ctx 为「跨度」嵌入（max(|Δr|,|Δc|)）与全局上下文的点积，显式感知格子距离。
+    已移除 global_proj：与 from_bias/to_bias 重叠且参数量过大（ACTION_SPACE 维全连接）。
     """
     action_space_size: int
     model_dim: int
     dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, h: jnp.ndarray, from_idx: jnp.ndarray, to_idx: jnp.ndarray) -> jnp.ndarray:
+    def __call__(
+        self,
+        h: jnp.ndarray,
+        from_idx: jnp.ndarray,
+        to_idx: jnp.ndarray,
+        action_span_embed_idx: jnp.ndarray,
+    ) -> jnp.ndarray:
         x = nn.LayerNorm(dtype=self.dtype)(h)
         proj_dim = max(self.model_dim // 2, 64)
         q_from = nn.Dense(proj_dim, use_bias=False, dtype=self.dtype, name="from_proj")(x)
@@ -272,8 +281,23 @@ class PolicyHead(nn.Module):
         corr_scale = self.param("corr_scale", nn.initializers.constant(0.0), ())
         logits = logits + corr_scale * corr_delta
 
-        global_ctx = jnp.mean(x, axis=1)
-        logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
+        # 格子跨度感知：9 档 (跨度 1..9) 与局面级向量点积，按动作索引 gather
+        span_dim = max(self.model_dim // 8, 16)
+        grid_ctx = nn.Dense(span_dim, dtype=self.dtype, name="grid_span_ctx_proj")(
+            jnp.mean(x, axis=1)
+        )
+        span_embed = nn.Embed(
+            num_embeddings=max(BOARD_HEIGHT, BOARD_WIDTH) - 1,
+            features=span_dim,
+            dtype=self.dtype,
+            name="grid_span_embed",
+        )(action_span_embed_idx)
+        span_scale = self.param(
+            "grid_span_scale",
+            nn.initializers.constant(1.0),
+            (),
+        )
+        logits = logits + span_scale * jnp.einsum("bd,ad->ba", grid_ctx, span_embed)
         return logits
 
 
@@ -338,6 +362,7 @@ class AlphaZeroNetwork(nn.Module):
         self.region_id = jnp.array(_build_region_ids(BOARD_HEIGHT, BOARD_WIDTH), dtype=jnp.int32)
         self.action_from_idx = jnp.array(_ACTION_TO_FROM_SQ, dtype=jnp.int32)
         self.action_to_idx = jnp.array(_ACTION_TO_TO_SQ, dtype=jnp.int32)
+        self.action_span_embed_idx = jnp.array(_ACTION_SPAN_EMBED_IDX, dtype=jnp.int32)
 
     @nn.compact
     def __call__(
@@ -458,7 +483,7 @@ class AlphaZeroNetwork(nn.Module):
             action_space_size=self.action_space_size,
             model_dim=self.channels,
             dtype=self.dtype,
-        )(h, self.action_from_idx, self.action_to_idx)
+        )(h, self.action_from_idx, self.action_to_idx, self.action_span_embed_idx)
 
         value, value_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
         return (
