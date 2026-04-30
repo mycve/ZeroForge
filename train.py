@@ -91,10 +91,10 @@ class Config:
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
     num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 24    # 缓退火 40 半步，给开局充分探索时间
+    top_k: int = 8
+    selfplay_temperature_steps: int = 24
     selfplay_temperature: float = 1.0      # 自对弈起始温度
-    selfplay_temperature_final: float = 0.1  # 尾温 0.1 保证中残局仍有分支多样性
+    selfplay_temperature_final: float = 0.1
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 1_000_000    # 配合 batch_size=2048，约 4 轮填满
@@ -1802,3 +1802,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
