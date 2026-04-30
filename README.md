@@ -123,9 +123,10 @@ scp remote:checkpoints/metadata.json ./checkpoints/
 | `num_simulations` | 32 | MCTS 模拟次数 |
 | `selfplay_batch_size` | 1024 | 自对弈并行数 |
 | `training_batch_size` | 2048 | 训练批大小 |
-| `learning_rate` | 0.02 | SGD peak LR |
+| `learning_rate` | 0.005 | SGD peak LR |
 | `lr_cosine_steps` | 240000 | 余弦退火周期（优化步） |
-| `sgd_momentum` | 0.9 | SGD momentum (Nesterov) |
+| `sgd_momentum` | 0.9 | SGD momentum |
+| `grad_clip_norm` | 1.0 | 全局梯度裁剪阈值 |
 | `replay_buffer_size` | 1000000 | 回放缓冲区容量 |
 | `sample_reuse_times` | 1 | 样本复用次数 |
 | `td_lambda` | 0.95 | TD(λ) 系数 |

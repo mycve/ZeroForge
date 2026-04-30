@@ -78,14 +78,14 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 2e-2       # SGD peak LR
-    lr_warmup_steps: int = 1000       # 预热步数
-    # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 240000     # 小 batch 下 opt steps 更多，延长周期保持按数据量的退火节奏
-    lr_min_ratio: float = 0.05        # 最低 LR = peak * 0.05
+    learning_rate: float = 5e-3       # SGD peak LR
+    lr_warmup_steps: int = 2000       # warmup steps
+    lr_cosine_steps: int = 240000     # cosine decay steps
+    lr_min_ratio: float = 0.05        # final LR = peak * 0.05
     training_batch_size: int = 2048
     sgd_momentum: float = 0.9
-    sgd_nesterov: bool = True
+    sgd_nesterov: bool = False
+    grad_clip_norm: float = 1.0
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
@@ -221,6 +221,8 @@ if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
 if config.sgd_momentum < 0:
     raise ValueError(f"sgd_momentum 必须 >= 0，当前值: {config.sgd_momentum}")
+if config.grad_clip_norm <= 0:
+    raise ValueError(f"grad_clip_norm 必须 > 0，当前值: {config.grad_clip_norm}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
@@ -1416,9 +1418,10 @@ def main():
         config.value_loss_weight,
     )
     logger.info(
-        "[Optimizer] SGD(momentum=%.2f, nesterov=%s), weight_decay=%.1e, train_batch=%s",
+        "[Optimizer] SGD(momentum=%.2f, nesterov=%s), clip_norm=%.1f, weight_decay=%.1e, train_batch=%s",
         config.sgd_momentum,
         config.sgd_nesterov,
+        config.grad_clip_norm,
         config.weight_decay,
         config.training_batch_size,
     )
@@ -1430,6 +1433,7 @@ def main():
             nesterov=config.sgd_nesterov,
         ),
     )
+    grad_clipper = optax.clip_by_global_norm(config.grad_clip_norm)
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -1466,14 +1470,17 @@ def main():
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
         grads, losses = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
-        updates, opt_state = optimizer.update(jax.lax.pmean(grads, 'i'), opt_state, params)
+        grads = jax.lax.pmean(grads, 'i')
+        grads, _ = grad_clipper.update(grads, optax.EmptyState())
+        updates, opt_state = optimizer.update(grads, opt_state, params)
         return (optax.apply_updates(params, updates), opt_state, *losses)
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
-        f"_sgdm{config.sgd_momentum:.1f}_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
+        f"_sgdm{config.sgd_momentum:.1f}_clip{config.grad_clip_norm:.1f}"
+        f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
