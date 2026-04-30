@@ -78,12 +78,14 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 2e-4       # AdamW 起始 LR
-    lr_warmup_steps: int = 2000       # 预热步数
+    learning_rate: float = 2e-2       # SGD peak LR
+    lr_warmup_steps: int = 1000       # 预热步数
     # LR 余弦退火：warmup 后平滑衰减到 min_ratio，无需手动调参
-    lr_cosine_steps: int = 120000     # 余弦周期（opt steps）
-    lr_min_ratio: float = 0.05        # 最低 LR = peak × 0.1 = 2e-5
-    training_batch_size: int = 4096
+    lr_cosine_steps: int = 240000     # 小 batch 下 opt steps 更多，延长周期保持按数据量的退火节奏
+    lr_min_ratio: float = 0.05        # 最低 LR = peak * 0.05
+    training_batch_size: int = 2048
+    sgd_momentum: float = 0.9
+    sgd_nesterov: bool = True
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
@@ -131,6 +133,7 @@ def parse_args():
         help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
+    parser.add_argument("--sgd-momentum", type=float, default=None, help="覆盖 sgd_momentum")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
@@ -150,6 +153,7 @@ def parse_args():
 def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
+        "sgd_momentum": args.sgd_momentum,
         "td_lambda": args.td_lambda,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
@@ -211,6 +215,8 @@ if config.top_k < 2:
     raise ValueError(f"top_k 至少为 2，当前值: {config.top_k}")
 if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
+if config.sgd_momentum < 0:
+    raise ValueError(f"sgd_momentum 必须 >= 0，当前值: {config.sgd_momentum}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
@@ -1119,15 +1125,9 @@ def _load_params_from_checkpoint(
 ) -> dict:
     """从 checkpoint 加载指定 step 的 params（用于 ELO 评估的对手模型）
     
-    必须传入完整 restore_target 结构，否则 orbax StandardRestore 会因结构不匹配而失败。
+    只恢复 params，用于 ELO 评估和 --init-checkpoint 导入基础模型。
     """
-    restore_target = {
-        "params": params_template,
-        "opt_state": opt_state_template,
-        "iteration": np.array(0),
-        "frames": np.array(0),
-        "rng_key": jax.random.PRNGKey(0),
-    }
+    restore_target = {"params": params_template}
     restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
     return restored["params"]
 
@@ -1281,7 +1281,21 @@ def main():
         config.td_lambda,
         config.value_loss_weight,
     )
-    optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
+    logger.info(
+        "[Optimizer] SGD(momentum=%.2f, nesterov=%s), weight_decay=%.1e, train_batch=%s",
+        config.sgd_momentum,
+        config.sgd_nesterov,
+        config.weight_decay,
+        config.training_batch_size,
+    )
+    optimizer = optax.chain(
+        optax.add_decayed_weights(config.weight_decay),
+        optax.sgd(
+            lr_schedule,
+            momentum=config.sgd_momentum,
+            nesterov=config.sgd_nesterov,
+        ),
+    )
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -1325,7 +1339,7 @@ def main():
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
-        f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
+        f"_sgdm{config.sgd_momentum:.1f}_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"

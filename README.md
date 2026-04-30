@@ -118,15 +118,18 @@ scp remote:checkpoints/metadata.json ./checkpoints/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `num_channels` | 128 | 网络通道数 |
+| `num_channels` | 196 | 网络通道数 |
 | `num_blocks` | 10 | 残差块数量 |
-| `num_simulations` | 128 | MCTS 模拟次数 |
-| `selfplay_batch_size` | 256 | 自对弈并行数 |
-| `training_batch_size` | 4096 | 训练批大小 |
-| `replay_buffer_size` | 1500000 | 回放缓冲区容量 |
+| `num_simulations` | 32 | MCTS 模拟次数 |
+| `selfplay_batch_size` | 1024 | 自对弈并行数 |
+| `training_batch_size` | 2048 | 训练批大小 |
+| `learning_rate` | 0.02 | SGD peak LR |
+| `lr_cosine_steps` | 240000 | 余弦退火周期（优化步） |
+| `sgd_momentum` | 0.9 | SGD momentum (Nesterov) |
+| `replay_buffer_size` | 1000000 | 回放缓冲区容量 |
 | `sample_reuse_times` | 1 | 样本复用次数 |
 | `td_lambda` | 0.95 | TD(λ) 系数 |
-| `top_k` | 32 | Gumbel 根节点候选动作数 |
+| `top_k` | 8 | Gumbel 根节点候选动作数 |
 
 ## 项目结构
 
