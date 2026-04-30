@@ -72,7 +72,7 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
+    num_channels: int = 196   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
@@ -84,18 +84,18 @@ class Config:
     lr_cosine_steps: int = 120000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.05        # 最低 LR = peak × 0.1 = 2e-5
     training_batch_size: int = 4096
-    td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 64            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 16                       # 根节点候选数，Gumbel 无需高 top_k
-    selfplay_temperature_steps: int = 40    # 缓退火 40 半步，给开局充分探索时间
+    selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
+    top_k: int = 8                       # 根节点候选数，Gumbel 无需高 top_k
+    selfplay_temperature_steps: int = 24    # 缓退火 40 半步，给开局充分探索时间
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.1  # 尾温 0.1 保证中残局仍有分支多样性
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 600_000    # 配合 batch_size=2048，约 4 轮填满
+    replay_buffer_size: int = 1_000_000    # 配合 batch_size=2048，约 4 轮填满
     sample_reuse_times: int = 1          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
