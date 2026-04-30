@@ -219,7 +219,7 @@ class Engine:
 
             obs = jax.vmap(self.env.observe)(next_state)
 
-            logits, value, _ = self._infer(params, obs)
+            logits, value, *_ = self._infer(params, obs)
 
             logits = jnp.where(
                 next_state.current_player[:, None] == 0,
@@ -377,7 +377,7 @@ class Engine:
 
         obs = self.env.observe(state)[None]
 
-        logits, value, _ = self._infer(self.params, obs)
+        logits, value, *_ = self._infer(self.params, obs)
 
         if state.current_player == 1:
             logits = logits[:, _ROTATED_IDX]

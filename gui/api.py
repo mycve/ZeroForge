@@ -581,7 +581,7 @@ def create_mcts_recurrent_fn():
         # observe
         obs = jax.vmap(env.observe)(ns)
 
-        logits, value, _ = infer(params, obs)
+        logits, value, *_ = infer(params, obs)
 
         logits = jnp.where(
             ns.current_player[:, None] == 0,
@@ -670,7 +670,7 @@ def get_ai_action(
 
             obs = env.observe(state.jax_state)[None, ...]
 
-            _, value, _ = infer(model_mgr.params, obs)
+            _, value, *_ = infer(model_mgr.params, obs)
 
             search_value = float(value[0])
 
@@ -713,7 +713,7 @@ def get_ai_action(
 
         obs = env.observe(state.jax_state)[None, ...]
 
-        logits, value, _ = infer(model_mgr.params, obs)
+        logits, value, *_ = infer(model_mgr.params, obs)
 
         if state.current_player == 1:
             logits = logits[:, _ROTATED_IDX]
@@ -1197,7 +1197,7 @@ async def ai_think(req: AIThinkRequest):
             action = int(legal_actions[0])
             print(f"[AI] 只有一个合法走法，直接应用: action={action}")
             obs = env.observe(game_state.jax_state)[None, ...]
-            _, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+            _, value, *_ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
             search_value = float(value[0])
             if game_state.current_player == 1:
                 search_value = -search_value
@@ -1214,7 +1214,7 @@ async def ai_think(req: AIThinkRequest):
         
         # 获取模型先验策略（直接前向推理，不运行MCTS）
         obs = env.observe(game_state.jax_state)[None, ...]
-        logits, value, _ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
+        logits, value, *_ = model_mgr.net.apply({'params': model_mgr.params}, obs, train=False)
         
         # 处理黑方视角
         if game_state.current_player == 1:

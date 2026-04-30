@@ -248,7 +248,7 @@ def make_distiller(
     @jax.jit
     def collect_batch(params: dict[str, Any], state: Any, key: jnp.ndarray):
         obs = jax.vmap(env.observe)(state)
-        logits, value, value_logits = net.apply({"params": params}, obs, train=False)
+        logits, value, value_logits, *_ = net.apply({"params": params}, obs, train=False)
 
         legal_norm = jnp.where(
             state.current_player[:, None] == 0,

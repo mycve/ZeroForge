@@ -129,6 +129,10 @@ scp remote:checkpoints/metadata.json ./checkpoints/
 | `replay_buffer_size` | 1000000 | 回放缓冲区容量 |
 | `sample_reuse_times` | 1 | 样本复用次数 |
 | `td_lambda` | 0.95 | TD(λ) 系数 |
+| `aux_future_horizon` | 8 | 辅助头未来预测跨度（半步） |
+| `aux_remaining_loss_weight` | 0.05 | 剩余步数分桶辅助损失权重 |
+| `aux_material_loss_weight` | 0.05 | 未来材料变化辅助损失权重 |
+| `aux_occupancy_loss_weight` | 0.05 | 未来占位变化辅助损失权重 |
 | `top_k` | 8 | Gumbel 根节点候选动作数 |
 
 ## 项目结构

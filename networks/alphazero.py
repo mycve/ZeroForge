@@ -337,6 +337,31 @@ class ValueHead(nn.Module):
 
 
 # ============================================================================
+# Auxiliary Heads
+# ============================================================================
+
+class AuxiliaryHeads(nn.Module):
+    """Training-only auxiliary predictions from the shared board trunk."""
+    model_dim: int
+    dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, h: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        x = nn.LayerNorm(dtype=self.dtype)(h)
+        pooled = jnp.concatenate([jnp.mean(x, axis=1), jnp.max(x, axis=1)], axis=-1)
+        pooled = nn.Dense(self.model_dim, dtype=self.dtype, name="aux_fc1")(pooled)
+        pooled = nn.silu(pooled)
+
+        remaining_logits = nn.Dense(5, dtype=self.dtype, name="remaining_ply_logits")(pooled)
+        material_delta = nn.Dense(1, dtype=self.dtype, name="future_material_delta")(pooled).squeeze(-1)
+
+        node_hidden = nn.Dense(max(self.model_dim // 2, 32), dtype=self.dtype, name="occupancy_fc1")(x)
+        node_hidden = nn.silu(node_hidden)
+        occupancy_logits = nn.Dense(1, dtype=self.dtype, name="future_occupancy_change")(node_hidden).squeeze(-1)
+        return remaining_logits, material_delta, occupancy_logits
+
+
+# ============================================================================
 # 主网络
 # ============================================================================
 
@@ -367,7 +392,7 @@ class AlphaZeroNetwork(nn.Module):
     @nn.compact
     def __call__(
         self, x: jnp.ndarray, train: bool = True
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """返回 (policy_logits, value, value_logits)。"""
         if x.ndim != 4:
             raise ValueError(f"输入必须是 4D (B,C,H,W), 实际 ndim={x.ndim}")
@@ -486,8 +511,15 @@ class AlphaZeroNetwork(nn.Module):
         )(h, self.action_from_idx, self.action_to_idx, self.action_span_embed_idx)
 
         value, value_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
+        remaining_logits, material_delta, occupancy_logits = AuxiliaryHeads(
+            model_dim=self.channels,
+            dtype=self.dtype,
+        )(h)
         return (
             policy_logits.astype(jnp.float32),
             value.astype(jnp.float32),
             value_logits.astype(jnp.float32),
+            remaining_logits.astype(jnp.float32),
+            material_delta.astype(jnp.float32),
+            occupancy_logits.astype(jnp.float32),
         )
