@@ -1261,9 +1261,15 @@ def _load_params_from_checkpoint(
 ) -> dict:
     """从 checkpoint 加载指定 step 的 params（用于 ELO 评估的对手模型）
     
-    只恢复 params，用于 ELO 评估和 --init-checkpoint 导入基础模型。
+    Orbax 需要完整训练状态树；这里按完整结构恢复，但只返回 params。
     """
-    restore_target = {"params": params_template}
+    restore_target = {
+        "params": params_template,
+        "opt_state": opt_state_template,
+        "iteration": np.array(0),
+        "frames": np.array(0),
+        "rng_key": jax.random.PRNGKey(0),
+    }
     restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore(restore_target))
     return restored["params"]
 
