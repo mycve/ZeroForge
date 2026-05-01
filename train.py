@@ -78,14 +78,11 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 5e-2       # SGD peak LR
+    learning_rate: float = 2e-4       # AdamW peak LR
     lr_warmup_steps: int = 2000       # warmup steps
-    lr_cosine_steps: int = 240000     # cosine decay steps
+    lr_cosine_steps: int = 60000      # cosine decay steps
     lr_min_ratio: float = 0.05        # final LR = peak * 0.05
-    training_batch_size: int = 2048
-    sgd_momentum: float = 0.9
-    sgd_nesterov: bool = False
-    grad_clip_norm: float = 1.0
+    training_batch_size: int = 1024 * 8
     td_lambda: float = 0.95              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
@@ -137,7 +134,6 @@ def parse_args():
         help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
-    parser.add_argument("--sgd-momentum", type=float, default=None, help="覆盖 sgd_momentum")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
@@ -157,7 +153,6 @@ def parse_args():
 def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
-        "sgd_momentum": args.sgd_momentum,
         "td_lambda": args.td_lambda,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
@@ -219,10 +214,6 @@ if config.top_k < 2:
     raise ValueError(f"top_k 至少为 2，当前值: {config.top_k}")
 if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
-if config.sgd_momentum < 0:
-    raise ValueError(f"sgd_momentum 必须 >= 0，当前值: {config.sgd_momentum}")
-if config.grad_clip_norm <= 0:
-    raise ValueError(f"grad_clip_norm 必须 > 0，当前值: {config.grad_clip_norm}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
@@ -1452,22 +1443,11 @@ def main():
         config.value_loss_weight,
     )
     logger.info(
-        "[Optimizer] SGD(momentum=%.2f, nesterov=%s), clip_norm=%.1f, weight_decay=%.1e, train_batch=%s",
-        config.sgd_momentum,
-        config.sgd_nesterov,
-        config.grad_clip_norm,
+        "[Optimizer] AdamW(weight_decay=%.1e, train_batch=%s)",
         config.weight_decay,
         config.training_batch_size,
     )
-    optimizer = optax.chain(
-        optax.add_decayed_weights(config.weight_decay),
-        optax.sgd(
-            lr_schedule,
-            momentum=config.sgd_momentum,
-            nesterov=config.sgd_nesterov,
-        ),
-    )
-    grad_clipper = optax.clip_by_global_norm(config.grad_clip_norm)
+    optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
@@ -1505,7 +1485,6 @@ def main():
     def train_step(params, opt_state, samples, rng_key):
         grads, losses = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
         grads = jax.lax.pmean(grads, 'i')
-        grads, _ = grad_clipper.update(grads, optax.EmptyState())
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return (optax.apply_updates(params, updates), opt_state, *losses)
 
@@ -1513,7 +1492,6 @@ def main():
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
-        f"_sgdm{config.sgd_momentum:.1f}_clip{config.grad_clip_norm:.1f}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
