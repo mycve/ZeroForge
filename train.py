@@ -729,16 +729,41 @@ def _run_best_checkpoint_eval(
         return None, rng_key
 
     rated_iters = [k for k in available_iters if k in iteration_elos]
+    eval_candidates = []
     if rated_iters:
-        ref_iter = max(rated_iters, key=lambda k: (iteration_elos[k], k))
-        ref_reason = "best_elo"
-    else:
-        ref_iter = available_iters[-1]
-        ref_reason = "bootstrap_unrated_ckpt"
-
-    opponent_params = replicate_to_devices(
-        _load_params_from_checkpoint(ckpt_manager, ref_iter, params_template, opt_state_template)
+        eval_candidates.extend(
+            (k, "best_elo")
+            for k in sorted(rated_iters, key=lambda step: (iteration_elos[step], step), reverse=True)
+        )
+    eval_candidates.extend(
+        (k, "bootstrap_unrated_ckpt")
+        for k in sorted((k for k in available_iters if k not in iteration_elos), reverse=True)
     )
+
+    opponent_params = None
+    ref_iter = None
+    ref_reason = None
+    failed_refs = []
+    for candidate_iter, candidate_reason in eval_candidates:
+        try:
+            opponent_params = replicate_to_devices(
+                _load_params_from_checkpoint(ckpt_manager, candidate_iter, params_template, opt_state_template)
+            )
+            ref_iter = candidate_iter
+            ref_reason = candidate_reason
+            break
+        except Exception as e:
+            failed_refs.append(candidate_iter)
+            iteration_elos.pop(candidate_iter, None)
+            logger.warning(
+                "[Eval] 跳过无法恢复的 checkpoint step=%s: %s",
+                candidate_iter,
+                e,
+            )
+
+    if opponent_params is None:
+        logger.warning("[Eval] 没有可用的历史 checkpoint，跳过本轮评估；失败 steps=%s", failed_refs)
+        return None, rng_key
 
     rng_key, sk5, sk6 = jax.random.split(rng_key, 3)
     batch_per_eval = config.eval_games
@@ -1239,6 +1264,7 @@ def save_checkpoint(
         "rng_key": rng_key_np,
     }
     ckpt_manager.save(step, args=ocp.args.StandardSave(state_dict))
+    ckpt_manager.wait_until_finished()
     
     # 单文件 metadata.json：iteration_elos、total_opt_steps（仅保留 orbax 保留的 step 对应的 elo）
     kept_steps = _get_kept_steps(config.ckpt_dir)
