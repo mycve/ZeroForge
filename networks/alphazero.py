@@ -391,9 +391,9 @@ class AlphaZeroNetwork(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: jnp.ndarray, train: bool = True
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """返回 (policy_logits, value, value_logits)。"""
+        self, x: jnp.ndarray, train: bool = True, return_aux: bool = True
+    ) -> tuple[jnp.ndarray, ...]:
+        """返回 policy/value；return_aux=True 时附带训练用辅助头。"""
         if x.ndim != 4:
             raise ValueError(f"输入必须是 4D (B,C,H,W), 实际 ndim={x.ndim}")
         if x.shape[2] != BOARD_HEIGHT or x.shape[3] != BOARD_WIDTH:
@@ -511,6 +511,12 @@ class AlphaZeroNetwork(nn.Module):
         )(h, self.action_from_idx, self.action_to_idx, self.action_span_embed_idx)
 
         value, value_logits = ValueHead(model_dim=self.channels, dtype=self.dtype)(h)
+        if not return_aux:
+            return (
+                policy_logits.astype(jnp.float32),
+                value.astype(jnp.float32),
+            )
+
         remaining_logits, material_delta, occupancy_logits = AuxiliaryHeads(
             model_dim=self.channels,
             dtype=self.dtype,

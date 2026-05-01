@@ -78,7 +78,7 @@ class Config:
     network_dtype: str = "bfloat16"
     
     # 训练超参数
-    learning_rate: float = 5e-3       # SGD peak LR
+    learning_rate: float = 5e-2       # SGD peak LR
     lr_warmup_steps: int = 2000       # warmup steps
     lr_cosine_steps: int = 240000     # cosine decay steps
     lr_min_ratio: float = 0.05        # final LR = peak * 0.05
@@ -91,7 +91,7 @@ class Config:
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
     num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 8
+    top_k: int = 16
     selfplay_temperature_steps: int = 24
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.1
@@ -320,24 +320,24 @@ _MATERIAL_VALUES = jnp.array(
 )
 _REMAINING_PLY_BUCKETS = jnp.array([8, 16, 32, 64], dtype=jnp.int32)
 
-def forward(params, obs, is_training=False, rng_key=None):
-    """前向传播: 返回 (policy_logits, value, value_logits)。
+def forward(params, obs, is_training=False, rng_key=None, return_aux=True):
+    """前向传播；return_aux=False 时只返回自玩/评估所需的 policy_logits 和 value。
 
     value = softmax(value_logits) 的 p_W − p_L；训练时价值损失为 MSE(value, value_tgt)，梯度经 value 回传至 value_logits。
     训练时需传入 rng_key 以支持 GraphBlock 内 dropout。
     """
     if is_training and rng_key is not None:
         outputs = net.apply(
-            {'params': params}, obs, train=True, rngs={'dropout': rng_key}
+            {'params': params}, obs, train=True, return_aux=return_aux, rngs={'dropout': rng_key}
         )
     else:
-        outputs = net.apply({'params': params}, obs, train=is_training)
+        outputs = net.apply({'params': params}, obs, train=is_training, return_aux=return_aux)
     return outputs
 
 
 def eval_forward(params, obs):
     """评估前向传播：固定 float32，规避部分 GPU 上 BF16 Triton 编译问题。"""
-    logits, value, *_ = eval_net.apply({'params': params}, obs, train=False)
+    logits, value = eval_net.apply({'params': params}, obs, train=False, return_aux=False)
     return logits, value
 
 
@@ -349,7 +349,7 @@ def recurrent_fn(params, rng_key, action, state):
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
-    logits, value, *_ = forward(params, obs)
+    logits, value = forward(params, obs, return_aux=False)
     # 黑方视角：logits 旋转到绝对坐标系，与 legal_action_mask（绝对）一致
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
@@ -370,7 +370,8 @@ class SelfplayOutput(NamedTuple):
     obs: jnp.ndarray              # 观察（红方=绝对视角，黑方=180° 翻转）
     reward: jnp.ndarray
     terminated: jnp.ndarray
-    action_weights: jnp.ndarray   # 策略目标，与 obs 保持同一归一化视角
+    policy_idx: jnp.ndarray       # 稀疏策略目标动作索引，与 obs 保持同一归一化视角
+    policy_prob: jnp.ndarray      # 稀疏策略目标概率
     discount: jnp.ndarray
     winner: jnp.ndarray           # 0=红胜 1=黑胜 -1=和棋
     draw_reason: jnp.ndarray
@@ -404,7 +405,7 @@ def selfplay(params, rng_key, batch_size):
     def step_fn(state, key):
         key_mcts, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
-        logits, value, *_ = forward(params, obs)
+        logits, value = forward(params, obs, return_aux=False)
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
@@ -459,13 +460,18 @@ def selfplay(params, rng_key, batch_size):
             action_weights,
             action_weights[:, _ROTATED_IDX],
         )
+        policy_prob, policy_idx = jax.lax.top_k(normalized_action_weights, config.top_k)
+        policy_denom = jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
+        policy_prob = (policy_prob / policy_denom).astype(jnp.float32)
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         p = _masked_normalize(action_weights, state.legal_action_mask)
         root_visit_entropy = -jnp.sum(p * jnp.log(p + 1e-10), axis=-1)
         
         data = SelfplayOutput(
-            obs=obs, action_weights=normalized_action_weights,
+            obs=obs,
+            policy_idx=policy_idx.astype(jnp.int32),
+            policy_prob=policy_prob,
             reward=next_state.rewards[jnp.arange(batch_size), actor],
             terminated=next_state.terminated,
             discount=jnp.where(next_state.terminated, 0.0, -1.0),
@@ -534,10 +540,6 @@ def compute_targets(data: SelfplayOutput):
         ),
     )
     value_tgt = value_tgt_rev[::-1]
-    policy_prob, policy_idx = jax.lax.top_k(data.action_weights, config.top_k)
-    policy_denom = jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
-    policy_prob = (policy_prob / policy_denom).astype(jnp.float32)
-
     first_term = (jnp.cumsum(data.terminated, axis=0) == 1) & data.terminated
     fallback_term = jnp.full((batch_size,), max_steps - 1, dtype=jnp.int32)
     term_idx = jnp.where(
@@ -568,8 +570,8 @@ def compute_targets(data: SelfplayOutput):
 
     return Sample(
         obs=data.obs, 
-        policy_idx=policy_idx.astype(jnp.int32),
-        policy_prob=policy_prob,
+        policy_idx=data.policy_idx.astype(jnp.int32),
+        policy_prob=data.policy_prob.astype(jnp.float32),
         value_tgt=value_tgt,
         remaining_ply_bucket=remaining_ply_bucket,
         future_material_delta=future_material_delta,

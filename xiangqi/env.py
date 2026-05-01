@@ -656,7 +656,7 @@ class XiangqiEnv:
         def encode_board(b: jnp.ndarray) -> jnp.ndarray:
             """将棋盘编码为 14 通道的 one-hot 表示 (向量化加速)"""
             # 形状: (14, 10, 9)
-            return (b[..., None, :, :] == _PIECE_TYPES[:, None, None]).astype(jnp.float32)
+            return (b[..., None, :, :] == _PIECE_TYPES[:, None, None]).astype(jnp.uint8)
 
         # 编码当前棋盘 (14, 10, 9)
         current_encoded = encode_board(board)
