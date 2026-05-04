@@ -26,6 +26,7 @@ from xiangqi.actions import (
     _ACTION_TO_FROM_SQ,
     _ACTION_TO_TO_SQ,
 )
+from xiangqi.env import BOARD_OBSERVATION_CHANNELS, NUM_RULE_STATE_CHANNELS
 
 
 # ============================================================================
@@ -368,7 +369,7 @@ class AuxiliaryHeads(nn.Module):
 class AlphaZeroNetwork(nn.Module):
     """精简 3 分支 GNN AlphaZero 网络（Local 8 邻居 + Row + Col，无 Global）
 
-    输入: (B, C, H, W) 观察张量（126 通道 = 9 帧 × 14 棋子类型）
+    输入: (B, C, H, W) 观察张量（126 棋盘通道 + 10 规则状态通道）
     输出: (policy_logits, value, value_logits)
         - policy_logits: (B, ACTION_SPACE_SIZE)
         - value: (B,) in [-1, 1]，由 value_logits 经 softmax 得 p_W、p_L 后 value = p_W − p_L
@@ -403,7 +404,7 @@ class AlphaZeroNetwork(nn.Module):
             )
 
         x = x.astype(self.dtype)
-        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC, (B, H, W, 126)
+        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
         batch_size = x.shape[0]
         num_nodes = BOARD_HEIGHT * BOARD_WIDTH
 
@@ -411,10 +412,13 @@ class AlphaZeroNetwork(nn.Module):
         # 目标: 让同类棋子共享统计结构，提高跨局面泛化与样本效率
         num_frames = 9
         channels_per_frame = 14
-        if x.shape[-1] != num_frames * channels_per_frame:
+        expected_channels = BOARD_OBSERVATION_CHANNELS + NUM_RULE_STATE_CHANNELS
+        if x.shape[-1] != expected_channels:
             raise ValueError(
-                f"通道数不匹配，期望 {num_frames * channels_per_frame}，实际 {x.shape[-1]}"
+                f"通道数不匹配，期望 {expected_channels}，实际 {x.shape[-1]}"
             )
+        board_x = x[..., :BOARD_OBSERVATION_CHANNELS]
+        rule_x = x[..., BOARD_OBSERVATION_CHANNELS:]
 
         piece_embed_dim = max(self.channels // 4, 24)  # 增大以更好区分棋子类型
         role_embed = self.param(
@@ -447,8 +451,8 @@ class AlphaZeroNetwork(nn.Module):
             + piece_channel_bias
         ).astype(self.dtype)  # (14, Dp)
 
-        x = x.reshape((batch_size, BOARD_HEIGHT, BOARD_WIDTH, num_frames, channels_per_frame))
-        node_occupancy = (jnp.sum(x[:, :, :, 0, :], axis=-1) > 0).reshape(batch_size, num_nodes)
+        board_x = board_x.reshape((batch_size, BOARD_HEIGHT, BOARD_WIDTH, num_frames, channels_per_frame))
+        node_occupancy = (jnp.sum(board_x[:, :, :, 0, :], axis=-1) > 0).reshape(batch_size, num_nodes)
 
         # 历史帧时间权重：9 帧各一个可学习标量，初始化为指数衰减
         # 帧顺序: [当前, t-1, t-2, ..., t-8]，越近权重越大
@@ -465,14 +469,17 @@ class AlphaZeroNetwork(nn.Module):
         ).astype(self.dtype)
 
         # (B, H, W, F, 14) x (14, Dp) -> (B, H, W, F, Dp)
-        piece_feat = jnp.einsum("bhwfp,pd->bhwfd", x, piece_embed_table)
-        piece_presence = jnp.sum(x, axis=-1, keepdims=True)  # 0/1 occupancy per frame
+        piece_feat = jnp.einsum("bhwfp,pd->bhwfd", board_x, piece_embed_table)
+        piece_presence = jnp.sum(board_x, axis=-1, keepdims=True)  # 0/1 occupancy per frame
         piece_feat = piece_feat + piece_presence * frame_embed[None, None, None, :, :]
         piece_feat = piece_feat * frame_weight[None, None, None, :, None]
 
         # 保留时间维度再投影，避免直接求和造成时序信息丢失
         h = piece_feat.reshape((batch_size, num_nodes, num_frames * piece_embed_dim))
         h = nn.Dense(self.channels, dtype=self.dtype, name="input_proj")(h)
+        rule_vec = jnp.mean(rule_x, axis=(1, 2))
+        rule_feat = nn.Dense(self.channels, dtype=self.dtype, name="rule_state_proj")(rule_vec)
+        h = h + rule_feat[:, None, :]
 
         pos_embed = self.param(
             "pos_embed",

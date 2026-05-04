@@ -37,8 +37,16 @@ NUM_HISTORY_STEPS = 8
 # 每步的通道数: 7种棋子 × 2方 = 14
 CHANNELS_PER_STEP = 14
 
-# 总观察通道数: (8历史 + 1当前) × 14棋子 = 126
-NUM_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP
+# 规则状态平面（全局二值特征，展开为 10x9 常量平面）
+# 0-2: 当前局面重复次数 >= 2/3/4
+# 3-5: 无吃子步数 >= 60/90/110
+# 6-7: 无吃子期间将军步数 >= 20/40
+# 8-9: 当前方/对方长将长捉压力 >= 2
+NUM_RULE_STATE_CHANNELS = 10
+
+# 总观察通道数: (8历史 + 1当前) × 14棋子 + 规则状态平面 = 136
+BOARD_OBSERVATION_CHANNELS = (NUM_HISTORY_STEPS + 1) * CHANNELS_PER_STEP
+NUM_OBSERVATION_CHANNELS = BOARD_OBSERVATION_CHANNELS + NUM_RULE_STATE_CHANNELS
 
 # 重复局面检测: 保存最近 N 步的局面哈希
 POSITION_HISTORY_SIZE = 256
@@ -665,8 +673,39 @@ class XiangqiEnv:
         history_encoded = jax.vmap(encode_board)(history)
         history_flat = history_encoded.reshape(-1, BOARD_HEIGHT, BOARD_WIDTH)
         
-        # 最终观察: 仅包含棋盘和历史平面 (126, 10, 9)
-        observation = jnp.concatenate([current_encoded, history_flat], axis=0)
+        board_observation = jnp.concatenate([current_encoded, history_flat], axis=0)
+
+        current_hash = compute_position_hash(state.board, state.current_player)
+        repetitions = jnp.maximum(
+            count_repetitions(current_hash, state.position_hashes, state.hash_count) - 1,
+            1,
+        )
+
+        own_check = jnp.where(is_black, state.black_check_count, state.red_check_count)
+        own_chase = jnp.where(is_black, state.black_chase_count, state.red_chase_count)
+        own_alt = jnp.where(is_black, state.black_alt_count, state.red_alt_count)
+        opp_check = jnp.where(is_black, state.red_check_count, state.black_check_count)
+        opp_chase = jnp.where(is_black, state.red_chase_count, state.black_chase_count)
+        opp_alt = jnp.where(is_black, state.red_alt_count, state.black_alt_count)
+
+        rule_bits = jnp.array([
+            repetitions >= 2,
+            repetitions >= 3,
+            repetitions >= 4,
+            state.no_capture_count >= 60,
+            state.no_capture_count >= 90,
+            state.no_capture_count >= 110,
+            state.check_in_no_capture >= 20,
+            state.check_in_no_capture >= MAX_CHECK_IN_NO_CAPTURE * 2,
+            jnp.maximum(jnp.maximum(own_check, own_chase), own_alt) >= 2,
+            jnp.maximum(jnp.maximum(opp_check, opp_chase), opp_alt) >= 2,
+        ], dtype=jnp.uint8)
+        rule_planes = jnp.broadcast_to(
+            rule_bits[:, None, None],
+            (NUM_RULE_STATE_CHANNELS, BOARD_HEIGHT, BOARD_WIDTH),
+        )
+
+        observation = jnp.concatenate([board_observation, rule_planes], axis=0)
         
         return observation
     
