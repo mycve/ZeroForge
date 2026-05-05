@@ -13,9 +13,11 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 import argparse
 import logging
 import os
+import signal
 import sys
 import time
 import json
+import struct
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -40,6 +42,10 @@ import numpy as np
 import optax
 import mctx
 import orbax.checkpoint as ocp
+try:
+    import lz4.frame as lz4_frame
+except ImportError:  # pragma: no cover - handled at runtime with a clear error.
+    lz4_frame = None
 
 from xiangqi.env import XiangqiEnv, NUM_OBSERVATION_CHANNELS
 from xiangqi.actions import rotate_action, ACTION_SPACE_SIZE, BOARD_HEIGHT, BOARD_WIDTH
@@ -1100,6 +1106,30 @@ class ReplayBuffer:
     def stats(self):
         return {"size": self.size, "total_added": self.total_added, "ptr": self.ptr}
 
+    def _active_indices(self) -> np.ndarray:
+        if self.size <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        if self.size < self.max_size:
+            return np.arange(self.size, dtype=np.int64)
+        start = self.ptr % self.max_size
+        return (np.arange(self.size, dtype=np.int64) + start) % self.max_size
+
+    def compact_state_dict(self):
+        idx = self._active_indices()
+        return {
+            "obs": self.obs[idx],
+            "policy_idx": self.policy_idx[idx],
+            "policy_prob": self.policy_prob[idx],
+            "value_tgt": self.value_tgt[idx],
+            "remaining_ply_bucket": self.remaining_ply_bucket[idx],
+            "future_material_delta": self.future_material_delta[idx],
+            "future_occupancy_change": self.future_occupancy_change[idx],
+            "mask": np.ones((idx.shape[0],), dtype=np.bool_),
+            "ptr": int(idx.shape[0] % self.max_size),
+            "size": int(idx.shape[0]),
+            "total_added": int(self.total_added),
+        }
+
     def state_dict(self):
         return {
             "obs": self.obs,
@@ -1122,6 +1152,11 @@ class ReplayBuffer:
         loaded_size = min(int(state["size"]), self.max_size, loaded_obs.shape[0])
         loaded_ptr = int(state["ptr"]) % max(loaded_size, 1)
 
+        if loaded_obs.shape[1:] != self.obs.shape[1:]:
+            raise ValueError(
+                f"replay obs shape 不匹配: snapshot={loaded_obs.shape[1:]}, current={self.obs.shape[1:]}"
+            )
+
         if "policy_idx" in state and "policy_prob" in state:
             loaded_policy_idx = np.array(state["policy_idx"], dtype=np.uint16)
             loaded_policy_prob = np.array(state["policy_prob"], dtype=np.float16)
@@ -1137,6 +1172,11 @@ class ReplayBuffer:
             loaded_policy_prob = (loaded_policy_prob / denom).astype(np.float16)
         else:
             raise ValueError("checkpoint replay buffer 缺少 policy_idx/policy_prob 或旧版 policy_tgt")
+
+        if loaded_policy_idx.shape[1:] != self.policy_idx.shape[1:]:
+            raise ValueError(
+                f"replay policy top-k 不匹配: snapshot={loaded_policy_idx.shape[1:]}, current={self.policy_idx.shape[1:]}"
+            )
 
         if loaded_obs.shape[0] < loaded_size:
             raise ValueError("checkpoint replay buffer 数据不完整")
@@ -1270,6 +1310,149 @@ def save_checkpoint(
         }, f)
     
     logger.info("[Checkpoint] 已保存 step=%s", step)
+
+
+REPLAY_SNAPSHOT_NAME = "replay_buffer.lz4"
+REPLAY_SNAPSHOT_MAGIC = b"ZFRB1\0\0\0"
+
+
+def _require_lz4():
+    if lz4_frame is None:
+        raise RuntimeError("保存/恢复 lz4 经验池需要安装 lz4：pip install lz4")
+
+
+def _replay_snapshot_path() -> str:
+    return os.path.join(os.path.abspath(config.ckpt_dir), REPLAY_SNAPSHOT_NAME)
+
+
+def save_replay_buffer_lz4(replay_buffer: ReplayBuffer, iteration: int, frames: int) -> str:
+    """以 lz4 frame 保存经验池有效样本；先写临时文件再原子替换。"""
+    _require_lz4()
+    path = _replay_snapshot_path()
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    state = replay_buffer.compact_state_dict()
+    array_keys = [
+        "obs",
+        "policy_idx",
+        "policy_prob",
+        "value_tgt",
+        "remaining_ply_bucket",
+        "future_material_delta",
+        "future_occupancy_change",
+        "mask",
+    ]
+    meta = {
+        "version": 1,
+        "iteration": int(iteration),
+        "frames": int(frames),
+        "top_k": int(replay_buffer.policy_idx.shape[1]),
+        "obs_shape": list(replay_buffer.obs.shape[1:]),
+        "max_size": int(replay_buffer.max_size),
+        "size": int(state["size"]),
+        "ptr": int(state["ptr"]),
+        "total_added": int(state["total_added"]),
+        "array_keys": array_keys,
+    }
+    meta_bytes = json.dumps(meta).encode("utf-8")
+
+    st = time.time()
+    try:
+        with lz4_frame.open(tmp_path, mode="wb", compression_level=0) as f:
+            f.write(REPLAY_SNAPSHOT_MAGIC)
+            f.write(struct.pack("<Q", len(meta_bytes)))
+            f.write(meta_bytes)
+            for key in array_keys:
+                np.save(f, state[key], allow_pickle=False)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    logger.info(
+        "[Replay] 已保存 lz4 快照: %s | samples=%s | %.1f MB | %s",
+        path,
+        state["size"],
+        size_mb,
+        _format_duration(time.time() - st),
+    )
+    return path
+
+
+def load_replay_buffer_lz4(
+    replay_buffer: ReplayBuffer,
+    expected_iteration: Optional[int] = None,
+) -> bool:
+    """启动时恢复经验池；配置或 iteration 不匹配时安全跳过。"""
+    path = _replay_snapshot_path()
+    if not os.path.exists(path):
+        logger.info("[Replay] 未找到经验池快照，跳过恢复")
+        return False
+    _require_lz4()
+
+    st = time.time()
+    with lz4_frame.open(path, mode="rb") as f:
+        magic = f.read(len(REPLAY_SNAPSHOT_MAGIC))
+        if magic != REPLAY_SNAPSHOT_MAGIC:
+            raise ValueError(f"经验池快照格式不匹配: {path}")
+        meta_len = struct.unpack("<Q", f.read(8))[0]
+        meta = json.loads(f.read(meta_len).decode("utf-8"))
+
+        if expected_iteration is not None and int(meta["iteration"]) != int(expected_iteration):
+            logger.warning(
+                "[Replay] 快照 iteration=%s 与 checkpoint iteration=%s 不一致，跳过恢复",
+                meta["iteration"],
+                expected_iteration,
+            )
+            return False
+        if int(meta["top_k"]) != replay_buffer.policy_idx.shape[1]:
+            logger.warning(
+                "[Replay] 快照 top_k=%s 与当前 top_k=%s 不一致，跳过恢复",
+                meta["top_k"],
+                replay_buffer.policy_idx.shape[1],
+            )
+            return False
+        if tuple(meta["obs_shape"]) != replay_buffer.obs.shape[1:]:
+            logger.warning(
+                "[Replay] 快照 obs_shape=%s 与当前 obs_shape=%s 不一致，跳过恢复",
+                tuple(meta["obs_shape"]),
+                replay_buffer.obs.shape[1:],
+            )
+            return False
+
+        state = {}
+        for key in meta["array_keys"]:
+            state[key] = np.load(f, allow_pickle=False)
+        state["ptr"] = int(meta["ptr"])
+        state["size"] = int(meta["size"])
+        state["total_added"] = int(meta["total_added"])
+
+    replay_buffer.load_state_dict(state)
+    logger.info(
+        "[Replay] 已恢复 lz4 快照: iteration=%s | samples=%s | total_added=%s | %s",
+        meta["iteration"],
+        replay_buffer.size,
+        replay_buffer.total_added,
+        _format_duration(time.time() - st),
+    )
+    return True
+
+
+def save_recovery_snapshot(
+    ckpt_manager: ocp.CheckpointManager,
+    replay_buffer: ReplayBuffer,
+    train_state: TrainState,
+    reason: str,
+) -> None:
+    """同步保存模型 checkpoint 与 lz4 经验池，用于 Ctrl+C/正常断点恢复。"""
+    logger.info("[Recovery] %s，开始保存 checkpoint + replay...", reason)
+    save_checkpoint(ckpt_manager, train_state, train_state.iteration)
+    save_replay_buffer_lz4(replay_buffer, train_state.iteration, train_state.frames)
 
 
 def _load_params_from_checkpoint(
@@ -1457,6 +1640,7 @@ def main():
     if restored is not None:
         params, opt_state, iteration, frames, rng_key, iteration_elos, total_opt_steps = restored
         logger.info("[断点续训] 从 iteration=%s 继续训练", iteration)
+        load_replay_buffer_lz4(replay_buffer, expected_iteration=iteration)
         if CLI_ARGS.init_checkpoint:
             logger.info("[Init] 检测到已有训练断点，忽略 --init-checkpoint=%s", CLI_ARGS.init_checkpoint)
     else:
@@ -1501,6 +1685,37 @@ def main():
     logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
     writer = SummaryWriter(run_log_dir)
     start_time_total = time.time()
+    shutdown_saving = False
+
+    def _handle_shutdown(signum, _frame):
+        nonlocal shutdown_saving
+        if shutdown_saving:
+            raise SystemExit(130)
+        shutdown_saving = True
+        train_state = TrainState(
+            params=params,
+            opt_state=opt_state,
+            iteration=iteration,
+            frames=frames,
+            rng_key=rng_key,
+            iteration_elos=iteration_elos,
+            total_opt_steps=total_opt_steps,
+        )
+        try:
+            save_recovery_snapshot(
+                ckpt_manager,
+                replay_buffer,
+                train_state,
+                reason=f"收到退出信号 {signum}",
+            )
+            writer.flush()
+            writer.close()
+        finally:
+            raise SystemExit(130)
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _handle_shutdown)
     
     logger.info("开始训练")
     
@@ -1748,6 +1963,7 @@ def main():
                 total_opt_steps=total_opt_steps,
             )
             save_checkpoint(ckpt_manager, train_state, iteration)
+            save_replay_buffer_lz4(replay_buffer, iteration, frames)
             # 裁剪 iteration_elos，与 orbax 保留数量一致，避免内存膨胀
             kept_steps = _get_kept_steps(config.ckpt_dir)
             iteration_elos = {k: v for k, v in iteration_elos.items() if k in kept_steps}
