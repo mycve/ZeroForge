@@ -81,7 +81,7 @@ class Config:
     num_channels: int = 64   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 4       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
-    network_dtype: str = "bfloat16"
+    network_dtype: str = "float32"
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW peak LR
