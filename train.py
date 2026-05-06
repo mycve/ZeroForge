@@ -78,8 +78,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
-    num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
+    num_channels: int = 64   # 128 是当前稳妥默认；96 更快但上限略低
+    num_blocks: int = 4       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
     
@@ -92,20 +92,20 @@ class Config:
     td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 64            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 8
+    selfplay_batch_size: int = 128       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 128            # 增大可提升 MCTS 质量（更耗算力）
+    top_k: int = 16
     selfplay_temperature_steps: int = 40
-    selfplay_temperature: float = 1.0      # 自对弈起始温度
-    selfplay_temperature_final: float = 0.15
+    selfplay_temperature: float = 1.2      # 自对弈起始温度
+    selfplay_temperature_final: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 500_000    # 配合 batch_size=2048，约 4 轮填满
+    replay_buffer_size: int = 200_000    # 配合 batch_size=2048，约 4 轮填满
     sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
-    value_loss_weight: float = 0.25
+    value_loss_weight: float = 1.0
     aux_remaining_loss_weight: float = 0.05
     aux_material_loss_weight: float = 0.05
     aux_occupancy_loss_weight: float = 0.05
@@ -116,7 +116,7 @@ class Config:
     eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 300              # 总步数 400 步（200回合）判和
+    max_steps: int = 400              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
@@ -1963,7 +1963,6 @@ def main():
                 total_opt_steps=total_opt_steps,
             )
             save_checkpoint(ckpt_manager, train_state, iteration)
-            save_replay_buffer_lz4(replay_buffer, iteration, frames)
             # 裁剪 iteration_elos，与 orbax 保留数量一致，避免内存膨胀
             kept_steps = _get_kept_steps(config.ckpt_dir)
             iteration_elos = {k: v for k, v in iteration_elos.items() if k in kept_steps}
