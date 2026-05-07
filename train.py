@@ -78,8 +78,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 196   # 128 是当前稳妥默认；96 更快但上限略低
-    num_blocks: int = 12       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
+    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
+    num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "float32"
     
@@ -89,11 +89,11 @@ class Config:
     lr_cosine_steps: int = 80000      # cosine decay steps
     lr_min_ratio: float = 0.05        # final LR = peak * 0.05
     training_batch_size: int = 1024
-    td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 128       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 128            # 增大可提升 MCTS 质量（更耗算力）
+    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 16
     selfplay_temperature_steps: int = 40
     selfplay_temperature: float = 1.2      # 自对弈起始温度
