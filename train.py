@@ -78,8 +78,8 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 64   # 128 是当前稳妥默认；96 更快但上限略低
-    num_blocks: int = 4       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
+    num_channels: int = 196   # 128 是当前稳妥默认；96 更快但上限略低
+    num_blocks: int = 12       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "float32"
     
