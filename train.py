@@ -11,6 +11,7 @@ ZeroForge - 中国象棋 Gumbel AlphaZero
 """
 
 import argparse
+import gc
 import logging
 import os
 import signal
@@ -35,6 +36,10 @@ os.environ["JAX_COMPILATION_CACHE_DIR"] = _JAX_CACHE_DIR
 os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1")
 os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Opt-in debugging/stability mode for wide models. It returns freed buffers to CUDA
+# more aggressively, but is usually slower than the default BFC allocator.
+if os.environ.get("ZEROFORGE_STABLE_CUDA_ALLOCATOR", "").lower() in ("1", "true", "yes", "on"):
+    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 import jax
 import jax.numpy as jnp
@@ -78,10 +83,10 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 128   # 128 是当前稳妥默认；96 更快但上限略低
+    num_channels: int = 256   # 128 是当前稳妥默认；96 更快但上限略低
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
-    network_dtype: str = "float32"
+    network_dtype: str = "bfloat16"
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW peak LR
@@ -89,18 +94,19 @@ class Config:
     lr_cosine_steps: int = 80000      # cosine decay steps
     lr_min_ratio: float = 0.05        # final LR = peak * 0.05
     training_batch_size: int = 1024
-    td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    grad_clip_norm: float = 1.0
+    td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 128       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
     num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 16
+    top_k: int = 8
     selfplay_temperature_steps: int = 40
     selfplay_temperature: float = 1.2      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 200_000    # 配合 batch_size=2048，约 4 轮填满
+    replay_buffer_size: int = 500_000    # 配合 batch_size=2048，约 4 轮填满
     sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
@@ -140,7 +146,11 @@ def parse_args():
         help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
+    parser.add_argument("--num-channels", type=int, default=None, help="覆盖 num_channels")
+    parser.add_argument("--num-blocks", type=int, default=None, help="覆盖 num_blocks")
+    parser.add_argument("--network-dtype", type=str, default=None, choices=["float32", "bfloat16"], help="覆盖 network_dtype")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
+    parser.add_argument("--grad-clip-norm", type=float, default=None, help="覆盖 grad_clip_norm")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
@@ -159,7 +169,11 @@ def parse_args():
 def apply_cli_overrides(args):
     overrides = {
         "learning_rate": args.learning_rate,
+        "num_channels": args.num_channels,
+        "num_blocks": args.num_blocks,
+        "network_dtype": args.network_dtype,
         "td_lambda": args.td_lambda,
+        "grad_clip_norm": args.grad_clip_norm,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
@@ -281,6 +295,15 @@ def _format_duration(seconds: float) -> str:
     if m > 0:
         return f"{m:d}m{s:02d}s"
     return f"{s:d}s"
+
+
+def _block_until_ready(pytree):
+    """Force pending CUDA work to finish so errors surface at the right stage."""
+    leaves = jax.tree_util.tree_leaves(pytree)
+    for leaf in leaves:
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+    return pytree
 
 
 
@@ -778,11 +801,17 @@ def _run_best_checkpoint_eval(
             [jax.tree.map(lambda x: x[i], states_b) for i in range(num_devices)], devices
         )
 
+    # Keep eval strictly sequential. JAX dispatch is async; launching both sides before
+    # synchronizing can briefly double the eval search-tree buffers on wide models.
     winners_r = evaluate(current_params, opponent_params, states_r, eval_keys_r)
-    winners_b = evaluate(opponent_params, current_params, states_b, eval_keys_b)
+    winners_r_np = np.array(jax.device_get(_block_until_ready(winners_r)))
+    del winners_r, states_r, eval_keys_r
+    gc.collect()
 
-    winners_r_np = np.array(jax.device_get(winners_r))
-    winners_b_np = np.array(jax.device_get(winners_b))
+    winners_b = evaluate(opponent_params, current_params, states_b, eval_keys_b)
+    winners_b_np = np.array(jax.device_get(_block_until_ready(winners_b)))
+    del winners_b, states_b, eval_keys_b, opponent_params
+    gc.collect()
     wins_red = int((winners_r_np == 0).sum())
     draws_red = int((winners_r_np == -1).sum())
     losses_red = int((winners_r_np == 1).sum())
@@ -1626,8 +1655,9 @@ def main():
         config.value_loss_weight,
     )
     logger.info(
-        "[Optimizer] AdamW(weight_decay=%.1e, train_batch=%s)",
+        "[Optimizer] AdamW(weight_decay=%.1e, grad_clip=%.2f, train_batch=%s)",
         config.weight_decay,
+        config.grad_clip_norm,
         config.training_batch_size,
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
@@ -1667,10 +1697,27 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        grads, losses = jax.grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        (total_loss, losses), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        loss_finite = jnp.isfinite(total_loss)
+        for loss_value in losses:
+            loss_finite = loss_finite & jnp.isfinite(loss_value)
+        grad_finite = jnp.array(True)
+        for grad in jax.tree_util.tree_leaves(grads):
+            grad_finite = grad_finite & jnp.all(jnp.isfinite(grad))
+        finite = jax.lax.pmin(loss_finite & grad_finite, 'i')
+        grads = jax.tree.map(
+            lambda g: jnp.where(finite, jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), jnp.zeros_like(g)),
+            grads,
+        )
         grads = jax.lax.pmean(grads, 'i')
+        if config.grad_clip_norm and config.grad_clip_norm > 0:
+            grad_norm = optax.global_norm(grads)
+            grad_scale = jnp.minimum(1.0, config.grad_clip_norm / (grad_norm + 1e-6))
+            grads = jax.tree.map(lambda g: g * grad_scale, grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        return (optax.apply_updates(params, updates), opt_state, *losses)
+        new_params = optax.apply_updates(params, updates)
+        params = jax.tree.map(lambda old, new: jnp.where(finite, new, old), params, new_params)
+        return (params, opt_state, *losses, finite)
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1798,6 +1845,8 @@ def main():
         del data
         
         replay_buffer.add(samples)
+        del samples
+        gc.collect()
         new_frames = config.max_steps * config.selfplay_batch_size
 
         # 只传输统计标量（~100 字节），不再传输完整 data（~3GB）
@@ -1808,6 +1857,8 @@ def main():
         root_visit_entropy = float(jax.device_get(ent_all_dev).mean())
         entropy_opening = float(jax.device_get(ent_open_dev).mean())
         entropy_mid = float(jax.device_get(ent_mid_dev).mean())
+        del gpu_stats, stats_dev, avg_len_dev, ent_all_dev, ent_open_dev, ent_mid_dev
+        gc.collect()
 
         (num_games, r_wins, b_wins, draws, d_max_steps, d_no_capture, d_repetition,
          d_perpetual, d_no_attackers, d_perpetual_chase, d_check_chase_alt, d_checkmate) = [int(x) for x in stats]
@@ -1834,6 +1885,7 @@ def main():
 
         ploss_acc, vloss_acc = None, None
         rem_loss_acc, mat_loss_acc, occ_loss_acc = None, None, None
+        finite_acc = None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
                 prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
@@ -1847,7 +1899,7 @@ def main():
                     next_future = None
 
                 try:
-                    params, opt_state, ploss, vloss, rem_loss, mat_loss, occ_loss = train_step(
+                    params, opt_state, ploss, vloss, rem_loss, mat_loss, occ_loss, finite = train_step(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1860,6 +1912,7 @@ def main():
                             f"selfplay_batch_size({config.selfplay_batch_size})."
                         ) from e
                     raise
+                finite_acc = finite if finite_acc is None else (finite_acc & finite)
 
                 # 累积损失（保持在 GPU），只在最后同步
                 if ploss_acc is None:
@@ -1871,9 +1924,17 @@ def main():
                     rem_loss_acc = rem_loss_acc + rem_loss
                     mat_loss_acc = mat_loss_acc + mat_loss
                     occ_loss_acc = occ_loss_acc + occ_loss
+                del batch, train_keys, finite, ploss, vloss, rem_loss, mat_loss, occ_loss
         
         # 累计优化器步数
         total_opt_steps += num_updates
+        if finite_acc is not None and not bool(np.asarray(jax.device_get(finite_acc)).all()):
+            raise RuntimeError(
+                "[Training NaN/Inf] 检测到非有限 loss 或梯度；"
+                f"建议降低 learning_rate({config.learning_rate}) / num_channels({config.num_channels})，"
+                f"或临时改用 --network-dtype float32 定位。"
+            )
+        del finite_acc
         
         # 一次性同步所有累积损失
         if num_updates > 0:
@@ -1882,6 +1943,8 @@ def main():
             remaining_loss = float(rem_loss_acc.mean() / num_updates)
             material_loss = float(mat_loss_acc.mean() / num_updates)
             occupancy_loss = float(occ_loss_acc.mean() / num_updates)
+            del ploss_acc, vloss_acc, rem_loss_acc, mat_loss_acc, occ_loss_acc
+            gc.collect()
         else:
             policy_loss = 0.0
             value_loss = 0.0
