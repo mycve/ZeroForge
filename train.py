@@ -639,7 +639,44 @@ def loss_fn(params, samples: Sample, rng_key):
     value_loss = jnp.sum(err * err * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
     total_loss = policy_loss + config.value_loss_weight * value_loss
-    return total_loss, (policy_loss, value_loss)
+    normalizer = jnp.maximum(jnp.sum(samples.mask.astype(jnp.float32)), 1.0)
+    target_sum = jnp.sum(policy_prob, axis=-1, keepdims=True)
+    target_full = jnp.zeros_like(logits).at[
+        jnp.arange(policy_idx.shape[0])[:, None], policy_idx
+    ].add(policy_prob)
+    grad_logits = (
+        (jax.nn.softmax(logits, axis=-1) * target_sum - target_full)
+        * samples.mask[:, None].astype(jnp.float32)
+        / normalizer
+    )
+    grad_value = (
+        2.0
+        * config.value_loss_weight
+        * err
+        * samples.mask.astype(jnp.float32)
+        / normalizer
+    )
+    debug_flags = jnp.stack([
+        jnp.all(jnp.isfinite(logits)),
+        jnp.all(jnp.isfinite(value)),
+        jnp.all(jnp.isfinite(policy_prob)),
+        jnp.all(jnp.isfinite(value_tgt)),
+        jnp.all(jnp.isfinite(sparse_log_probs)),
+        jnp.all(jnp.isfinite(target_sum)),
+        jnp.all(target_sum > 0.0),
+        jnp.all(jnp.isfinite(grad_logits)),
+        jnp.all(jnp.isfinite(grad_value)),
+    ])
+    debug_values = jnp.stack([
+        jnp.max(jnp.abs(logits)),
+        jnp.max(jnp.abs(value)),
+        jnp.max(policy_prob),
+        jnp.min(target_sum),
+        jnp.max(target_sum),
+        jnp.max(jnp.abs(grad_logits)),
+        jnp.max(jnp.abs(grad_value)),
+    ])
+    return total_loss, (policy_loss, value_loss, debug_flags, debug_values)
 
 
 def _run_best_checkpoint_eval(
@@ -1543,6 +1580,26 @@ def main():
         _format_tree_path(path)
         for path, _ in jax.tree_util.tree_flatten_with_path(params_template)[0]
     ]
+    loss_debug_names = [
+        "logits_finite",
+        "value_finite",
+        "policy_prob_finite",
+        "value_tgt_finite",
+        "sparse_log_probs_finite",
+        "policy_prob_sum_finite",
+        "policy_prob_sum_positive",
+        "grad_logits_finite",
+        "grad_value_finite",
+    ]
+    loss_debug_value_names = [
+        "max_abs_logits",
+        "max_abs_value",
+        "max_policy_prob",
+        "min_policy_prob_sum",
+        "max_policy_prob_sum",
+        "max_abs_grad_logits",
+        "max_abs_grad_value",
+    ]
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
     ckpt_manager = create_checkpoint_manager(config.ckpt_dir)
@@ -1578,9 +1635,10 @@ def main():
     
     @partial(jax.pmap, axis_name='i')
     def train_step(params, opt_state, samples, rng_key):
-        (total_loss, losses), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        (total_loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, samples, rng_key)
+        policy_loss, value_loss, debug_flags, debug_values = aux
         loss_finite = jnp.isfinite(total_loss)
-        for loss_value in losses:
+        for loss_value in (policy_loss, value_loss):
             loss_finite = loss_finite & jnp.isfinite(loss_value)
         grad_bad_mask = jnp.stack([
             ~jnp.all(jnp.isfinite(grad))
@@ -1595,10 +1653,16 @@ def main():
             grads,
         )
         grads = jax.lax.pmean(grads, 'i')
-        updates, opt_state = optimizer.update(grads, opt_state, params)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
+        opt_state = jax.tree.map(lambda old, new: jnp.where(finite, new, old), opt_state, new_opt_state)
         params = jax.tree.map(lambda old, new: jnp.where(finite, new, old), params, new_params)
-        return (params, opt_state, *losses, finite, loss_finite, grad_finite, grad_bad_mask)
+        debug_flags = jax.lax.pmin(debug_flags.astype(jnp.int32), 'i').astype(jnp.bool_)
+        debug_values = jax.lax.pmax(debug_values.astype(jnp.float32), 'i')
+        return (
+            params, opt_state, policy_loss, value_loss, finite, loss_finite, grad_finite,
+            grad_bad_mask, debug_flags, debug_values,
+        )
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1782,7 +1846,10 @@ def main():
                     next_future = None
 
                 try:
-                    params, opt_state, ploss, vloss, finite, loss_finite, grad_finite, grad_bad_mask = train_step(
+                    (
+                        params, opt_state, ploss, vloss, finite, loss_finite, grad_finite,
+                        grad_bad_mask, debug_flags, debug_values,
+                    ) = train_step(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1803,6 +1870,43 @@ def main():
                     if bad_grad_mask_acc is None
                     else (bad_grad_mask_acc | grad_bad_mask)
                 )
+                if not bool(np.asarray(jax.device_get(finite)).all()):
+                    loss_ok = bool(np.asarray(jax.device_get(loss_finite)).all())
+                    grad_ok = bool(np.asarray(jax.device_get(grad_finite)).all())
+                    bad_mask = np.asarray(jax.device_get(grad_bad_mask)).astype(np.bool_)
+                    if bad_mask.ndim > 1:
+                        bad_mask = np.any(bad_mask, axis=0)
+                    bad_names = [name for name, bad in zip(grad_path_names, bad_mask) if bad]
+                    preview = ", ".join(bad_names[:8]) if bad_names else "unknown"
+                    if len(bad_names) > 8:
+                        preview += f", ...(+{len(bad_names) - 8})"
+                    debug_ok = np.asarray(jax.device_get(debug_flags)).astype(np.bool_)
+                    if debug_ok.ndim > 1:
+                        debug_ok = np.all(debug_ok, axis=0)
+                    debug_text = ", ".join(
+                        f"{name}={bool(ok)}" for name, ok in zip(loss_debug_names, debug_ok)
+                    )
+                    debug_value_np = np.asarray(jax.device_get(debug_values)).astype(np.float32)
+                    if debug_value_np.ndim > 1:
+                        debug_value_np = np.max(debug_value_np, axis=0)
+                    debug_value_text = ", ".join(
+                        f"{name}={float(value):.6g}"
+                        for name, value in zip(loss_debug_value_names, debug_value_np)
+                    )
+                    logger.error(
+                        "[Training NaN/Inf] bad_update=%s/%s loss_finite=%s, grad_finite=%s, %s, %s, bad_grad_leaves=%s",
+                        i + 1,
+                        num_updates,
+                        loss_ok,
+                        grad_ok,
+                        debug_text,
+                        debug_value_text,
+                        preview,
+                    )
+                    raise RuntimeError(
+                        "[Training NaN/Inf] 检测到非有限 loss 或梯度；"
+                        "已在触发的 mini-update 立即停止，请查看上一行 debug flags 和 bad_grad_leaves。"
+                    )
 
                 # 累积损失（保持在 GPU），只在最后同步
                 if ploss_acc is None:
@@ -1810,7 +1914,7 @@ def main():
                 else:
                     ploss_acc = ploss_acc + ploss
                     vloss_acc = vloss_acc + vloss
-                del batch, train_keys, finite, loss_finite, grad_finite, grad_bad_mask, ploss, vloss
+                del batch, train_keys, finite, loss_finite, grad_finite, grad_bad_mask, debug_flags, debug_values, ploss, vloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
