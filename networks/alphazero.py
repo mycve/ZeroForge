@@ -325,7 +325,7 @@ class ValueHead(nn.Module):
 
     @nn.compact
     def __call__(self, h: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        x = nn.LayerNorm(dtype=self.dtype)(h)
+        x = nn.LayerNorm(dtype=self.dtype, use_scale=False, use_bias=False)(h)
         pool_logits = nn.Dense(1, dtype=self.dtype, name="pool_logits")(x).squeeze(-1)
         pool_weights = nn.softmax(pool_logits, axis=1)
         pooled = jnp.sum(pool_weights[..., None] * x, axis=1)
