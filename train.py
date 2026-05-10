@@ -250,6 +250,8 @@ _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def _masked_normalize(x: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
     """对合法动作子集归一化，非法动作恒为 0。"""
+    x = jnp.nan_to_num(x.astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    x = jnp.maximum(x, 0.0)
     masked = jnp.where(legal_mask, x, 0.0)
     denom = jnp.maximum(jnp.sum(masked, axis=-1, keepdims=True), 1e-10)
     return jnp.where(legal_mask, masked / denom, 0.0)
@@ -434,6 +436,9 @@ def selfplay(params, rng_key, batch_size):
         one_hot = jax.nn.one_hot(action_idx, ACTION_SPACE_SIZE, dtype=jnp.float32)
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
+        action_weights = _masked_normalize(action_weights, state.legal_action_mask)
+        root_value = jnp.nan_to_num(root_value.astype(jnp.float32), nan=0.0, posinf=1.0, neginf=-1.0)
+        root_value = jnp.clip(root_value, -1.0, 1.0)
 
         def _sample_action(w, legal_mask, temperature, sample_key):
             # 在 log 空间做温度缩放，避免小概率动作下溢。
@@ -466,7 +471,10 @@ def selfplay(params, rng_key, batch_size):
         )
         policy_prob, policy_idx = jax.lax.top_k(normalized_action_weights, config.top_k)
         policy_denom = jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
-        policy_prob = (policy_prob / policy_denom).astype(jnp.float32)
+        policy_prob = jnp.nan_to_num(policy_prob / policy_denom, nan=0.0, posinf=0.0, neginf=0.0)
+        policy_prob = jnp.maximum(policy_prob, 0.0)
+        policy_prob = policy_prob / jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
+        policy_prob = policy_prob.astype(jnp.float32)
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         p = _masked_normalize(action_weights, state.legal_action_mask)
@@ -532,6 +540,8 @@ def compute_targets(data: SelfplayOutput):
         ),
     )
     value_tgt = value_tgt_rev[::-1]
+    value_tgt = jnp.nan_to_num(value_tgt.astype(jnp.float32), nan=0.0, posinf=1.0, neginf=-1.0)
+    value_tgt = jnp.clip(value_tgt, -1.0, 1.0)
     return Sample(
         obs=data.obs, 
         policy_idx=data.policy_idx.astype(jnp.int32),
@@ -606,6 +616,9 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = samples.obs.astype(jnp.float32)
     policy_idx = samples.policy_idx.astype(jnp.int32)
     policy_prob = samples.policy_prob.astype(jnp.float32)
+    policy_prob = jnp.nan_to_num(policy_prob, nan=0.0, posinf=0.0, neginf=0.0)
+    policy_prob = jnp.maximum(policy_prob, 0.0)
+    policy_prob = policy_prob / jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
 
     # 随机左右镜像增强（默认 30% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
@@ -626,6 +639,8 @@ def loss_fn(params, samples: Sample, rng_key):
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
+    value_tgt = jnp.nan_to_num(value_tgt, nan=0.0, posinf=1.0, neginf=-1.0)
+    value_tgt = jnp.clip(value_tgt, -1.0, 1.0)
 
     # 稀疏策略损失：仅对非零目标动作做 gather，避免在回放中搬运完整 2086 维分布
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -926,18 +941,22 @@ class ReplayBuffer:
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_idx_flat = samples_np.policy_idx.reshape(-1, samples_np.policy_idx.shape[-1]).astype(np.uint16)
-        policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float16)
-        value_flat = samples_np.value_tgt.reshape(-1)
+        policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float32)
+        value_flat = samples_np.value_tgt.reshape(-1).astype(np.float32)
         mask_flat = samples_np.mask.reshape(-1)
 
-        valid_mask = mask_flat.astype(np.bool_)
+        clean_prob = np.nan_to_num(policy_prob_flat, nan=0.0, posinf=0.0, neginf=0.0)
+        clean_prob = np.maximum(clean_prob, 0.0)
+        clean_prob_sum = clean_prob.sum(axis=-1)
+        valid_mask = mask_flat.astype(np.bool_) & np.isfinite(value_flat) & (clean_prob_sum > 1e-8)
         if not np.any(valid_mask):
             return
 
         obs_flat = obs_flat[valid_mask]
         policy_idx_flat = policy_idx_flat[valid_mask]
-        policy_prob_flat = policy_prob_flat[valid_mask]
-        value_flat = value_flat[valid_mask]
+        policy_prob_flat = clean_prob[valid_mask]
+        policy_prob_flat = (policy_prob_flat / np.maximum(policy_prob_flat.sum(axis=-1, keepdims=True), 1e-8)).astype(np.float16)
+        value_flat = np.clip(np.nan_to_num(value_flat[valid_mask], nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -1560,7 +1579,9 @@ def main():
         grad_finite = jnp.array(True)
         for grad in jax.tree_util.tree_leaves(grads):
             grad_finite = grad_finite & jnp.all(jnp.isfinite(grad))
-        finite = jax.lax.pmin(loss_finite & grad_finite, 'i')
+        loss_finite = jax.lax.pmin(loss_finite, 'i')
+        grad_finite = jax.lax.pmin(grad_finite, 'i')
+        finite = loss_finite & grad_finite
         grads = jax.tree.map(
             lambda g: jnp.where(finite, jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), jnp.zeros_like(g)),
             grads,
@@ -1569,7 +1590,7 @@ def main():
         updates, opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         params = jax.tree.map(lambda old, new: jnp.where(finite, new, old), params, new_params)
-        return (params, opt_state, *losses, finite)
+        return (params, opt_state, *losses, finite, loss_finite, grad_finite)
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1737,6 +1758,8 @@ def main():
 
         ploss_acc, vloss_acc = None, None
         finite_acc = None
+        loss_finite_acc = None
+        grad_finite_acc = None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
                 prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
@@ -1750,7 +1773,7 @@ def main():
                     next_future = None
 
                 try:
-                    params, opt_state, ploss, vloss, finite = train_step(
+                    params, opt_state, ploss, vloss, finite, loss_finite, grad_finite = train_step(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1764,6 +1787,8 @@ def main():
                         ) from e
                     raise
                 finite_acc = finite if finite_acc is None else (finite_acc & finite)
+                loss_finite_acc = loss_finite if loss_finite_acc is None else (loss_finite_acc & loss_finite)
+                grad_finite_acc = grad_finite if grad_finite_acc is None else (grad_finite_acc & grad_finite)
 
                 # 累积损失（保持在 GPU），只在最后同步
                 if ploss_acc is None:
@@ -1771,17 +1796,20 @@ def main():
                 else:
                     ploss_acc = ploss_acc + ploss
                     vloss_acc = vloss_acc + vloss
-                del batch, train_keys, finite, ploss, vloss
+                del batch, train_keys, finite, loss_finite, grad_finite, ploss, vloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
         if finite_acc is not None and not bool(np.asarray(jax.device_get(finite_acc)).all()):
+            loss_ok = bool(np.asarray(jax.device_get(loss_finite_acc)).all())
+            grad_ok = bool(np.asarray(jax.device_get(grad_finite_acc)).all())
+            logger.error("[Training NaN/Inf] loss_finite=%s, grad_finite=%s", loss_ok, grad_ok)
             raise RuntimeError(
                 "[Training NaN/Inf] 检测到非有限 loss 或梯度；"
                 f"建议降低 learning_rate({config.learning_rate}) / num_channels({config.num_channels})，"
                 f"或临时改用 --network-dtype float32 定位。"
             )
-        del finite_acc
+        del finite_acc, loss_finite_acc, grad_finite_acc
         
         # 一次性同步所有累积损失
         if num_updates > 0:
