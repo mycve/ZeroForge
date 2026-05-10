@@ -329,7 +329,10 @@ class ValueHead(nn.Module):
         pooled = jnp.sum(pool_weights[..., None] * x, axis=1)
         mean_pooled = jnp.mean(x, axis=1)
         max_pooled = jnp.max(x, axis=1)
-        std_pooled = jnp.std(x, axis=1)
+        x32 = x.astype(jnp.float32)
+        mean32 = jnp.mean(x32, axis=1, keepdims=True)
+        var_pooled = jnp.mean(jnp.square(x32 - mean32), axis=1)
+        std_pooled = jnp.sqrt(var_pooled + 1e-6).astype(self.dtype)
 
         fused = jnp.concatenate([pooled, mean_pooled, max_pooled, std_pooled], axis=-1)
         fused = nn.Dense(self.model_dim * 2, dtype=self.dtype, name="fc1")(fused)
