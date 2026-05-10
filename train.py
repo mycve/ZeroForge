@@ -1818,6 +1818,8 @@ def main():
             loss_ok = bool(np.asarray(jax.device_get(loss_finite_acc)).all())
             grad_ok = bool(np.asarray(jax.device_get(grad_finite_acc)).all())
             bad_mask = np.asarray(jax.device_get(bad_grad_mask_acc)).astype(np.bool_)
+            if bad_mask.ndim > 1:
+                bad_mask = np.any(bad_mask, axis=0)
             bad_names = [name for name, bad in zip(grad_path_names, bad_mask) if bad]
             preview = ", ".join(bad_names[:8]) if bad_names else "unknown"
             if len(bad_names) > 8:
