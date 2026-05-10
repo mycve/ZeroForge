@@ -86,21 +86,20 @@ class Config:
     num_channels: int = 128   # caae0ef 强度基线；盲目加宽会降低每轮搜索/训练质量
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
-    network_dtype: str = "bfloat16"
+    network_dtype: str = "float32"
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW peak LR
     lr_warmup_steps: int = 2000       # warmup steps
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
-    training_batch_size: int = 4096
-    grad_clip_norm: float = 1.0
+    training_batch_size: int = 2048
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
     num_simulations: int = 40            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 8
+    top_k: int = 16
     selfplay_temperature_steps: int = 60
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25
@@ -112,10 +111,6 @@ class Config:
     
     # 损失权重
     value_loss_weight: float = 1.0
-    aux_remaining_loss_weight: float = 0.05
-    aux_material_loss_weight: float = 0.05
-    aux_occupancy_loss_weight: float = 0.05
-    aux_future_horizon: int = 14
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
@@ -150,7 +145,6 @@ def parse_args():
     parser.add_argument("--num-blocks", type=int, default=None, help="覆盖 num_blocks")
     parser.add_argument("--network-dtype", type=str, default=None, choices=["float32", "bfloat16"], help="覆盖 network_dtype")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
-    parser.add_argument("--grad-clip-norm", type=float, default=None, help="覆盖 grad_clip_norm")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
@@ -173,7 +167,6 @@ def apply_cli_overrides(args):
         "num_blocks": args.num_blocks,
         "network_dtype": args.network_dtype,
         "td_lambda": args.td_lambda,
-        "grad_clip_norm": args.grad_clip_norm,
         "training_batch_size": args.training_batch_size,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
@@ -334,30 +327,24 @@ eval_net = AlphaZeroNetwork(
     dtype=jnp.float32,
 )
 
-_MATERIAL_VALUES = jnp.array(
-    [0.0, 2.0, 2.0, 4.0, 9.0, 4.5, 1.0, 1.0, 4.5, 9.0, 4.0, 2.0, 2.0, 0.0],
-    dtype=jnp.float32,
-)
-_REMAINING_PLY_BUCKETS = jnp.array([8, 16, 32, 64], dtype=jnp.int32)
-
-def forward(params, obs, is_training=False, rng_key=None, return_aux=True):
-    """前向传播；return_aux=False 时只返回自玩/评估所需的 policy_logits 和 value。
+def forward(params, obs, is_training=False, rng_key=None):
+    """前向传播: 返回 (policy_logits, value, value_logits)。
 
     value = softmax(value_logits) 的 p_W − p_L；训练时价值损失为 MSE(value, value_tgt)，梯度经 value 回传至 value_logits。
     训练时需传入 rng_key 以支持 GraphBlock 内 dropout。
     """
     if is_training and rng_key is not None:
-        outputs = net.apply(
-            {'params': params}, obs, train=True, return_aux=return_aux, rngs={'dropout': rng_key}
+        logits, value, value_logits = net.apply(
+            {'params': params}, obs, train=True, rngs={'dropout': rng_key}
         )
     else:
-        outputs = net.apply({'params': params}, obs, train=is_training, return_aux=return_aux)
-    return outputs
+        logits, value, value_logits = net.apply({'params': params}, obs, train=is_training)
+    return logits, value, value_logits
 
 
 def eval_forward(params, obs):
     """评估前向传播：固定 float32，规避部分 GPU 上 BF16 Triton 编译问题。"""
-    logits, value = eval_net.apply({'params': params}, obs, train=False, return_aux=False)
+    logits, value, _ = eval_net.apply({'params': params}, obs, train=False)
     return logits, value
 
 
@@ -369,7 +356,7 @@ def recurrent_fn(params, rng_key, action, state):
     prev_player = state.current_player
     state = jax.vmap(env.step)(state, action)
     obs = jax.vmap(env.observe)(state)
-    logits, value = forward(params, obs, return_aux=False)
+    logits, value, _ = forward(params, obs)
     # 黑方视角：logits 旋转到绝对坐标系，与 legal_action_mask（绝对）一致
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
@@ -405,9 +392,6 @@ class Sample(NamedTuple):
     policy_idx: jnp.ndarray       # 稀疏策略目标的动作索引 (top-k)
     policy_prob: jnp.ndarray      # 稀疏策略目标的概率 (top-k)
     value_tgt: jnp.ndarray        # MCTS 根价值 TD(λ) 标量目标（与 Gumbel AlphaZero / mctx 一致）
-    remaining_ply_bucket: jnp.ndarray
-    future_material_delta: jnp.ndarray
-    future_occupancy_change: jnp.ndarray
     mask: jnp.ndarray            # 有效步掩码（游戏结束前）
 
 # ============================================================================
@@ -425,7 +409,7 @@ def selfplay(params, rng_key, batch_size):
     def step_fn(state, key):
         key_mcts, key_sample, key_reset = jax.random.split(key, 3)
         obs = jax.vmap(env.observe)(state)
-        logits, value = forward(params, obs, return_aux=False)
+        logits, value, _ = forward(params, obs)
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
@@ -512,18 +496,6 @@ def selfplay(params, rng_key, batch_size):
     _, data = jax.lax.scan(step_fn, state, jax.random.split(key_scan, config.max_steps))
     return data
 
-def _current_material(obs: jnp.ndarray) -> jnp.ndarray:
-    current = obs[..., :14, :, :].astype(jnp.float32)
-    piece_counts = jnp.sum(current, axis=(-1, -2))
-    own = jnp.sum(piece_counts[..., :7] * _MATERIAL_VALUES[:7], axis=-1)
-    opp = jnp.sum(piece_counts[..., 7:] * _MATERIAL_VALUES[7:], axis=-1)
-    return (own - opp) / 45.0
-
-
-def _current_occupancy(obs: jnp.ndarray) -> jnp.ndarray:
-    return (jnp.sum(obs[..., :14, :, :], axis=-3) > 0).reshape(*obs.shape[:-3], BOARD_HEIGHT * BOARD_WIDTH)
-
-
 @jax.pmap
 def compute_targets(data: SelfplayOutput):
     """计算训练目标（与 mctx / Gumbel MuZero 推荐一致）。
@@ -560,42 +532,11 @@ def compute_targets(data: SelfplayOutput):
         ),
     )
     value_tgt = value_tgt_rev[::-1]
-    first_term = (jnp.cumsum(data.terminated, axis=0) == 1) & data.terminated
-    fallback_term = jnp.full((batch_size,), max_steps - 1, dtype=jnp.int32)
-    term_idx = jnp.where(
-        jnp.any(first_term, axis=0),
-        jnp.argmax(first_term.astype(jnp.int32), axis=0),
-        fallback_term,
-    )
-    step_idx = jnp.arange(max_steps, dtype=jnp.int32)[:, None]
-    remaining_ply = jnp.maximum(term_idx[None, :] - step_idx + 1, 1)
-    remaining_ply_bucket = jnp.sum(
-        remaining_ply[..., None] > _REMAINING_PLY_BUCKETS[None, None, :],
-        axis=-1,
-    ).astype(jnp.int32)
-
-    future_idx = jnp.minimum(step_idx + config.aux_future_horizon, term_idx[None, :])
-    obs_by_batch = jnp.swapaxes(data.obs, 0, 1)
-    idx_by_batch = jnp.swapaxes(future_idx, 0, 1)
-    future_obs = jax.vmap(lambda obs_b, idx_b: obs_b[idx_b])(obs_by_batch, idx_by_batch)
-    future_obs = jnp.swapaxes(future_obs, 0, 1)
-
-    current_material = _current_material(data.obs)
-    future_material = _current_material(future_obs)
-    future_material_delta = jnp.clip(future_material - current_material, -1.0, 1.0)
-
-    current_occupancy = _current_occupancy(data.obs)
-    future_occupancy = _current_occupancy(future_obs)
-    future_occupancy_change = (current_occupancy != future_occupancy).astype(jnp.float32)
-
     return Sample(
         obs=data.obs, 
         policy_idx=data.policy_idx.astype(jnp.int32),
         policy_prob=data.policy_prob.astype(jnp.float32),
         value_tgt=value_tgt,
-        remaining_ply_bucket=remaining_ply_bucket,
-        future_material_delta=future_material_delta,
-        future_occupancy_change=future_occupancy_change,
         mask=value_mask,
     )
 
@@ -670,43 +611,17 @@ def loss_fn(params, samples: Sample, rng_key):
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
     do_mirror = jax.random.bernoulli(rng_mirror, config.mirror_augmentation_prob)
 
-    def _mirror_occupancy(occupancy):
-        board = occupancy.reshape((occupancy.shape[0], BOARD_HEIGHT, BOARD_WIDTH))
-        return jnp.flip(board, axis=2).reshape((occupancy.shape[0], BOARD_HEIGHT * BOARD_WIDTH))
-
     def _apply_mirror(args):
-        obs_in, idx_in, prob_in, occ_in = args
-        return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in, _mirror_occupancy(occ_in)
+        obs_in, idx_in, prob_in = args
+        return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in
 
-    aux_enabled = (
-        config.aux_remaining_loss_weight > 0.0
-        or config.aux_material_loss_weight > 0.0
-        or config.aux_occupancy_loss_weight > 0.0
+    obs, policy_idx, policy_prob = jax.lax.cond(
+        do_mirror,
+        _apply_mirror,
+        lambda args: args,
+        (obs, policy_idx, policy_prob),
     )
-    if aux_enabled:
-        obs, policy_idx, policy_prob, future_occupancy_change = jax.lax.cond(
-            do_mirror,
-            _apply_mirror,
-            lambda args: args,
-            (obs, policy_idx, policy_prob, samples.future_occupancy_change.astype(jnp.float32)),
-        )
-        logits, value, _, remaining_logits, material_delta_pred, occupancy_logits = forward(
-            params, obs, is_training=True, rng_key=rng_dropout, return_aux=True
-        )
-    else:
-        def _apply_mirror_main(args):
-            obs_in, idx_in, prob_in = args
-            return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in
-
-        obs, policy_idx, policy_prob = jax.lax.cond(
-            do_mirror,
-            _apply_mirror_main,
-            lambda args: args,
-            (obs, policy_idx, policy_prob),
-        )
-        logits, value = forward(
-            params, obs, is_training=True, rng_key=rng_dropout, return_aux=False
-        )
+    logits, value, _ = forward(params, obs, is_training=True, rng_key=rng_dropout)
     
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
@@ -722,42 +637,8 @@ def loss_fn(params, samples: Sample, rng_key):
     err = value - value_tgt
     value_loss = jnp.sum(err * err * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
-    if aux_enabled:
-        remaining_ply_bucket = samples.remaining_ply_bucket.astype(jnp.int32)
-        future_material_delta = samples.future_material_delta.astype(jnp.float32)
-        future_occupancy_change = future_occupancy_change.astype(jnp.float32)
-        mask = samples.mask.astype(jnp.float32)
-        mask_denom = jnp.maximum(jnp.sum(mask), 1.0)
-        remaining_ce = optax.softmax_cross_entropy_with_integer_labels(
-            remaining_logits.astype(jnp.float32),
-            remaining_ply_bucket,
-        )
-        remaining_loss = jnp.sum(remaining_ce * mask) / mask_denom
-
-        material_err = material_delta_pred.astype(jnp.float32) - future_material_delta
-        material_loss = jnp.sum(optax.huber_loss(material_err, delta=0.25) * mask) / mask_denom
-
-        occupancy_bce = optax.sigmoid_binary_cross_entropy(
-            occupancy_logits.astype(jnp.float32),
-            future_occupancy_change,
-        )
-        occupancy_loss = jnp.sum(occupancy_bce * mask[:, None]) / jnp.maximum(
-            jnp.sum(mask) * occupancy_bce.shape[-1],
-            1.0,
-        )
-
-        aux_loss = (
-            config.aux_remaining_loss_weight * remaining_loss
-            + config.aux_material_loss_weight * material_loss
-            + config.aux_occupancy_loss_weight * occupancy_loss
-        )
-    else:
-        remaining_loss = jnp.array(0.0, dtype=jnp.float32)
-        material_loss = jnp.array(0.0, dtype=jnp.float32)
-        occupancy_loss = jnp.array(0.0, dtype=jnp.float32)
-        aux_loss = jnp.array(0.0, dtype=jnp.float32)
-    total_loss = policy_loss + config.value_loss_weight * value_loss + aux_loss
-    return total_loss, (policy_loss, value_loss, remaining_loss, material_loss, occupancy_loss)
+    total_loss = policy_loss + config.value_loss_weight * value_loss
+    return total_loss, (policy_loss, value_loss)
 
 
 def _run_best_checkpoint_eval(
@@ -1023,9 +904,6 @@ class ReplayBuffer:
         self.policy_idx = np.zeros((max_size, policy_target_size), dtype=np.uint16)
         self.policy_prob = np.zeros((max_size, policy_target_size), dtype=np.float16)
         self.value_tgt = np.zeros((max_size,), dtype=np.float32)
-        self.remaining_ply_bucket = np.zeros((max_size,), dtype=np.uint8)
-        self.future_material_delta = np.zeros((max_size,), dtype=np.float16)
-        self.future_occupancy_change = np.zeros((max_size, BOARD_HEIGHT * BOARD_WIDTH), dtype=np.bool_)
         self.mask = np.zeros((max_size,), dtype=np.bool_)
         self.ptr = 0
         self.size = 0
@@ -1050,11 +928,6 @@ class ReplayBuffer:
         policy_idx_flat = samples_np.policy_idx.reshape(-1, samples_np.policy_idx.shape[-1]).astype(np.uint16)
         policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float16)
         value_flat = samples_np.value_tgt.reshape(-1)
-        remaining_flat = samples_np.remaining_ply_bucket.reshape(-1).astype(np.uint8)
-        material_flat = samples_np.future_material_delta.reshape(-1).astype(np.float16)
-        occupancy_flat = samples_np.future_occupancy_change.reshape(
-            -1, samples_np.future_occupancy_change.shape[-1]
-        ).astype(np.bool_)
         mask_flat = samples_np.mask.reshape(-1)
 
         valid_mask = mask_flat.astype(np.bool_)
@@ -1065,9 +938,6 @@ class ReplayBuffer:
         policy_idx_flat = policy_idx_flat[valid_mask]
         policy_prob_flat = policy_prob_flat[valid_mask]
         value_flat = value_flat[valid_mask]
-        remaining_flat = remaining_flat[valid_mask]
-        material_flat = material_flat[valid_mask]
-        occupancy_flat = occupancy_flat[valid_mask]
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -1076,9 +946,6 @@ class ReplayBuffer:
         self.policy_idx[indices] = policy_idx_flat
         self.policy_prob[indices] = policy_prob_flat
         self.value_tgt[indices] = value_flat
-        self.remaining_ply_bucket[indices] = remaining_flat
-        self.future_material_delta[indices] = material_flat
-        self.future_occupancy_change[indices] = occupancy_flat
         self.mask[indices] = True
         self.ptr = (self.ptr + n_new) % self.max_size
         self.size = min(self.size + n_new, self.max_size)
@@ -1100,18 +967,12 @@ class ReplayBuffer:
         policy_idx_batch = self.policy_idx[idx]
         policy_prob_batch = self.policy_prob[idx]
         value_batch = self.value_tgt[idx]
-        remaining_batch = self.remaining_ply_bucket[idx]
-        material_batch = self.future_material_delta[idx]
-        occupancy_batch = self.future_occupancy_change[idx]
         
         sample = Sample(
             obs=jnp.asarray(obs_batch, dtype=jnp.uint8),
             policy_idx=jnp.asarray(policy_idx_batch, dtype=jnp.int32),
             policy_prob=jnp.asarray(policy_prob_batch, dtype=jnp.float32),
             value_tgt=jnp.asarray(value_batch),
-            remaining_ply_bucket=jnp.asarray(remaining_batch, dtype=jnp.int32),
-            future_material_delta=jnp.asarray(material_batch, dtype=jnp.float32),
-            future_occupancy_change=jnp.asarray(occupancy_batch, dtype=jnp.float32),
             mask=jnp.ones((batch_size,), dtype=jnp.bool_),
         )
         return sample, idx.astype(np.int64)
@@ -1133,11 +994,6 @@ class ReplayBuffer:
         policy_idx_batch = self.policy_idx[idx].reshape((num_devices, per_device, self.policy_idx.shape[1]))
         policy_prob_batch = self.policy_prob[idx].reshape((num_devices, per_device, self.policy_prob.shape[1]))
         value_batch = self.value_tgt[idx].reshape((num_devices, per_device))
-        remaining_batch = self.remaining_ply_bucket[idx].reshape((num_devices, per_device))
-        material_batch = self.future_material_delta[idx].reshape((num_devices, per_device))
-        occupancy_batch = self.future_occupancy_change[idx].reshape(
-            (num_devices, per_device, BOARD_HEIGHT * BOARD_WIDTH)
-        )
         mask_batch = np.ones((num_devices, per_device), dtype=np.bool_)
 
         with warnings.catch_warnings():
@@ -1147,9 +1003,6 @@ class ReplayBuffer:
                 policy_idx=jax.device_put_sharded([policy_idx_batch[i] for i in range(num_devices)], devices),
                 policy_prob=jax.device_put_sharded([policy_prob_batch[i] for i in range(num_devices)], devices),
                 value_tgt=jax.device_put_sharded([value_batch[i] for i in range(num_devices)], devices),
-                remaining_ply_bucket=jax.device_put_sharded([remaining_batch[i] for i in range(num_devices)], devices),
-                future_material_delta=jax.device_put_sharded([material_batch[i] for i in range(num_devices)], devices),
-                future_occupancy_change=jax.device_put_sharded([occupancy_batch[i] for i in range(num_devices)], devices),
                 mask=jax.device_put_sharded([mask_batch[i] for i in range(num_devices)], devices),
             )
         return sample, idx.astype(np.int64)
@@ -1175,9 +1028,6 @@ class ReplayBuffer:
             "policy_idx": self.policy_idx[idx],
             "policy_prob": self.policy_prob[idx],
             "value_tgt": self.value_tgt[idx],
-            "remaining_ply_bucket": self.remaining_ply_bucket[idx],
-            "future_material_delta": self.future_material_delta[idx],
-            "future_occupancy_change": self.future_occupancy_change[idx],
             "mask": np.ones((idx.shape[0],), dtype=np.bool_),
             "ptr": int(idx.shape[0] % self.max_size),
             "size": int(idx.shape[0]),
@@ -1190,9 +1040,6 @@ class ReplayBuffer:
             "policy_idx": self.policy_idx,
             "policy_prob": self.policy_prob,
             "value_tgt": self.value_tgt,
-            "remaining_ply_bucket": self.remaining_ply_bucket,
-            "future_material_delta": self.future_material_delta,
-            "future_occupancy_change": self.future_occupancy_change,
             "mask": self.mask,
             "ptr": self.ptr, "size": self.size, "total_added": self.total_added
         }
@@ -1200,9 +1047,6 @@ class ReplayBuffer:
     def load_state_dict(self, state):
         loaded_obs = np.array(state["obs"])
         loaded_value = np.array(state["value_tgt"])
-        loaded_remaining = np.array(state["remaining_ply_bucket"], dtype=np.uint8)
-        loaded_material = np.array(state["future_material_delta"], dtype=np.float16)
-        loaded_occupancy = np.array(state["future_occupancy_change"], dtype=np.bool_)
         loaded_size = min(int(state["size"]), self.max_size, loaded_obs.shape[0])
         loaded_ptr = int(state["ptr"]) % max(loaded_size, 1)
 
@@ -1248,25 +1092,16 @@ class ReplayBuffer:
                 loaded_policy_idx = loaded_policy_idx[idx]
                 loaded_policy_prob = loaded_policy_prob[idx]
                 loaded_value = loaded_value[idx]
-                loaded_remaining = loaded_remaining[idx]
-                loaded_material = loaded_material[idx]
-                loaded_occupancy = loaded_occupancy[idx]
             else:
                 loaded_obs = loaded_obs[:loaded_size]
                 loaded_policy_idx = loaded_policy_idx[:loaded_size]
                 loaded_policy_prob = loaded_policy_prob[:loaded_size]
                 loaded_value = loaded_value[:loaded_size]
-                loaded_remaining = loaded_remaining[:loaded_size]
-                loaded_material = loaded_material[:loaded_size]
-                loaded_occupancy = loaded_occupancy[:loaded_size]
 
             self.obs[:loaded_size] = loaded_obs
             self.policy_idx[:loaded_size] = loaded_policy_idx
             self.policy_prob[:loaded_size] = loaded_policy_prob
             self.value_tgt[:loaded_size] = loaded_value
-            self.remaining_ply_bucket[:loaded_size] = loaded_remaining
-            self.future_material_delta[:loaded_size] = loaded_material
-            self.future_occupancy_change[:loaded_size] = loaded_occupancy
 
         if loaded_size < self.max_size:
             self.mask[loaded_size:] = False
@@ -1392,9 +1227,6 @@ def save_replay_buffer_lz4(replay_buffer: ReplayBuffer, iteration: int, frames: 
         "policy_idx",
         "policy_prob",
         "value_tgt",
-        "remaining_ply_bucket",
-        "future_material_delta",
-        "future_occupancy_change",
         "mask",
     ]
     meta = {
@@ -1680,9 +1512,8 @@ def main():
         config.value_loss_weight,
     )
     logger.info(
-        "[Optimizer] AdamW(weight_decay=%.1e, grad_clip=%.2f, train_batch=%s)",
+        "[Optimizer] AdamW(weight_decay=%.1e, train_batch=%s)",
         config.weight_decay,
-        config.grad_clip_norm,
         config.training_batch_size,
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
@@ -1735,10 +1566,6 @@ def main():
             grads,
         )
         grads = jax.lax.pmean(grads, 'i')
-        if config.grad_clip_norm and config.grad_clip_norm > 0:
-            grad_norm = optax.global_norm(grads)
-            grad_scale = jnp.minimum(1.0, config.grad_clip_norm / (grad_norm + 1e-6))
-            grads = jax.tree.map(lambda g: g * grad_scale, grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         params = jax.tree.map(lambda old, new: jnp.where(finite, new, old), params, new_params)
@@ -1909,7 +1736,6 @@ def main():
             return batch, keys
 
         ploss_acc, vloss_acc = None, None
-        rem_loss_acc, mat_loss_acc, occ_loss_acc = None, None, None
         finite_acc = None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
@@ -1924,7 +1750,7 @@ def main():
                     next_future = None
 
                 try:
-                    params, opt_state, ploss, vloss, rem_loss, mat_loss, occ_loss, finite = train_step(
+                    params, opt_state, ploss, vloss, finite = train_step(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1942,14 +1768,10 @@ def main():
                 # 累积损失（保持在 GPU），只在最后同步
                 if ploss_acc is None:
                     ploss_acc, vloss_acc = ploss, vloss
-                    rem_loss_acc, mat_loss_acc, occ_loss_acc = rem_loss, mat_loss, occ_loss
                 else:
                     ploss_acc = ploss_acc + ploss
                     vloss_acc = vloss_acc + vloss
-                    rem_loss_acc = rem_loss_acc + rem_loss
-                    mat_loss_acc = mat_loss_acc + mat_loss
-                    occ_loss_acc = occ_loss_acc + occ_loss
-                del batch, train_keys, finite, ploss, vloss, rem_loss, mat_loss, occ_loss
+                del batch, train_keys, finite, ploss, vloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
@@ -1965,17 +1787,11 @@ def main():
         if num_updates > 0:
             policy_loss = float(ploss_acc.mean() / num_updates)
             value_loss = float(vloss_acc.mean() / num_updates)
-            remaining_loss = float(rem_loss_acc.mean() / num_updates)
-            material_loss = float(mat_loss_acc.mean() / num_updates)
-            occupancy_loss = float(occ_loss_acc.mean() / num_updates)
-            del ploss_acc, vloss_acc, rem_loss_acc, mat_loss_acc, occ_loss_acc
+            del ploss_acc, vloss_acc
             gc.collect()
         else:
             policy_loss = 0.0
             value_loss = 0.0
-            remaining_loss = 0.0
-            material_loss = 0.0
-            occupancy_loss = 0.0
         
         # --- 清理已训练足够次数的样本 ---
         replay_buffer.cleanup()
@@ -1986,14 +1802,11 @@ def main():
         buf_stats = replay_buffer.stats()
         total_elapsed = time.time() - start_time_total
         logger.info(
-            "iter=%3d | ploss=%.4f vloss=%.4f aux=%.3f/%.3f/%.3f | len=%4.1f fps=%4.0f "
+            "iter=%3d | ploss=%.4f vloss=%.4f | len=%4.1f fps=%4.0f "
             "buf=%dk train=%d | ent=%.3f(开%.3f/中%.3f) | 红%3d 黑%3d 和%3d | iter_t=%s total=%s",
             iteration,
             policy_loss,
             value_loss,
-            remaining_loss,
-            material_loss,
-            occupancy_loss,
             avg_length,
             fps,
             buf_stats["size"] // 1000,
@@ -2012,9 +1825,6 @@ def main():
         # TensorBoard 记录
         writer.add_scalar("train/policy_loss", policy_loss, iteration)
         writer.add_scalar("train/value_loss", value_loss, iteration)
-        writer.add_scalar("train/aux_remaining_loss", remaining_loss, iteration)
-        writer.add_scalar("train/aux_material_loss", material_loss, iteration)
-        writer.add_scalar("train/aux_occupancy_loss", occupancy_loss, iteration)
         writer.add_scalar("train/lr", base_lr, iteration)
         writer.add_scalar("stats/avg_game_length", avg_length, iteration)
         writer.add_scalar("stats/fps", fps, iteration)

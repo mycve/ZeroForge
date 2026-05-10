@@ -7,7 +7,6 @@
 - **Gumbel AlphaZero**: Gumbel-Top-k MCTS，自对弈按温度退火采样；评估关闭 Gumbel 扰动以保证可比性
 - **3 分支 GNN 网络**: Local 8 邻居 + Row + Col 注意力，配合 factorized policy head、全局动作先验与跨度上下文
 - **规则状态平面**: 将重复、无吃子、长将/长捉压力等规则信息作为额外观察通道输入网络
-- **辅助头训练**: 可选预测剩余步数、未来材料变化和未来占位变化，用作主干表征正则
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint + lz4 经验池快照的完整状态保存，支持无差别恢复
 - **TD(λ) 价值目标**: 对 MCTS 根标量 `root_value` 做时序差分备份，与 `value`（由 `value_logits` 得 W−L）做 MSE
@@ -100,14 +99,13 @@ python play.py checkpoints/100
 ## 训练输出说明
 
 ```
-iter= 10 | ploss=2.81 vloss=0.15 aux=0.42/0.03/0.19 | len=153 fps=516 buf=358k train=300 | ent=1.92(开2.04/中1.66) | 红403 黑195 和426
+iter= 10 | ploss=2.81 vloss=0.15 | len=153 fps=516 buf=358k train=300 | ent=1.92(开2.04/中1.66) | 红403 黑195 和426
 ```
 
 | 指标 | 说明 |
 |------|------|
 | `ploss` | 稀疏策略蒸馏损失（对 MCTS `action_weights` top-k 的交叉熵） |
 | `vloss` | 价值损失（对 `value` 与 `value_tgt` 的均方误差 MSE） |
-| `aux` | 剩余步数 / 未来材料变化 / 未来占位变化三个辅助损失 |
 | `len` | 平均对局步数 |
 | `fps` | 每秒采样帧数 |
 | `buf` | 经验回放缓冲区大小 |
@@ -153,17 +151,12 @@ scp remote:checkpoints/replay_buffer.lz4 ./checkpoints/
 | `lr_warmup_steps` | 2000 | 学习率 warmup 步数 |
 | `lr_cosine_steps` | 100000 | 余弦退火周期（优化步） |
 | `lr_min_ratio` | 0.2 | 最低学习率比例 |
-| `grad_clip_norm` | 1.0 | 全局梯度裁剪阈值 |
 | `replay_buffer_size` | 2000000 | 回放缓冲区容量 |
 | `sample_reuse_times` | 3 | 样本复用次数 |
 | `td_lambda` | 0.75 | TD(λ) 系数 |
 | `selfplay_temperature` | 1.0 | 自对弈初始采样温度 |
 | `selfplay_temperature_final` | 0.25 | 退火后的最低采样温度 |
 | `selfplay_temperature_steps` | 60 | 温度退火半步数 |
-| `aux_future_horizon` | 14 | 辅助头未来预测跨度（半步） |
-| `aux_remaining_loss_weight` | 0.05 | 剩余步数分桶辅助损失权重 |
-| `aux_material_loss_weight` | 0.05 | 未来材料变化辅助损失权重 |
-| `aux_occupancy_loss_weight` | 0.05 | 未来占位变化辅助损失权重 |
 | `top_k` | 8 | Gumbel 根节点候选动作数 |
 
 ## 项目结构
