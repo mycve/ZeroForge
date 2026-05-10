@@ -112,10 +112,10 @@ class Config:
     
     # 损失权重
     value_loss_weight: float = 1.0
-    aux_remaining_loss_weight: float = 0.0
-    aux_material_loss_weight: float = 0.0
-    aux_occupancy_loss_weight: float = 0.0
-    aux_future_horizon: int = 8
+    aux_remaining_loss_weight: float = 0.05
+    aux_material_loss_weight: float = 0.05
+    aux_occupancy_loss_weight: float = 0.05
+    aux_future_horizon: int = 14
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
     selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
