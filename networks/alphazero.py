@@ -1,5 +1,5 @@
 """
-AlphaZero network - 精简 3 分支 GNN 架构（无 Global）
+AlphaZero network - 精简 3 分支 GNN 架构 + 全局动作先验
 
 分支设计（全部基于静态棋盘拓扑，无动态规则计算）:
 - Local: 8 方向邻居（上下左右+4对角），负责短程交互
@@ -7,10 +7,11 @@ AlphaZero network - 精简 3 分支 GNN 架构（无 Global）
 - Col: 同列分组注意力（车/炮纵向），并对空位做 occupancy mask
 
 关键设计决策:
-- 去掉主干 Global，Row/Col 多跳覆盖大部分长距离关系
+- 主干去掉 Global attention，Row/Col 多跳覆盖大部分长距离关系
+- Policy head 保留 global action bias，用局面级动作先验补足 from/to 分解表达力
 - Local 仅 8 邻居，节省计算，自对弈更快
 - 不在网络内计算合法走法，让网络从原始棋子位置自行学习
-- Factorized Policy Head + 轻量 pair correction + Attention-Pooled Value Head
+- Factorized Policy Head + global action bias + 轻量 pair/span correction + Attention-Pooled Value Head
 """
 
 import math
