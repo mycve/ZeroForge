@@ -236,9 +236,9 @@ class PolicyHead(nn.Module):
     """Factorized from/to policy head.
 
     将动作分解为 (from_square, to_square) 对，用点积评分:
-    score(a) = base_factorized(a) + correction_delta(a) + grid_span_ctx(a)
+    score(a) = base_factorized(a) + correction_delta(a) + global + grid_span_ctx(a)
     其中 grid_span_ctx 为「跨度」嵌入（max(|Δr|,|Δc|)）与全局上下文的点积，显式感知格子距离。
-    已移除 global_proj：与 from_bias/to_bias 重叠且参数量过大（ACTION_SPACE 维全连接）。
+    global_proj 保留为局面级动作先验；grid_span_ctx 作为可学习的轻量补充。
     """
     action_space_size: int
     model_dim: int
@@ -283,6 +283,11 @@ class PolicyHead(nn.Module):
         logits = logits + corr_scale * corr_delta
 
         # 格子跨度感知：9 档 (跨度 1..9) 与局面级向量点积，按动作索引 gather
+        # caae0ef 强版本中的全局动作偏置。它给每个 action 一个局面级自由度，
+        # 对开局偏好和长程战术先验很重要；低秩 from/to 分解不能完全替代。
+        global_ctx = jnp.mean(x, axis=1)
+        logits = logits + nn.Dense(self.action_space_size, dtype=self.dtype, name="global_proj")(global_ctx)
+
         span_dim = max(self.model_dim // 8, 16)
         grid_ctx = nn.Dense(span_dim, dtype=self.dtype, name="grid_span_ctx_proj")(
             jnp.mean(x, axis=1)
@@ -295,7 +300,7 @@ class PolicyHead(nn.Module):
         )(action_span_embed_idx)
         span_scale = self.param(
             "grid_span_scale",
-            nn.initializers.constant(1.0),
+            nn.initializers.constant(0.0),
             (),
         )
         logits = logits + span_scale * jnp.einsum("bd,ad->ba", grid_ctx, span_embed)

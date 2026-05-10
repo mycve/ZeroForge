@@ -83,7 +83,7 @@ class Config:
     log_dir: str = "logs"
     
     # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 256   # 128 是当前稳妥默认；96 更快但上限略低
+    num_channels: int = 128   # caae0ef 强度基线；盲目加宽会降低每轮搜索/训练质量
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "bfloat16"
@@ -91,30 +91,30 @@ class Config:
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW peak LR
     lr_warmup_steps: int = 2000       # warmup steps
-    lr_cosine_steps: int = 80000      # cosine decay steps
-    lr_min_ratio: float = 0.05        # final LR = peak * 0.05
-    training_batch_size: int = 1024
+    lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
+    lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
+    training_batch_size: int = 4096
     grad_clip_norm: float = 1.0
-    td_lambda: float = 1.0              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
+    td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
     selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 32            # 增大可提升 MCTS 质量（更耗算力）
+    num_simulations: int = 40            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8
-    selfplay_temperature_steps: int = 40
-    selfplay_temperature: float = 1.2      # 自对弈起始温度
+    selfplay_temperature_steps: int = 60
+    selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 500_000    # 配合 batch_size=2048，约 4 轮填满
-    sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
+    replay_buffer_size: int = 2_000_000
+    sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
     value_loss_weight: float = 1.0
-    aux_remaining_loss_weight: float = 0.05
-    aux_material_loss_weight: float = 0.05
-    aux_occupancy_loss_weight: float = 0.05
+    aux_remaining_loss_weight: float = 0.0
+    aux_material_loss_weight: float = 0.0
+    aux_occupancy_loss_weight: float = 0.0
     aux_future_horizon: int = 8
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
@@ -678,23 +678,39 @@ def loss_fn(params, samples: Sample, rng_key):
         obs_in, idx_in, prob_in, occ_in = args
         return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in, _mirror_occupancy(occ_in)
 
-    obs, policy_idx, policy_prob, future_occupancy_change = jax.lax.cond(
-        do_mirror,
-        _apply_mirror,
-        lambda args: args,
-        (obs, policy_idx, policy_prob, samples.future_occupancy_change.astype(jnp.float32)),
+    aux_enabled = (
+        config.aux_remaining_loss_weight > 0.0
+        or config.aux_material_loss_weight > 0.0
+        or config.aux_occupancy_loss_weight > 0.0
     )
+    if aux_enabled:
+        obs, policy_idx, policy_prob, future_occupancy_change = jax.lax.cond(
+            do_mirror,
+            _apply_mirror,
+            lambda args: args,
+            (obs, policy_idx, policy_prob, samples.future_occupancy_change.astype(jnp.float32)),
+        )
+        logits, value, _, remaining_logits, material_delta_pred, occupancy_logits = forward(
+            params, obs, is_training=True, rng_key=rng_dropout, return_aux=True
+        )
+    else:
+        def _apply_mirror_main(args):
+            obs_in, idx_in, prob_in = args
+            return jax.vmap(mirror_observation)(obs_in), mirror_action(idx_in), prob_in
 
-    logits, value, _, remaining_logits, material_delta_pred, occupancy_logits = forward(
-        params, obs, is_training=True, rng_key=rng_dropout
-    )
+        obs, policy_idx, policy_prob = jax.lax.cond(
+            do_mirror,
+            _apply_mirror_main,
+            lambda args: args,
+            (obs, policy_idx, policy_prob),
+        )
+        logits, value = forward(
+            params, obs, is_training=True, rng_key=rng_dropout, return_aux=False
+        )
     
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
-    remaining_ply_bucket = samples.remaining_ply_bucket.astype(jnp.int32)
-    future_material_delta = samples.future_material_delta.astype(jnp.float32)
-    future_occupancy_change = future_occupancy_change.astype(jnp.float32)
 
     # 稀疏策略损失：仅对非零目标动作做 gather，避免在回放中搬运完整 2086 维分布
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -706,31 +722,40 @@ def loss_fn(params, samples: Sample, rng_key):
     err = value - value_tgt
     value_loss = jnp.sum(err * err * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
-    mask = samples.mask.astype(jnp.float32)
-    mask_denom = jnp.maximum(jnp.sum(mask), 1.0)
-    remaining_ce = optax.softmax_cross_entropy_with_integer_labels(
-        remaining_logits.astype(jnp.float32),
-        remaining_ply_bucket,
-    )
-    remaining_loss = jnp.sum(remaining_ce * mask) / mask_denom
+    if aux_enabled:
+        remaining_ply_bucket = samples.remaining_ply_bucket.astype(jnp.int32)
+        future_material_delta = samples.future_material_delta.astype(jnp.float32)
+        future_occupancy_change = future_occupancy_change.astype(jnp.float32)
+        mask = samples.mask.astype(jnp.float32)
+        mask_denom = jnp.maximum(jnp.sum(mask), 1.0)
+        remaining_ce = optax.softmax_cross_entropy_with_integer_labels(
+            remaining_logits.astype(jnp.float32),
+            remaining_ply_bucket,
+        )
+        remaining_loss = jnp.sum(remaining_ce * mask) / mask_denom
 
-    material_err = material_delta_pred.astype(jnp.float32) - future_material_delta
-    material_loss = jnp.sum(optax.huber_loss(material_err, delta=0.25) * mask) / mask_denom
+        material_err = material_delta_pred.astype(jnp.float32) - future_material_delta
+        material_loss = jnp.sum(optax.huber_loss(material_err, delta=0.25) * mask) / mask_denom
 
-    occupancy_bce = optax.sigmoid_binary_cross_entropy(
-        occupancy_logits.astype(jnp.float32),
-        future_occupancy_change,
-    )
-    occupancy_loss = jnp.sum(occupancy_bce * mask[:, None]) / jnp.maximum(
-        jnp.sum(mask) * occupancy_bce.shape[-1],
-        1.0,
-    )
+        occupancy_bce = optax.sigmoid_binary_cross_entropy(
+            occupancy_logits.astype(jnp.float32),
+            future_occupancy_change,
+        )
+        occupancy_loss = jnp.sum(occupancy_bce * mask[:, None]) / jnp.maximum(
+            jnp.sum(mask) * occupancy_bce.shape[-1],
+            1.0,
+        )
 
-    aux_loss = (
-        config.aux_remaining_loss_weight * remaining_loss
-        + config.aux_material_loss_weight * material_loss
-        + config.aux_occupancy_loss_weight * occupancy_loss
-    )
+        aux_loss = (
+            config.aux_remaining_loss_weight * remaining_loss
+            + config.aux_material_loss_weight * material_loss
+            + config.aux_occupancy_loss_weight * occupancy_loss
+        )
+    else:
+        remaining_loss = jnp.array(0.0, dtype=jnp.float32)
+        material_loss = jnp.array(0.0, dtype=jnp.float32)
+        occupancy_loss = jnp.array(0.0, dtype=jnp.float32)
+        aux_loss = jnp.array(0.0, dtype=jnp.float32)
     total_loss = policy_loss + config.value_loss_weight * value_loss + aux_loss
     return total_loss, (policy_loss, value_loss, remaining_loss, material_loss, occupancy_loss)
 
