@@ -250,8 +250,6 @@ _ROTATED_IDX = rotate_action(jnp.arange(ACTION_SPACE_SIZE))
 
 def _masked_normalize(x: jnp.ndarray, legal_mask: jnp.ndarray) -> jnp.ndarray:
     """对合法动作子集归一化，非法动作恒为 0。"""
-    x = jnp.nan_to_num(x.astype(jnp.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    x = jnp.maximum(x, 0.0)
     masked = jnp.where(legal_mask, x, 0.0)
     denom = jnp.maximum(jnp.sum(masked, axis=-1, keepdims=True), 1e-10)
     return jnp.where(legal_mask, masked / denom, 0.0)
@@ -362,7 +360,7 @@ def recurrent_fn(params, rng_key, action, state):
     # 黑方视角：logits 旋转到绝对坐标系，与 legal_action_mask（绝对）一致
     logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
     logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-    logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+    logits = jnp.where(state.legal_action_mask, logits, -1.0e9)
     
     reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
     value = jnp.where(state.terminated, 0.0, value)
@@ -414,7 +412,7 @@ def selfplay(params, rng_key, batch_size):
         logits, value, _ = forward(params, obs)
         # 黑方时 obs 已翻转，logits 旋转到绝对坐标系，供 MCTS 与 legal_action_mask 使用
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
-        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        logits = jnp.where(state.legal_action_mask, logits, -1.0e9)
         
         # MCTS 搜索
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
@@ -437,14 +435,12 @@ def selfplay(params, rng_key, batch_size):
         action_weights = jnp.where(only_one_move[:, None], one_hot, action_weights)
         root_value = jnp.where(only_one_move, value, root_value)
         action_weights = _masked_normalize(action_weights, state.legal_action_mask)
-        root_value = jnp.nan_to_num(root_value.astype(jnp.float32), nan=0.0, posinf=1.0, neginf=-1.0)
-        root_value = jnp.clip(root_value, -1.0, 1.0)
 
         def _sample_action(w, legal_mask, temperature, sample_key):
             # 在 log 空间做温度缩放，避免小概率动作下溢。
             w_masked = _masked_normalize(w, legal_mask)
             log_w = jnp.log(w_masked + 1e-10) / temperature
-            log_w = jnp.where(legal_mask, log_w, -jnp.inf)
+            log_w = jnp.where(legal_mask, log_w, -1.0e9)
             log_w = log_w - jnp.max(log_w)
             probs = jnp.exp(log_w)
             probs = _masked_normalize(probs, legal_mask)
@@ -471,10 +467,7 @@ def selfplay(params, rng_key, batch_size):
         )
         policy_prob, policy_idx = jax.lax.top_k(normalized_action_weights, config.top_k)
         policy_denom = jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
-        policy_prob = jnp.nan_to_num(policy_prob / policy_denom, nan=0.0, posinf=0.0, neginf=0.0)
-        policy_prob = jnp.maximum(policy_prob, 0.0)
-        policy_prob = policy_prob / jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
-        policy_prob = policy_prob.astype(jnp.float32)
+        policy_prob = (policy_prob / policy_denom).astype(jnp.float32)
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         p = _masked_normalize(action_weights, state.legal_action_mask)
@@ -540,8 +533,6 @@ def compute_targets(data: SelfplayOutput):
         ),
     )
     value_tgt = value_tgt_rev[::-1]
-    value_tgt = jnp.nan_to_num(value_tgt.astype(jnp.float32), nan=0.0, posinf=1.0, neginf=-1.0)
-    value_tgt = jnp.clip(value_tgt, -1.0, 1.0)
     return Sample(
         obs=data.obs, 
         policy_idx=data.policy_idx.astype(jnp.int32),
@@ -616,9 +607,6 @@ def loss_fn(params, samples: Sample, rng_key):
     obs = samples.obs.astype(jnp.float32)
     policy_idx = samples.policy_idx.astype(jnp.int32)
     policy_prob = samples.policy_prob.astype(jnp.float32)
-    policy_prob = jnp.nan_to_num(policy_prob, nan=0.0, posinf=0.0, neginf=0.0)
-    policy_prob = jnp.maximum(policy_prob, 0.0)
-    policy_prob = policy_prob / jnp.maximum(jnp.sum(policy_prob, axis=-1, keepdims=True), 1e-10)
 
     # 随机左右镜像增强（默认 30% 概率）
     rng_mirror, rng_dropout = jax.random.split(rng_key, 2)
@@ -639,8 +627,6 @@ def loss_fn(params, samples: Sample, rng_key):
     logits = logits.astype(jnp.float32)
     value = value.astype(jnp.float32)
     value_tgt = samples.value_tgt.astype(jnp.float32)
-    value_tgt = jnp.nan_to_num(value_tgt, nan=0.0, posinf=1.0, neginf=-1.0)
-    value_tgt = jnp.clip(value_tgt, -1.0, 1.0)
 
     # 稀疏策略损失：仅对非零目标动作做 gather，避免在回放中搬运完整 2086 维分布
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -831,7 +817,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
         # 黑方视角：logits 旋转到绝对坐标系
         logits = jnp.where(state.current_player[:, None] == 0, logits, logits[:, _ROTATED_IDX])
         logits = logits - jnp.max(logits, axis=-1, keepdims=True)
-        logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+        logits = jnp.where(state.legal_action_mask, logits, -1.0e9)
         
         reward = state.rewards[jnp.arange(state.rewards.shape[0]), prev_player]
         value = jnp.where(state.terminated, 0.0, value)
@@ -941,22 +927,24 @@ class ReplayBuffer:
         
         obs_flat = samples_np.obs.reshape(-1, *samples_np.obs.shape[3:]).astype(np.uint8)
         policy_idx_flat = samples_np.policy_idx.reshape(-1, samples_np.policy_idx.shape[-1]).astype(np.uint16)
-        policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float32)
-        value_flat = samples_np.value_tgt.reshape(-1).astype(np.float32)
+        policy_prob_flat = samples_np.policy_prob.reshape(-1, samples_np.policy_prob.shape[-1]).astype(np.float16)
+        value_flat = samples_np.value_tgt.reshape(-1)
         mask_flat = samples_np.mask.reshape(-1)
 
-        clean_prob = np.nan_to_num(policy_prob_flat, nan=0.0, posinf=0.0, neginf=0.0)
-        clean_prob = np.maximum(clean_prob, 0.0)
-        clean_prob_sum = clean_prob.sum(axis=-1)
-        valid_mask = mask_flat.astype(np.bool_) & np.isfinite(value_flat) & (clean_prob_sum > 1e-8)
+        valid_mask = mask_flat.astype(np.bool_)
         if not np.any(valid_mask):
             return
 
         obs_flat = obs_flat[valid_mask]
         policy_idx_flat = policy_idx_flat[valid_mask]
-        policy_prob_flat = clean_prob[valid_mask]
-        policy_prob_flat = (policy_prob_flat / np.maximum(policy_prob_flat.sum(axis=-1, keepdims=True), 1e-8)).astype(np.float16)
-        value_flat = np.clip(np.nan_to_num(value_flat[valid_mask], nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+        policy_prob_flat = policy_prob_flat[valid_mask]
+        value_flat = value_flat[valid_mask]
+        if (
+            not np.all(np.isfinite(policy_prob_flat))
+            or not np.all(np.isfinite(value_flat))
+            or np.any(policy_prob_flat.sum(axis=-1) <= 1e-8)
+        ):
+            raise RuntimeError("[ReplayBuffer] 检测到非法训练目标：policy_prob/value_tgt 非有限或策略概率和为 0")
         
         n_new = obs_flat.shape[0]
         indices = (np.arange(n_new) + self.ptr) % self.max_size
@@ -1537,6 +1525,24 @@ def main():
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
+
+    def _format_tree_path(path):
+        parts = []
+        for entry in path:
+            if hasattr(entry, "key"):
+                parts.append(str(entry.key))
+            elif hasattr(entry, "idx"):
+                parts.append(str(entry.idx))
+            elif hasattr(entry, "name"):
+                parts.append(str(entry.name))
+            else:
+                parts.append(str(entry))
+        return "/".join(parts)
+
+    grad_path_names = [
+        _format_tree_path(path)
+        for path, _ in jax.tree_util.tree_flatten_with_path(params_template)[0]
+    ]
     
     # === 创建 Checkpoint Manager 并尝试恢复 ===
     ckpt_manager = create_checkpoint_manager(config.ckpt_dir)
@@ -1576,11 +1582,13 @@ def main():
         loss_finite = jnp.isfinite(total_loss)
         for loss_value in losses:
             loss_finite = loss_finite & jnp.isfinite(loss_value)
-        grad_finite = jnp.array(True)
-        for grad in jax.tree_util.tree_leaves(grads):
-            grad_finite = grad_finite & jnp.all(jnp.isfinite(grad))
+        grad_bad_mask = jnp.stack([
+            ~jnp.all(jnp.isfinite(grad))
+            for grad in jax.tree_util.tree_leaves(grads)
+        ])
+        grad_bad_mask = jax.lax.pmax(grad_bad_mask.astype(jnp.int32), 'i').astype(jnp.bool_)
+        grad_finite = ~jnp.any(grad_bad_mask)
         loss_finite = jax.lax.pmin(loss_finite, 'i')
-        grad_finite = jax.lax.pmin(grad_finite, 'i')
         finite = loss_finite & grad_finite
         grads = jax.tree.map(
             lambda g: jnp.where(finite, jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), jnp.zeros_like(g)),
@@ -1590,7 +1598,7 @@ def main():
         updates, opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         params = jax.tree.map(lambda old, new: jnp.where(finite, new, old), params, new_params)
-        return (params, opt_state, *losses, finite, loss_finite, grad_finite)
+        return (params, opt_state, *losses, finite, loss_finite, grad_finite, grad_bad_mask)
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
@@ -1760,6 +1768,7 @@ def main():
         finite_acc = None
         loss_finite_acc = None
         grad_finite_acc = None
+        bad_grad_mask_acc = None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
                 prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
@@ -1773,7 +1782,7 @@ def main():
                     next_future = None
 
                 try:
-                    params, opt_state, ploss, vloss, finite, loss_finite, grad_finite = train_step(
+                    params, opt_state, ploss, vloss, finite, loss_finite, grad_finite, grad_bad_mask = train_step(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1789,6 +1798,11 @@ def main():
                 finite_acc = finite if finite_acc is None else (finite_acc & finite)
                 loss_finite_acc = loss_finite if loss_finite_acc is None else (loss_finite_acc & loss_finite)
                 grad_finite_acc = grad_finite if grad_finite_acc is None else (grad_finite_acc & grad_finite)
+                bad_grad_mask_acc = (
+                    grad_bad_mask
+                    if bad_grad_mask_acc is None
+                    else (bad_grad_mask_acc | grad_bad_mask)
+                )
 
                 # 累积损失（保持在 GPU），只在最后同步
                 if ploss_acc is None:
@@ -1796,20 +1810,30 @@ def main():
                 else:
                     ploss_acc = ploss_acc + ploss
                     vloss_acc = vloss_acc + vloss
-                del batch, train_keys, finite, loss_finite, grad_finite, ploss, vloss
+                del batch, train_keys, finite, loss_finite, grad_finite, grad_bad_mask, ploss, vloss
         
         # 累计优化器步数
         total_opt_steps += num_updates
         if finite_acc is not None and not bool(np.asarray(jax.device_get(finite_acc)).all()):
             loss_ok = bool(np.asarray(jax.device_get(loss_finite_acc)).all())
             grad_ok = bool(np.asarray(jax.device_get(grad_finite_acc)).all())
-            logger.error("[Training NaN/Inf] loss_finite=%s, grad_finite=%s", loss_ok, grad_ok)
+            bad_mask = np.asarray(jax.device_get(bad_grad_mask_acc)).astype(np.bool_)
+            bad_names = [name for name, bad in zip(grad_path_names, bad_mask) if bad]
+            preview = ", ".join(bad_names[:8]) if bad_names else "unknown"
+            if len(bad_names) > 8:
+                preview += f", ...(+{len(bad_names) - 8})"
+            logger.error(
+                "[Training NaN/Inf] loss_finite=%s, grad_finite=%s, bad_grad_leaves=%s",
+                loss_ok,
+                grad_ok,
+                preview,
+            )
             raise RuntimeError(
                 "[Training NaN/Inf] 检测到非有限 loss 或梯度；"
-                f"建议降低 learning_rate({config.learning_rate}) / num_channels({config.num_channels})，"
-                f"或临时改用 --network-dtype float32 定位。"
+                "请查看上一行 bad_grad_leaves 定位具体参数叶子；"
+                f"若全部集中在同一模块，再优先检查该模块的反传数值。"
             )
-        del finite_acc, loss_finite_acc, grad_finite_acc
+        del finite_acc, loss_finite_acc, grad_finite_acc, bad_grad_mask_acc
         
         # 一次性同步所有累积损失
         if num_updates > 0:

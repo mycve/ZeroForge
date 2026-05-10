@@ -29,6 +29,8 @@ from xiangqi.actions import (
 )
 from xiangqi.env import BOARD_OBSERVATION_CHANNELS, NUM_RULE_STATE_CHANNELS
 
+_ATTN_MASK_VALUE = -1.0e4
+
 
 # ============================================================================
 # 静态棋盘拓扑
@@ -161,7 +163,7 @@ class GraphBlock(nn.Module):
         local_logits = jnp.where(
             neighbor_mask[None, :, :] > 0,
             local_logits,
-            jnp.finfo(local_logits.dtype).min,
+            jnp.asarray(_ATTN_MASK_VALUE, dtype=local_logits.dtype),
         )
         local_attn = nn.softmax(local_logits, axis=-1)
         local_agg = jnp.sum(local_attn[..., None] * (v_neigh + dir_embed), axis=2)
@@ -178,7 +180,7 @@ class GraphBlock(nn.Module):
         row_scores = jnp.where(
             row_key_mask,
             row_scores,
-            jnp.finfo(row_scores.dtype).min,
+            jnp.asarray(_ATTN_MASK_VALUE, dtype=row_scores.dtype),
         )
         row_attn = nn.softmax(row_scores, axis=-1)
         row_agg = jnp.einsum("brnm,brmd->brnd", row_attn, vr).reshape(B, -1, D)
@@ -195,7 +197,7 @@ class GraphBlock(nn.Module):
         col_scores = jnp.where(
             col_key_mask,
             col_scores,
-            jnp.finfo(col_scores.dtype).min,
+            jnp.asarray(_ATTN_MASK_VALUE, dtype=col_scores.dtype),
         )
         col_attn = nn.softmax(col_scores, axis=-1)
         col_agg = jnp.einsum("bcnm,bcmd->bcnd", col_attn, vc)
