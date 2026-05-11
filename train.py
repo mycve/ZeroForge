@@ -97,16 +97,16 @@ class Config:
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 1024       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 40            # 增大可提升 MCTS 质量（更耗算力）
+    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 128            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 16
     selfplay_temperature_steps: int = 60
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 2_000_000
-    sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
+    replay_buffer_size: int = 1_000_000
+    sample_reuse_times: int = 5          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
