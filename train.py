@@ -94,7 +94,7 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
     training_batch_size: int = 1024
-    train_steps_per_call: int = 4     # 每次 pmap 调用内连续执行的小 batch 更新数；不改变单步 batch 语义
+    train_steps_per_call: int = 8     # 每次 pmap 调用内连续执行的小 batch 更新数；不改变单步 batch 语义
     full_nan_debug_checks: bool = False  # 仅排查 NaN/Inf 时开启，默认跳过昂贵 dense debug
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
