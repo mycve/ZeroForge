@@ -93,31 +93,31 @@ class Config:
     lr_warmup_steps: int = 2000       # warmup steps
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
-    training_batch_size: int = 2048
+    training_batch_size: int = 1024
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
-    selfplay_batch_size: int = 512       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
-    num_simulations: int = 128            # 增大可提升 MCTS 质量（更耗算力）
-    top_k: int = 16
-    selfplay_temperature_steps: int = 60
-    selfplay_temperature: float = 1.0      # 自对弈起始温度
+    selfplay_batch_size: int = 4096       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
+    num_simulations: int = 16            # 增大可提升 MCTS 质量（更耗算力）
+    top_k: int = 8
+    selfplay_temperature_steps: int = 40
+    selfplay_temperature: float = 1.5      # 自对弈起始温度
     selfplay_temperature_final: float = 0.25
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
-    replay_buffer_size: int = 1_000_000
-    sample_reuse_times: int = 5          # 数据产出减半，多学一遍弥补
+    replay_buffer_size: int = 5_000_000
+    sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
-    value_loss_weight: float = 1.0
+    value_loss_weight: float = 0.5
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    selfplay_gumbel_scale: float = 10.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 400              # 总步数 400 步（200回合）判和
+    max_steps: int = 200              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
