@@ -94,6 +94,8 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
     training_batch_size: int = 1024
+    train_steps_per_call: int = 4     # 每次 pmap 调用内连续执行的小 batch 更新数；不改变单步 batch 语义
+    full_nan_debug_checks: bool = False  # 仅排查 NaN/Inf 时开启，默认跳过昂贵 dense debug
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
     # 自对弈与搜索：Gumbel-Top-k，搜索质量优先
@@ -146,6 +148,8 @@ def parse_args():
     parser.add_argument("--network-dtype", type=str, default=None, choices=["float32", "bfloat16"], help="覆盖 network_dtype")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
+    parser.add_argument("--train-steps-per-call", type=int, default=None, help="每次 pmap 调用内连续执行的小 batch 更新数")
+    parser.add_argument("--full-nan-debug-checks", action="store_true", help="开启完整 NaN/Inf debug 检查（较慢）")
     parser.add_argument("--selfplay-batch-size", type=int, default=None, help="覆盖 selfplay_batch_size")
     parser.add_argument("--replay-buffer-size", type=int, default=None, help="覆盖 replay_buffer_size")
     parser.add_argument("--sample-reuse-times", type=int, default=None, help="覆盖 sample_reuse_times")
@@ -168,6 +172,7 @@ def apply_cli_overrides(args):
         "network_dtype": args.network_dtype,
         "td_lambda": args.td_lambda,
         "training_batch_size": args.training_batch_size,
+        "train_steps_per_call": args.train_steps_per_call,
         "selfplay_batch_size": args.selfplay_batch_size,
         "replay_buffer_size": args.replay_buffer_size,
         "sample_reuse_times": args.sample_reuse_times,
@@ -185,6 +190,9 @@ def apply_cli_overrides(args):
         if value is not None:
             setattr(config, key, value)
             applied[key] = value
+    if args.full_nan_debug_checks:
+        config.full_nan_debug_checks = True
+        applied["full_nan_debug_checks"] = True
     return applied
 
 
@@ -227,6 +235,8 @@ if config.top_k < 2:
     raise ValueError(f"top_k 至少为 2，当前值: {config.top_k}")
 if config.learning_rate <= 0:
     raise ValueError(f"learning_rate 必须 > 0，当前值: {config.learning_rate}")
+if config.train_steps_per_call <= 0:
+    raise ValueError(f"train_steps_per_call 必须 > 0，当前值: {config.train_steps_per_call}")
 if config.lr_warmup_steps < 0:
     raise ValueError(f"lr_warmup_steps 必须 >= 0，当前值: {config.lr_warmup_steps}")
 if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
@@ -639,43 +649,65 @@ def loss_fn(params, samples: Sample, rng_key):
     value_loss = jnp.sum(err * err * samples.mask) / jnp.maximum(jnp.sum(samples.mask), 1.0)
 
     total_loss = policy_loss + config.value_loss_weight * value_loss
-    normalizer = jnp.maximum(jnp.sum(samples.mask.astype(jnp.float32)), 1.0)
     target_sum = jnp.sum(policy_prob, axis=-1, keepdims=True)
-    target_full = jnp.zeros_like(logits).at[
-        jnp.arange(policy_idx.shape[0])[:, None], policy_idx
-    ].add(policy_prob)
-    grad_logits = (
-        (jax.nn.softmax(logits, axis=-1) * target_sum - target_full)
-        * samples.mask[:, None].astype(jnp.float32)
-        / normalizer
-    )
-    grad_value = (
-        2.0
-        * config.value_loss_weight
-        * err
-        * samples.mask.astype(jnp.float32)
-        / normalizer
-    )
-    debug_flags = jnp.stack([
-        jnp.all(jnp.isfinite(logits)),
-        jnp.all(jnp.isfinite(value)),
-        jnp.all(jnp.isfinite(policy_prob)),
-        jnp.all(jnp.isfinite(value_tgt)),
-        jnp.all(jnp.isfinite(sparse_log_probs)),
-        jnp.all(jnp.isfinite(target_sum)),
-        jnp.all(target_sum > 0.0),
-        jnp.all(jnp.isfinite(grad_logits)),
-        jnp.all(jnp.isfinite(grad_value)),
-    ])
-    debug_values = jnp.stack([
-        jnp.max(jnp.abs(logits)),
-        jnp.max(jnp.abs(value)),
-        jnp.max(policy_prob),
-        jnp.min(target_sum),
-        jnp.max(target_sum),
-        jnp.max(jnp.abs(grad_logits)),
-        jnp.max(jnp.abs(grad_value)),
-    ])
+    if config.full_nan_debug_checks:
+        normalizer = jnp.maximum(jnp.sum(samples.mask.astype(jnp.float32)), 1.0)
+        target_full = jnp.zeros_like(logits).at[
+            jnp.arange(policy_idx.shape[0])[:, None], policy_idx
+        ].add(policy_prob)
+        grad_logits = (
+            (jax.nn.softmax(logits, axis=-1) * target_sum - target_full)
+            * samples.mask[:, None].astype(jnp.float32)
+            / normalizer
+        )
+        grad_value = (
+            2.0
+            * config.value_loss_weight
+            * err
+            * samples.mask.astype(jnp.float32)
+            / normalizer
+        )
+        debug_flags = jnp.stack([
+            jnp.all(jnp.isfinite(logits)),
+            jnp.all(jnp.isfinite(value)),
+            jnp.all(jnp.isfinite(policy_prob)),
+            jnp.all(jnp.isfinite(value_tgt)),
+            jnp.all(jnp.isfinite(sparse_log_probs)),
+            jnp.all(jnp.isfinite(target_sum)),
+            jnp.all(target_sum > 0.0),
+            jnp.all(jnp.isfinite(grad_logits)),
+            jnp.all(jnp.isfinite(grad_value)),
+        ])
+        debug_values = jnp.stack([
+            jnp.max(jnp.abs(logits)),
+            jnp.max(jnp.abs(value)),
+            jnp.max(policy_prob),
+            jnp.min(target_sum),
+            jnp.max(target_sum),
+            jnp.max(jnp.abs(grad_logits)),
+            jnp.max(jnp.abs(grad_value)),
+        ])
+    else:
+        debug_flags = jnp.stack([
+            jnp.all(jnp.isfinite(logits)),
+            jnp.all(jnp.isfinite(value)),
+            jnp.all(jnp.isfinite(policy_prob)),
+            jnp.all(jnp.isfinite(value_tgt)),
+            jnp.all(jnp.isfinite(sparse_log_probs)),
+            jnp.all(jnp.isfinite(target_sum)),
+            jnp.all(target_sum > 0.0),
+            jnp.array(True),
+            jnp.array(True),
+        ])
+        debug_values = jnp.stack([
+            jnp.max(jnp.abs(logits)),
+            jnp.max(jnp.abs(value)),
+            jnp.max(policy_prob),
+            jnp.min(target_sum),
+            jnp.max(target_sum),
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+        ])
     return total_loss, (policy_loss, value_loss, debug_flags, debug_values)
 
 
@@ -1039,6 +1071,39 @@ class ReplayBuffer:
         policy_prob_batch = self.policy_prob[idx].reshape((num_devices, per_device, self.policy_prob.shape[1]))
         value_batch = self.value_tgt[idx].reshape((num_devices, per_device))
         mask_batch = np.ones((num_devices, per_device), dtype=np.bool_)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            sample = Sample(
+                obs=jax.device_put_sharded([obs_batch[i] for i in range(num_devices)], devices),
+                policy_idx=jax.device_put_sharded([policy_idx_batch[i] for i in range(num_devices)], devices),
+                policy_prob=jax.device_put_sharded([policy_prob_batch[i] for i in range(num_devices)], devices),
+                value_tgt=jax.device_put_sharded([value_batch[i] for i in range(num_devices)], devices),
+                mask=jax.device_put_sharded([mask_batch[i] for i in range(num_devices)], devices),
+            )
+        return sample, idx.astype(np.int64)
+
+    def sample_train_block_sharded(self, batch_size: int, num_steps: int, rng_key):
+        """一次采样多个小 batch，形状为 (device, step, per_device, ...)。"""
+        if num_steps <= 0:
+            raise ValueError(f"num_steps={num_steps} 必须 > 0")
+        if batch_size <= 0 or batch_size % num_devices != 0:
+            raise ValueError(
+                f"batch_size={batch_size} 必须是正数且能整除 num_devices({num_devices})"
+            )
+        if self.size <= 0:
+            raise ValueError("ReplayBuffer 为空，无法采样")
+
+        rng = self._build_rng(rng_key)
+        per_device = batch_size // num_devices
+        idx = rng.integers(self.size, size=num_steps * batch_size)
+        step_device_shape = (num_steps, num_devices, per_device)
+
+        obs_batch = self.obs[idx].reshape((*step_device_shape, *self.obs.shape[1:])).transpose(1, 0, 2, 3, 4, 5)
+        policy_idx_batch = self.policy_idx[idx].reshape((*step_device_shape, self.policy_idx.shape[1])).transpose(1, 0, 2, 3)
+        policy_prob_batch = self.policy_prob[idx].reshape((*step_device_shape, self.policy_prob.shape[1])).transpose(1, 0, 2, 3)
+        value_batch = self.value_tgt[idx].reshape(step_device_shape).transpose(1, 0, 2)
+        mask_batch = np.ones((num_devices, num_steps, per_device), dtype=np.bool_)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
@@ -1556,9 +1621,11 @@ def main():
         config.value_loss_weight,
     )
     logger.info(
-        "[Optimizer] AdamW(weight_decay=%.1e, train_batch=%s)",
+        "[Optimizer] AdamW(weight_decay=%.1e, train_batch=%s, steps_per_call=%s, full_nan_debug=%s)",
         config.weight_decay,
         config.training_batch_size,
+        config.train_steps_per_call,
+        config.full_nan_debug_checks,
     )
     optimizer = optax.adamw(lr_schedule, weight_decay=config.weight_decay)
     opt_state_template = optimizer.init(params_template)
@@ -1633,8 +1700,7 @@ def main():
     params = replicate_to_devices(params)
     opt_state = replicate_to_devices(opt_state)
     
-    @partial(jax.pmap, axis_name='i')
-    def train_step(params, opt_state, samples, rng_key):
+    def _train_one_step(params, opt_state, samples, rng_key):
         (total_loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, samples, rng_key)
         policy_loss, value_loss, debug_flags, debug_values = aux
         loss_finite = jnp.isfinite(total_loss)
@@ -1664,11 +1730,34 @@ def main():
             grad_bad_mask, debug_flags, debug_values,
         )
 
+    @partial(jax.pmap, axis_name='i')
+    def train_steps(params, opt_state, samples, rng_keys):
+        def _scan_step(carry, xs):
+            step_params, step_opt_state = carry
+            step_samples, step_key = xs
+            (
+                new_params, new_opt_state, policy_loss, value_loss, finite, loss_finite,
+                grad_finite, grad_bad_mask, debug_flags, debug_values,
+            ) = _train_one_step(step_params, step_opt_state, step_samples, step_key)
+            outputs = (
+                policy_loss, value_loss, finite, loss_finite, grad_finite,
+                grad_bad_mask, debug_flags, debug_values,
+            )
+            return (new_params, new_opt_state), outputs
+
+        (params, opt_state), outputs = jax.lax.scan(
+            _scan_step,
+            (params, opt_state),
+            (samples, rng_keys),
+        )
+        return (params, opt_state, *outputs)
+
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
         f"ch{config.num_channels}_b{config.num_blocks}"
         f"_sim{config.num_simulations}_k{config.top_k}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
+        f"_tpc{config.train_steps_per_call}"
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
@@ -1815,18 +1904,30 @@ def main():
         num_updates = (new_frames * config.sample_reuse_times) // config.training_batch_size
         num_updates = max(1, num_updates)
         
-        # 预生成所有采样 key
-        sample_keys = jax.random.split(rng_key, num_updates + 1)
+        # 预生成训练块采样 key。每块内部仍按 training_batch_size 做多次 optimizer update。
+        num_train_blocks = (num_updates + config.train_steps_per_call - 1) // config.train_steps_per_call
+        sample_keys = jax.random.split(rng_key, num_train_blocks + 1)
         rng_key = sample_keys[0]
         
-        def _prefetch_batch(key_idx):
-            """CPU 采样 + 直接按设备分片上传（双缓冲预读取）"""
-            batch, _ = replay_buffer.sample_sharded(config.training_batch_size, sample_keys[key_idx])
+        def _prefetch_train_block(block_idx):
+            """CPU 采样多个小 batch + 直接按设备分片上传（双缓冲预读取）"""
+            steps = min(
+                config.train_steps_per_call,
+                num_updates - block_idx * config.train_steps_per_call,
+            )
+            batch, _ = replay_buffer.sample_train_block_sharded(
+                config.training_batch_size,
+                steps,
+                sample_keys[block_idx + 1],
+            )
+            key_block = np.asarray(
+                jax.random.split(sample_keys[block_idx + 1], steps * num_devices)
+            ).reshape(num_devices, steps, 2)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", DeprecationWarning)
                 keys = jax.device_put_sharded(
-                    list(jax.random.split(sample_keys[key_idx], num_devices)), devices)
-            return batch, keys
+                    [key_block[i] for i in range(num_devices)], devices)
+            return batch, keys, steps
 
         ploss_acc, vloss_acc = None, None
         finite_acc = None
@@ -1835,13 +1936,13 @@ def main():
         bad_grad_mask_acc = None
         with ThreadPoolExecutor(max_workers=1) as prefetch_executor:
             next_future = (
-                prefetch_executor.submit(_prefetch_batch, 1) if num_updates > 0 else None
+                prefetch_executor.submit(_prefetch_train_block, 0) if num_updates > 0 else None
             )
 
-            for i in range(num_updates):
-                batch, train_keys = next_future.result()
-                if i + 1 < num_updates:
-                    next_future = prefetch_executor.submit(_prefetch_batch, i + 2)
+            for block_idx in range(num_train_blocks):
+                batch, train_keys, block_steps = next_future.result()
+                if block_idx + 1 < num_train_blocks:
+                    next_future = prefetch_executor.submit(_prefetch_train_block, block_idx + 1)
                 else:
                     next_future = None
 
@@ -1849,7 +1950,7 @@ def main():
                     (
                         params, opt_state, ploss, vloss, finite, loss_finite, grad_finite,
                         grad_bad_mask, debug_flags, debug_values,
-                    ) = train_step(
+                    ) = train_steps(
                         params, opt_state, batch, train_keys
                     )
                 except jax.errors.JaxRuntimeError as e:
@@ -1862,40 +1963,48 @@ def main():
                             f"selfplay_batch_size({config.selfplay_batch_size})."
                         ) from e
                     raise
-                finite_acc = finite if finite_acc is None else (finite_acc & finite)
-                loss_finite_acc = loss_finite if loss_finite_acc is None else (loss_finite_acc & loss_finite)
-                grad_finite_acc = grad_finite if grad_finite_acc is None else (grad_finite_acc & grad_finite)
+                finite_block = jnp.all(finite, axis=1)
+                loss_finite_block = jnp.all(loss_finite, axis=1)
+                grad_finite_block = jnp.all(grad_finite, axis=1)
+                grad_bad_mask_block = jnp.any(grad_bad_mask, axis=1)
+                finite_acc = finite_block if finite_acc is None else (finite_acc & finite_block)
+                loss_finite_acc = loss_finite_block if loss_finite_acc is None else (loss_finite_acc & loss_finite_block)
+                grad_finite_acc = grad_finite_block if grad_finite_acc is None else (grad_finite_acc & grad_finite_block)
                 bad_grad_mask_acc = (
-                    grad_bad_mask
+                    grad_bad_mask_block
                     if bad_grad_mask_acc is None
-                    else (bad_grad_mask_acc | grad_bad_mask)
+                    else (bad_grad_mask_acc | grad_bad_mask_block)
                 )
-                if not bool(np.asarray(jax.device_get(finite)).all()):
+                if not bool(np.asarray(jax.device_get(finite_block)).all()):
+                    finite_np = np.asarray(jax.device_get(finite)).astype(np.bool_)
+                    bad_pos = np.argwhere(~finite_np)
+                    bad_step = int(bad_pos[0, 1]) if bad_pos.size else 0
+                    bad_update = block_idx * config.train_steps_per_call + bad_step + 1
                     loss_ok = bool(np.asarray(jax.device_get(loss_finite)).all())
                     grad_ok = bool(np.asarray(jax.device_get(grad_finite)).all())
                     bad_mask = np.asarray(jax.device_get(grad_bad_mask)).astype(np.bool_)
                     if bad_mask.ndim > 1:
-                        bad_mask = np.any(bad_mask, axis=0)
+                        bad_mask = np.any(bad_mask, axis=tuple(range(bad_mask.ndim - 1)))
                     bad_names = [name for name, bad in zip(grad_path_names, bad_mask) if bad]
                     preview = ", ".join(bad_names[:8]) if bad_names else "unknown"
                     if len(bad_names) > 8:
                         preview += f", ...(+{len(bad_names) - 8})"
                     debug_ok = np.asarray(jax.device_get(debug_flags)).astype(np.bool_)
                     if debug_ok.ndim > 1:
-                        debug_ok = np.all(debug_ok, axis=0)
+                        debug_ok = np.all(debug_ok, axis=tuple(range(debug_ok.ndim - 1)))
                     debug_text = ", ".join(
                         f"{name}={bool(ok)}" for name, ok in zip(loss_debug_names, debug_ok)
                     )
                     debug_value_np = np.asarray(jax.device_get(debug_values)).astype(np.float32)
                     if debug_value_np.ndim > 1:
-                        debug_value_np = np.max(debug_value_np, axis=0)
+                        debug_value_np = np.max(debug_value_np, axis=tuple(range(debug_value_np.ndim - 1)))
                     debug_value_text = ", ".join(
                         f"{name}={float(value):.6g}"
                         for name, value in zip(loss_debug_value_names, debug_value_np)
                     )
                     logger.error(
                         "[Training NaN/Inf] bad_update=%s/%s loss_finite=%s, grad_finite=%s, %s, %s, bad_grad_leaves=%s",
-                        i + 1,
+                        bad_update,
                         num_updates,
                         loss_ok,
                         grad_ok,
@@ -1909,12 +2018,14 @@ def main():
                     )
 
                 # 累积损失（保持在 GPU），只在最后同步
+                ploss_sum = jnp.sum(ploss, axis=1)
+                vloss_sum = jnp.sum(vloss, axis=1)
                 if ploss_acc is None:
-                    ploss_acc, vloss_acc = ploss, vloss
+                    ploss_acc, vloss_acc = ploss_sum, vloss_sum
                 else:
-                    ploss_acc = ploss_acc + ploss
-                    vloss_acc = vloss_acc + vloss
-                del batch, train_keys, finite, loss_finite, grad_finite, grad_bad_mask, debug_flags, debug_values, ploss, vloss
+                    ploss_acc = ploss_acc + ploss_sum
+                    vloss_acc = vloss_acc + vloss_sum
+                del batch, train_keys, finite, loss_finite, grad_finite, grad_bad_mask, debug_flags, debug_values, ploss, vloss, ploss_sum, vloss_sum
         
         # 累计优化器步数
         total_opt_steps += num_updates
