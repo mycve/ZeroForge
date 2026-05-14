@@ -94,7 +94,7 @@ class Config:
     lr_cosine_steps: int = 100000     # 余弦周期（opt steps）
     lr_min_ratio: float = 0.2         # 强版本使用较高尾段学习率，避免过早停滞
     training_batch_size: int = 1024
-    train_steps_per_call: int = 10     # 每次 pmap 调用内连续执行的小 batch 更新数；不改变单步 batch 语义
+    train_steps_per_call: int = 8     # 每次 pmap 调用内连续执行的小 batch 更新数；不改变单步 batch 语义
     full_nan_debug_checks: bool = False  # 仅排查 NaN/Inf 时开启，默认跳过昂贵 dense debug
     td_lambda: float = 0.75              # λ 越大越信任终局结果，减少早期不准确 bootstrap 的偏差
     
@@ -112,14 +112,14 @@ class Config:
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
-    value_loss_weight: float = 0.5
+    value_loss_weight: float = 1.0
     weight_decay: float = 1e-4
     qtransform_value_scale: float = 0.10   # 放大 Q 值差异，提升高收益分支被选概率
-    selfplay_gumbel_scale: float = 10.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
+    selfplay_gumbel_scale: float = 1.0   # Gumbel 噪声强度（mctx 固定参数，无需动态调节）
     eval_gumbel_scale: float = 0.0       # 评估关闭 Gumbel 扰动，提升结果稳定性与可比性
     
     # 环境规则（符合象棋竞赛规则）
-    max_steps: int = 200              # 总步数 400 步（200回合）判和
+    max_steps: int = 300              # 总步数 400 步（200回合）判和
     max_no_capture_steps: int = 120   # 无吃子 120 步（60回合）判和，将军最多累计20回合
     repetition_threshold: int = 5     # 非将非捉重复局面 5 次判和
     # 长将/长捉规则已在 violation_rules.py 中实现
