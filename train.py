@@ -102,15 +102,15 @@ class Config:
     selfplay_batch_size: int = 256       # 减半 batch 换取更深搜索，每步数据质量 > 数据量
     num_simulations: int = 96            # 增大可提升 MCTS 质量（更耗算力）
     top_k: int = 8
-    selfplay_temperature_steps: int = 40
-    selfplay_temperature: float = 1.5      # 自对弈起始温度
-    selfplay_temperature_final: float = 0.25
-    policy_smoothing_plies: int = 4        # 前 N 个半步做策略目标平滑
+    selfplay_temperature_steps: int = 20
+    selfplay_temperature: float = 1.0      # 自对弈起始温度
+    selfplay_temperature_final: float = 0.15
+    policy_smoothing_plies: int = 6        # 前 N 个半步做策略目标平滑
     policy_smoothing_value: float = 0.5    # 平滑强度：混入合法动作均匀分布
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 500_000
-    sample_reuse_times: int = 2          # 数据产出减半，多学一遍弥补
+    sample_reuse_times: int = 3          # 数据产出减半，多学一遍弥补
     mirror_augmentation_prob: float = 0.3  # 左右镜像增强概率；0.3 更保守，避免过度改写原分布
     
     # 损失权重
