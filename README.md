@@ -104,7 +104,7 @@ iter= 10 | ploss=2.81 vloss=0.15 | len=153 fps=516 buf=358k train=300 | ent=1.92
 
 | 指标 | 说明 |
 |------|------|
-| `ploss` | 稀疏策略蒸馏损失（对 MCTS `action_weights` top-k 的交叉熵） |
+| `ploss` | 完整策略蒸馏损失（对 MCTS `action_weights` 全动作分布的交叉熵） |
 | `vloss` | 价值损失（对 `value` 与 `value_tgt` 的均方误差 MSE） |
 | `len` | 平均对局步数 |
 | `fps` | 每秒采样帧数 |

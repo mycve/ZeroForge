@@ -9,7 +9,7 @@
 
 基本术语：
 - 将军：走子直接攻击对方"将"或"帅"
-- 捉：走子攻击对方除将帅以外的任何无根子，并企图于下一步吃去
+- 捉：走子攻击对方除将帅以外的任何可捉子，并企图于下一步吃去
 - 有根：被捉子如有另子保护，可反吃
 - 真根：保护子在被吃后可以反吃
 - 假根：保护子因受牵制不能反吃
@@ -264,23 +264,23 @@ def is_chase_move(board_before: jnp.ndarray, board_after: jnp.ndarray,
     """
     判断一步棋是否构成"捉"
     
-    捉的定义：走子攻击对方除将帅以外的任何无根子，并企图于下一步吃去
+    捉的定义：走子攻击对方除将帅以外的任何可捉子，并企图于下一步吃去
     
     不算捉的情况：
     1. 分捉多子不算捉
     2. 捉未过河的卒（兵）不算捉
     3. 将卒（帅兵）捉其他子不算捉
     4. 受牵制的子捉其他子不算捉
-    5. 捉真根子不算捉
+    5. 捉同类子、有根子或可换子目标仍按捉处理
     
     算捉的情况：
-    1. 捉假根子算捉
+    1. 捉假根子、真根子、可换子目标均算捉
     2. 捉过河卒（兵）算捉
     3. 马捉被绊脚马，算捉
     
     特殊情况：
     1. 除车卒(兵)外其他子捉车，无论车是否有根，算捉
-    2. 捉同类子不算捉，但一方受牵制不能吃子时，算捉
+    2. 捉同类子仍算捉，避免换子长捉被误判为普通重复
     
     Args:
         board_before: 走子前的棋盘
@@ -327,13 +327,7 @@ def is_chase_move(board_before: jnp.ndarray, board_after: jnp.ndarray,
         # 检查能否攻击到
         can_attack = can_piece_attack(board_after, to_row, to_col, row, col, player)
         
-        # 检查走子前是否已经能攻击（原本就能攻击的不算新捉）
-        could_attack_before = can_piece_attack(board_before, from_row, from_col, row, col, player)
-        
-        # 新产生的攻击才算捉
-        is_new_attack = can_attack & ~could_attack_before
-        
-        return is_enemy & is_not_king & is_new_attack
+        return is_enemy & is_not_king & can_attack
     
     squares = jnp.arange(NUM_SQUARES)
     new_threats = jax.vmap(check_target)(squares)
@@ -354,38 +348,18 @@ def is_chase_move(board_before: jnp.ndarray, board_after: jnp.ndarray,
     pawn_crossed = has_crossed_river(threatened_row, enemy_player)
     pawn_not_crossed = is_pawn & ~pawn_crossed
     
-    # 规则：捉同类子不算捉（除非对方被牵制不能吃）
-    is_same_type = moved_piece_type == threatened_type
-    enemy_can_capture = can_piece_attack(board_after, threatened_row, threatened_col, to_row, to_col, enemy_player)
-    enemy_pinned = is_piece_pinned(board_after, threatened_row, threatened_col, enemy_player)
-    same_type_exclude = is_same_type & enemy_can_capture & ~enemy_pinned
-    
-    # 规则：除车卒(兵)外其他子捉车，无论车是否有根，算捉
-    is_rook_target = threatened_type == 5
-    attacker_is_rook_or_pawn = (moved_piece_type == 5) | (moved_piece_type == 7)
-    special_rook_chase = is_rook_target & ~attacker_is_rook_or_pawn
-    
-    # 规则：捉真根子不算捉，捉假根子算捉
-    has_real_root = has_real_protector(board_after, threatened_row, threatened_col,
-                                        to_row, to_col, enemy_player)
-    
     # 综合判断
     # 算捉条件：
     # 1. 不是基本排除（将/兵捉子、被牵制）
     # 2. 单捉（不是分捉多子）
     # 3. 不是捉未过河卒
-    # 4. 不是捉同类子（除非对方被牵制）
-    # 5. 以下满足其一：
-    #    a. 特殊捉车（非车非卒捉车）
-    #    b. 捉无根子或假根子
+    # 4. 捉过河兵、有根子、同类子、可换子目标均算捉
     
     is_valid_chase = (
         ~basic_exclude & 
         is_single_threat & 
         ~pawn_not_crossed &
-        ~same_type_exclude &
-        (threat_count > 0) &
-        (special_rook_chase | ~has_real_root)
+        (threat_count > 0)
     )
     
     # 返回：是否捉、被捉子位置、被捉子类型
