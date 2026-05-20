@@ -288,26 +288,15 @@ class ModelManager:
         self.last_error = ""
 
     def _infer_channels(self, params) -> Optional[int]:
-        # 当前 GNN 结构：首层 input_proj 的输出维度即 channels
         try:
-            if "input_proj" in params:
-                proj = params["input_proj"]
-                return int(proj["kernel"].shape[-1])
-        except Exception:
-            pass
-        # 兜底：GraphBlock_0/q_proj
-        try:
-            if "GraphBlock_0" in params and "q_proj" in params["GraphBlock_0"]:
-                return int(params["GraphBlock_0"]["q_proj"]["kernel"].shape[-1])
+            if "feature_embed" in params:
+                return max(int(params["feature_embed"].shape[-1]) // 4, 1)
         except Exception:
             pass
         return None
 
     def _infer_num_blocks(self, params) -> int:
-        try:
-            return len([k for k in params.keys() if str(k).startswith("GraphBlock_")])
-        except Exception:
-            return 0
+        return 0
 
     def load(self, ckpt_dir: str, step: int) -> bool:
         self.last_error = ""
@@ -345,10 +334,10 @@ class ModelManager:
 
         channels = self._infer_channels(params)
         num_blocks = self._infer_num_blocks(params)
-        if not channels or num_blocks <= 0:
+        if not channels:
             self.last_error = (
                 f"模型结构推断失败: channels={channels}, num_blocks={num_blocks} "
-                "(可能是旧 CNN checkpoint 或参数格式不匹配)"
+                "(可能是旧 checkpoint 或参数格式不匹配)"
             )
             print(f"[AI] {self.last_error}")
             return False
@@ -834,7 +823,7 @@ class MoveRequest(BaseModel):
 
 
 class LoadModelRequest(BaseModel):
-    ckpt_dir: str = "checkpoints"
+    ckpt_dir: str = "checkpoints_nnue"
     step: int = 0
 
 
@@ -1356,7 +1345,7 @@ async def uci_think(req: UCIThinkRequest):
 
 
 @app.get("/api/checkpoints")
-async def get_checkpoints(ckpt_dir: str = "checkpoints"):
+async def get_checkpoints(ckpt_dir: str = "checkpoints_nnue"):
     """获取检查点列表"""
     steps = list_checkpoints(ckpt_dir)
     return {

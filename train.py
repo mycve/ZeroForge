@@ -79,12 +79,12 @@ for _name in ("jax", "jax._src", "orbax", "orbax.checkpoint", "mctx", "absl", "a
 class Config:
     # 基础配置
     seed: int = 42
-    ckpt_dir: str = "checkpoints"
-    log_dir: str = "logs"
+    ckpt_dir: str = "checkpoints_nnue"
+    log_dir: str = "logs_nnue"
     
-    # 网络架构：3分支GNN（Local 8邻居+Row+Col，无Global）+ factorized policy head
-    num_channels: int = 128   # caae0ef 强度基线；盲目加宽会降低每轮搜索/训练质量
-    num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
+    # 网络架构：纯 NNUE 稀疏 piece-square 特征 + 小 MLP policy/value head
+    num_channels: int = 128   # NNUE 基础宽度；实际 accumulator=4x、hidden=2x
+    num_blocks: int = 0       # 兼容旧 CLI/checkpoint 元数据；NNUE 不使用 block
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "float32"
     
@@ -142,11 +142,11 @@ def parse_args():
         "--init-checkpoint",
         type=str,
         default=None,
-        help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints/100 的路径",
+        help="导入指定 checkpoint 作为基础模型开始训练；支持 step 编号或形如 checkpoints_nnue/100 的路径",
     )
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 learning_rate")
     parser.add_argument("--num-channels", type=int, default=None, help="覆盖 num_channels")
-    parser.add_argument("--num-blocks", type=int, default=None, help="覆盖 num_blocks")
+    parser.add_argument("--num-blocks", type=int, default=None, help="兼容参数；NNUE 当前不使用")
     parser.add_argument("--network-dtype", type=str, default=None, choices=["float32", "bfloat16"], help="覆盖 network_dtype")
     parser.add_argument("--td-lambda", type=float, default=None, help="覆盖 td_lambda")
     parser.add_argument("--training-batch-size", type=int, default=None, help="覆盖 training_batch_size")
@@ -356,7 +356,7 @@ def forward(params, obs, is_training=False, rng_key=None):
     """前向传播: 返回 (policy_logits, value, value_logits)。
 
     value = softmax(value_logits) 的 p_W − p_L；训练时价值损失为 MSE(value, value_tgt)，梯度经 value 回传至 value_logits。
-    训练时需传入 rng_key 以支持 GraphBlock 内 dropout。
+    保留 rng_key 参数以兼容训练路径；当前 NNUE 前向不使用 dropout。
     """
     if is_training and rng_key is not None:
         logits, value, value_logits = net.apply(
@@ -1491,7 +1491,7 @@ def _resolve_checkpoint_source(spec: str, default_ckpt_dir: str) -> Tuple[str, i
     base = os.path.basename(abs_path)
     if not base.isdigit():
         raise ValueError(
-            f"无法解析 checkpoint: {spec}。请使用 step 编号，或形如 checkpoints/100 的目录路径。"
+            f"无法解析 checkpoint: {spec}。请使用 step 编号，或形如 checkpoints_nnue/100 的目录路径。"
         )
     if not os.path.isdir(abs_path):
         raise FileNotFoundError(f"checkpoint 目录不存在: {abs_path}")
@@ -1578,8 +1578,8 @@ def restore_checkpoint(
 
 def main():
     logger.info("=" * 50)
-    logger.info("ZeroForge - 现代高效架构")
-    logger.info("特性: 3分支GNN + factorized policy head + 完整策略目标 + 统一视角训练 + Gumbel MCTS + TD(λ)")
+    logger.info("ZeroForge - NNUE sparse selfplay")
+    logger.info("特性: 纯NNUE稀疏piece-square特征 + 完整策略目标 + 统一视角训练 + Gumbel MCTS + TD(λ)")
     if CLI_OVERRIDES:
         logger.info("[CLI] 覆盖参数: %s", CLI_OVERRIDES)
     
@@ -1759,7 +1759,7 @@ def main():
 
     # 根据关键超参自动生成日志子目录，便于 TensorBoard 对比实验
     run_name = (
-        f"ch{config.num_channels}_b{config.num_blocks}"
+        f"nnue_ch{config.num_channels}"
         f"_sim{config.num_simulations}_k{config.top_k}"
         f"_lr{config.learning_rate:.0e}_bs{config.training_batch_size}"
         f"_tpc{config.train_steps_per_call}"
@@ -1874,8 +1874,7 @@ def main():
                     "[Selfplay OOM] 自对弈阶段显存不足。"
                     f"建议优先减小 selfplay_batch_size({config.selfplay_batch_size})；"
                     f"其次再调小 num_simulations({config.num_simulations}) / "
-                    f"top_k({config.top_k}) / num_channels({config.num_channels}) / "
-                    f"num_blocks({config.num_blocks})。"
+                    f"top_k({config.top_k}) / num_channels({config.num_channels})。"
                 ) from e
             raise
 
@@ -1967,7 +1966,7 @@ def main():
                         raise RuntimeError(
                             "训练显存不足（OOM）。建议进一步降低: "
                             f"training_batch_size({config.training_batch_size}), "
-                            f"num_channels({config.num_channels}), num_blocks({config.num_blocks}), "
+                            f"num_channels({config.num_channels}), "
                             f"selfplay_batch_size({config.selfplay_batch_size})."
                         ) from e
                     raise

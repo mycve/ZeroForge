@@ -174,19 +174,15 @@ class Engine:
     def _infer_arch(self, params):
 
         channels = 128
-        blocks = 8
+        blocks = 0
 
         try:
 
             p = params.get("params", params)
 
-            if "input_proj" in p:
-                channels = int(p["input_proj"]["kernel"].shape[-1])
-
-            blocks = len([k for k in p.keys() if str(k).startswith("GraphBlock_")])
-
-            if blocks <= 0:
-                blocks = 8
+            if "feature_embed" in p:
+                channels = max(int(p["feature_embed"].shape[-1]) // 4, 1)
+                return channels, 0
 
         except Exception:
             pass
@@ -733,7 +729,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--ckpt", default="checkpoints")
+    parser.add_argument("--ckpt", default="checkpoints_nnue")
     parser.add_argument("--step", type=int, default=0)
 
     parser.add_argument("--simulations", type=int, default=DEFAULT_NUM_SIMULATIONS)

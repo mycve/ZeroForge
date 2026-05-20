@@ -5,14 +5,14 @@
 ## 核心特性
 
 - **Gumbel AlphaZero**: Gumbel-Top-k MCTS，自对弈按温度退火采样；评估关闭 Gumbel 扰动以保证可比性
-- **3 分支 GNN 网络**: Local 8 邻居 + Row + Col 注意力，配合 factorized policy head、全局动作先验与跨度上下文
+- **纯 NNUE 稀疏网络**: 9 帧棋子-格子 sparse feature accumulator + 小型 policy/value MLP，优先提升自对弈推理吞吐
 - **规则状态平面**: 将重复、无吃子、长将/长捉压力等规则信息作为额外观察通道输入网络
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint + lz4 经验池快照的完整状态保存，支持无差别恢复
 - **TD(λ) 价值目标**: 对 MCTS 根标量 `root_value` 做时序差分备份，与 `value`（由 `value_logits` 得 W−L）做 MSE
 - **视角归一化**: 始终以当前玩家为中心观察，简化网络学习
 - **镜像增强**: 训练时自动左右镜像变换，数据利用率翻倍
-- **BF16 训练路径**: 默认使用 `bfloat16` 网络前向，评估路径固定 float32 以规避部分 GPU 编译问题
+- **BF16 可选训练路径**: 默认使用 `float32`；可通过 `--network-dtype bfloat16` 测试更快前向
 - **极速 JAX 优化**:
   - 全向量化规则，消除 Python 循环
   - `jax.pmap` 多设备分发 + `jax.lax.scan` 循环优化
@@ -39,7 +39,7 @@ python train.py
 
 训练会自动：
 - 检测并恢复已有 checkpoint（断点续训）
-- 保存 checkpoint 到 `checkpoints/` 目录
+- 保存 checkpoint 到 `checkpoints_nnue/` 目录
 - 输出日志到 TensorBoard
 
 也可以导入一个指定模型作为基础模型，再从 `iteration=0` 开始自玩训练：
@@ -49,10 +49,10 @@ python train.py
 python train.py --init-checkpoint 100
 
 # 或直接指定 checkpoint 目录
-python train.py --init-checkpoint checkpoints/100
+python train.py --init-checkpoint checkpoints_nnue/100
 
 # 导入强模型后，用更保守的参数继续训练
-python train.py --init-checkpoint checkpoints/100 \
+python train.py --init-checkpoint checkpoints_nnue/100 \
   --learning-rate 5e-5 \
   --sample-reuse-times 1 \
   --selfplay-temperature-steps 30 \
@@ -60,9 +60,9 @@ python train.py --init-checkpoint checkpoints/100 \
 ```
 
 说明：
-- 如果当前 `checkpoints/` 里已经存在可恢复的训练断点，仍然会优先断点续训
+- 如果当前 `checkpoints_nnue/` 里已经存在可恢复的训练断点，仍然会优先断点续训
 - `--init-checkpoint` 只在“没有现成训练断点”时生效
-- 改变 `num_channels`、`num_blocks` 或策略头结构后，旧 checkpoint 通常不能直接续训；请使用新的 checkpoint 目录重新开始
+- 改变 `num_channels` 或策略头结构后，旧 checkpoint 通常不能直接续训；NNUE 分支默认使用 `checkpoints_nnue/`
 
 常用覆盖参数：
 
@@ -83,7 +83,7 @@ ZEROFORGE_STABLE_CUDA_ALLOCATOR=1 python train.py --selfplay-batch-size 512
 ### 3. 监控训练
 
 ```bash
-tensorboard --logdir logs
+tensorboard --logdir logs_nnue
 ```
 
 ### 4. 人机对弈
@@ -93,7 +93,7 @@ tensorboard --logdir logs
 python play.py
 
 # 或指定 checkpoint
-python play.py checkpoints/100
+python play.py checkpoints_nnue/100
 ```
 
 ## 训练输出说明
@@ -118,7 +118,7 @@ iter= 10 | ploss=2.81 vloss=0.15 | len=153 fps=516 buf=358k train=300 | ent=1.92
 ### 目录结构
 
 ```
-checkpoints/
+checkpoints_nnue/
 ├── 10/              # orbax checkpoint (模型参数、优化器状态)
 ├── 20/
 ├── metadata.json    # ELO 记录、total_opt_steps（单文件，评估对手从 orbax 加载）
@@ -129,21 +129,21 @@ checkpoints/
 
 ```bash
 # 只需对弈
-scp -r remote:checkpoints/100 ./checkpoints/
+scp -r remote:checkpoints_nnue/100 ./checkpoints_nnue/
 
 # 断点续训
-scp -r remote:checkpoints/100 ./checkpoints/
-scp remote:checkpoints/metadata.json ./checkpoints/
-scp remote:checkpoints/replay_buffer.lz4 ./checkpoints/
+scp -r remote:checkpoints_nnue/100 ./checkpoints_nnue/
+scp remote:checkpoints_nnue/metadata.json ./checkpoints_nnue/
+scp remote:checkpoints_nnue/replay_buffer.lz4 ./checkpoints_nnue/
 ```
 
 ## 默认配置
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `num_channels` | 128 | GNN 通道数；当前强度基线优先保证搜索和训练质量 |
-| `num_blocks` | 10 | GraphBlock 数量 |
-| `network_dtype` | `bfloat16` | 训练网络 dtype；评估固定 float32 |
+| `num_channels` | 128 | NNUE 基础宽度；accumulator 为 4x，hidden 为 2x |
+| `num_blocks` | 0 | 兼容参数；NNUE 当前不使用 |
+| `network_dtype` | `float32` | 训练网络 dtype；可用 `--network-dtype bfloat16` 覆盖 |
 | `num_simulations` | 40 | MCTS 模拟次数 |
 | `selfplay_batch_size` | 1024 | 自对弈并行数 |
 | `training_batch_size` | 4096 | 训练批大小 |
@@ -166,7 +166,7 @@ ZeroForge/
 ├── train.py           # 训练入口
 ├── play.py            # 人机对弈
 ├── networks/
-│   └── alphazero.py   # 3 分支 GNN AlphaZero 网络
+│   └── alphazero.py   # 纯 NNUE 稀疏特征网络
 ├── xiangqi/
 │   ├── env.py         # 环境状态管理
 │   ├── rules.py       # 向量化规则校验
@@ -181,8 +181,8 @@ ZeroForge/
 ├── uci_engine.py      # UCI 引擎入口
 ├── generate_eval_fens.py # 生成固定评估局面
 ├── eval_fens.txt      # 固定评估 FEN 池
-├── checkpoints/       # 模型存档
-└── logs/              # TensorBoard 日志
+├── checkpoints_nnue/  # NNUE 模型存档
+└── logs_nnue/         # NNUE TensorBoard 日志
 ```
 
 ## License
