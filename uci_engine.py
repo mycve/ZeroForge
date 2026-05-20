@@ -215,7 +215,7 @@ class Engine:
 
             prev_player = state.current_player
 
-            next_state = jax.vmap(self.env.step)(state, action)
+            next_state = jax.vmap(self.env.step_search)(state, action)
 
             obs = jax.vmap(self.env.observe)(next_state)
 

@@ -6,6 +6,7 @@
 
 - **Gumbel AlphaZero**: Gumbel-Top-k MCTS，自对弈按温度退火采样；评估关闭 Gumbel 扰动以保证可比性
 - **3 分支 GNN 网络**: Local 8 邻居 + Row + Col 注意力，配合 factorized policy head、全局动作先验与跨度上下文
+- **搜索树快速后继**: MCTS 内部使用 basic legal mask 的 `step_search`，根节点和真实落子仍保留完整规则校验
 - **规则状态平面**: 将重复、无吃子、长将/长捉压力等规则信息作为额外观察通道输入网络
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint + lz4 经验池快照的完整状态保存，支持无差别恢复
