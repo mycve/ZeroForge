@@ -66,8 +66,8 @@ class AlphaZeroNetwork(nn.Module):
             raise ValueError(f"channels 必须 > 0，实际 {self.channels}")
 
         batch_size = x.shape[0]
-        accumulator_dim = self.channels * 4
-        hidden_dim = max(self.channels * 2, 128)
+        accumulator_dim = self.channels
+        hidden_dim = max(self.channels, 64)
         bottleneck_dim = max(self.channels, 64)
 
         x = x.astype(self.dtype)
@@ -108,9 +108,7 @@ class AlphaZeroNetwork(nn.Module):
 
         h = nn.Dense(hidden_dim, dtype=self.dtype, name="fc1")(h)
         h = _clipped_relu(h)
-        h = nn.Dense(hidden_dim, dtype=self.dtype, name="fc2")(h)
-        h = _clipped_relu(h)
-        h = nn.Dense(bottleneck_dim, dtype=self.dtype, name="fc3")(h)
+        h = nn.Dense(bottleneck_dim, dtype=self.dtype, name="fc2")(h)
         h = _clipped_relu(h)
 
         policy_logits = nn.Dense(

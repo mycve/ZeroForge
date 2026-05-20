@@ -290,7 +290,7 @@ class ModelManager:
     def _infer_channels(self, params) -> Optional[int]:
         try:
             if "feature_embed" in params:
-                return max(int(params["feature_embed"].shape[-1]) // 4, 1)
+                return max(int(params["feature_embed"].shape[-1]), 1)
         except Exception:
             pass
         return None
@@ -565,7 +565,7 @@ def create_mcts_recurrent_fn():
         prev_p = state.current_player
 
         # step
-        ns = jax.vmap(env.step)(state, action)
+        ns = jax.vmap(env.step_search)(state, action)
 
         # observe
         obs = jax.vmap(env.observe)(ns)

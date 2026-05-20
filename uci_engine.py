@@ -181,7 +181,7 @@ class Engine:
             p = params.get("params", params)
 
             if "feature_embed" in p:
-                channels = max(int(p["feature_embed"].shape[-1]) // 4, 1)
+                channels = max(int(p["feature_embed"].shape[-1]), 1)
                 return channels, 0
 
         except Exception:
@@ -211,7 +211,7 @@ class Engine:
 
             prev_player = state.current_player
 
-            next_state = jax.vmap(self.env.step)(state, action)
+            next_state = jax.vmap(self.env.step_search)(state, action)
 
             obs = jax.vmap(self.env.observe)(next_state)
 

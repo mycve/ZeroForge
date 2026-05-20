@@ -20,7 +20,7 @@ from xiangqi.actions import (
 )
 from xiangqi.rules import (
     get_initial_board, apply_move, is_legal_move, is_game_over,
-    is_game_over_with_mask, get_legal_moves_mask, is_in_check, get_piece_type,
+    is_game_over_with_mask, get_legal_moves_mask, get_basic_valid_mask, is_in_check, get_piece_type,
 )
 from xiangqi.violation_rules import (
     is_chase_move, count_checking_pieces, check_violation,
@@ -627,6 +627,96 @@ class XiangqiEnv:
                 search_model_index=state.search_model_index,
             )
         
+        return jax.lax.cond(state.terminated, lambda: state, _do_step)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step_search(self, state: XiangqiState, action: jnp.ndarray) -> XiangqiState:
+        """MCTS recurrent 专用快速走子。
+
+        根节点与真实落子仍使用 `step()` 的完整规则。搜索树内部只需要近似后继：
+        跳过长将/长捉检测和全动作送将过滤，改用 `get_basic_valid_mask` 生成下一步动作。
+        这避免每个模拟节点对 2086 个动作逐一 `apply_move + is_in_check_at`。
+        """
+
+        def _do_step() -> XiangqiState:
+            from_sq, to_sq = action_to_move(action)
+            to_row = to_sq // BOARD_WIDTH
+            to_col = to_sq % BOARD_WIDTH
+            captured_piece = state.board[to_row, to_col]
+            is_capture = captured_piece != EMPTY
+
+            new_history = jnp.concatenate([
+                state.board[jnp.newaxis, :, :],
+                state.history[:-1, :, :],
+            ], axis=0)
+            new_board = apply_move(state.board, from_sq, to_sq)
+            new_player = 1 - state.current_player
+            new_step_count = state.step_count + 1
+
+            new_hash = compute_position_hash(new_board, new_player)
+            hash_idx = state.hash_count % POSITION_HISTORY_SIZE
+            new_position_hashes = state.position_hashes.at[hash_idx].set(new_hash)
+            new_hash_count = state.hash_count + 1
+
+            new_no_capture = jnp.where(is_capture, jnp.int32(0), state.no_capture_count + 1)
+            is_max_steps = new_step_count >= self.max_steps
+            is_no_capture_draw = new_no_capture >= self.max_no_capture_steps
+
+            new_legal_mask_raw = get_basic_valid_mask(new_board, new_player)
+            basic_game_over, basic_winner = is_game_over_with_mask(
+                new_board, new_player, new_legal_mask_raw
+            )
+            game_over = basic_game_over | is_max_steps | is_no_capture_draw
+            winner = jnp.where(basic_game_over, basic_winner, jnp.int32(-1))
+            draw_reason = jnp.where(
+                basic_game_over,
+                jnp.int32(8),
+                jnp.where(is_no_capture_draw, jnp.int32(2), jnp.where(is_max_steps, jnp.int32(1), jnp.int32(0))),
+            )
+            rewards = jnp.where(
+                game_over,
+                jnp.where(
+                    winner == -1,
+                    jnp.zeros(2, dtype=jnp.float32),
+                    jnp.where(
+                        winner == 0,
+                        jnp.array([1.0, -1.0], dtype=jnp.float32),
+                        jnp.array([-1.0, 1.0], dtype=jnp.float32),
+                    ),
+                ),
+                jnp.zeros(2, dtype=jnp.float32),
+            )
+            new_legal_mask = jnp.where(
+                game_over,
+                jnp.zeros(ACTION_SPACE_SIZE, dtype=jnp.bool_),
+                new_legal_mask_raw,
+            )
+
+            return XiangqiState(
+                board=new_board,
+                history=new_history,
+                current_player=new_player,
+                legal_action_mask=new_legal_mask,
+                rewards=rewards,
+                terminated=game_over,
+                step_count=new_step_count,
+                no_capture_count=new_no_capture,
+                winner=winner,
+                draw_reason=jnp.where(game_over, draw_reason, jnp.int32(0)),
+                position_hashes=new_position_hashes,
+                hash_count=new_hash_count,
+                red_check_count=state.red_check_count,
+                red_chase_count=state.red_chase_count,
+                red_alt_count=state.red_alt_count,
+                red_max_check_pieces=state.red_max_check_pieces,
+                black_check_count=state.black_check_count,
+                black_chase_count=state.black_chase_count,
+                black_alt_count=state.black_alt_count,
+                black_max_check_pieces=state.black_max_check_pieces,
+                check_in_no_capture=state.check_in_no_capture,
+                search_model_index=state.search_model_index,
+            )
+
         return jax.lax.cond(state.terminated, lambda: state, _do_step)
     
     @partial(jax.jit, static_argnums=(0,))

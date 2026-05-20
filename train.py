@@ -83,7 +83,7 @@ class Config:
     log_dir: str = "logs_nnue"
     
     # 网络架构：纯 NNUE 稀疏 piece-square 特征 + 小 MLP policy/value head
-    num_channels: int = 128   # NNUE 基础宽度；实际 accumulator=4x、hidden=2x
+    num_channels: int = 128   # NNUE accumulator/hidden 宽度；CPU 上建议先试 64/128
     num_blocks: int = 0       # 兼容旧 CLI/checkpoint 元数据；NNUE 不使用 block
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
     network_dtype: str = "float32"
@@ -374,12 +374,13 @@ def eval_forward(params, obs):
 
 
 def recurrent_fn(params, rng_key, action, state):
-    """MCTS 递归函数（瓶颈在 forward 推理 ~85%+，env.step 占比极小）
+    """MCTS 递归函数。
     
     黑方时 obs 已翻转，网络输出为黑方坐标系；旋转到绝对坐标系供 MCTS 使用。
+    搜索树内部使用 `env.step_search` 的 basic legal mask；根节点和真实落子仍用精确规则。
     """
     prev_player = state.current_player
-    state = jax.vmap(env.step)(state, action)
+    state = jax.vmap(env.step_search)(state, action)
     obs = jax.vmap(env.observe)(state)
     logits, value, _ = forward(params, obs)
     # 黑方视角：logits 旋转到绝对坐标系，与 legal_action_mask（绝对）一致
@@ -901,7 +902,7 @@ def evaluate(params_red, params_black, initial_states, rng_key):
     
     def recurrent_fn_eval(params, rng_key, action, state):
         prev_player = state.current_player
-        state = jax.vmap(env.step)(state, action)
+        state = jax.vmap(env.step_search)(state, action)
         obs = jax.vmap(env.observe)(state)
         logits, value = eval_forward(params, obs)
         # 黑方视角：logits 旋转到绝对坐标系

@@ -6,6 +6,7 @@
 
 - **Gumbel AlphaZero**: Gumbel-Top-k MCTS，自对弈按温度退火采样；评估关闭 Gumbel 扰动以保证可比性
 - **纯 NNUE 稀疏网络**: 9 帧棋子-格子 sparse feature accumulator + 小型 policy/value MLP，优先提升自对弈推理吞吐
+- **搜索树快速后继**: MCTS 内部使用 basic legal mask 的 `step_search`，根节点和真实落子仍保留完整规则校验
 - **规则状态平面**: 将重复、无吃子、长将/长捉压力等规则信息作为额外观察通道输入网络
 - **经验回放**: 样本可复用，提高数据利用效率
 - **断点续训**: 基于 orbax-checkpoint + lz4 经验池快照的完整状态保存，支持无差别恢复
@@ -141,7 +142,7 @@ scp remote:checkpoints_nnue/replay_buffer.lz4 ./checkpoints_nnue/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `num_channels` | 128 | NNUE 基础宽度；accumulator 为 4x，hidden 为 2x |
+| `num_channels` | 128 | NNUE accumulator/hidden 宽度；CPU 上可先试 64/128 |
 | `num_blocks` | 0 | 兼容参数；NNUE 当前不使用 |
 | `network_dtype` | `float32` | 训练网络 dtype；可用 `--network-dtype bfloat16` 覆盖 |
 | `num_simulations` | 40 | MCTS 模拟次数 |
