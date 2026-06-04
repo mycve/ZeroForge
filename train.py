@@ -86,7 +86,7 @@ class Config:
     num_channels: int = 128   # caae0ef 强度基线；盲目加宽会降低每轮搜索/训练质量
     num_blocks: int = 10       # 8 层是当前速度/强度折中；10 层更稳，6 层适合快实验
     # RTX 50 系上 BF16 通常具备接近 FP16 的速度，同时比 FP16 更稳
-    network_dtype: str = "float32"
+    network_dtype: str = "bfloat16"
     
     # 训练超参数
     learning_rate: float = 2e-4       # AdamW peak LR
@@ -105,8 +105,6 @@ class Config:
     selfplay_temperature_steps: int = 20
     selfplay_temperature: float = 1.0      # 自对弈起始温度
     selfplay_temperature_final: float = 0.15
-    policy_smoothing_plies: int = 6        # 前 N 个半步做策略目标平滑
-    policy_smoothing_value: float = 0.5    # 平滑强度：混入合法动作均匀分布
 
     # 经验回放配置（纯均匀采样，AlphaZero 标准）
     replay_buffer_size: int = 500_000
@@ -160,8 +158,6 @@ def parse_args():
     parser.add_argument("--selfplay-temperature", type=float, default=None, help="覆盖 selfplay_temperature")
     parser.add_argument("--selfplay-temperature-steps", type=int, default=None, help="覆盖 selfplay_temperature_steps")
     parser.add_argument("--selfplay-temperature-final", type=float, default=None, help="覆盖 selfplay_temperature_final")
-    parser.add_argument("--policy-smoothing-plies", type=int, default=None, help="覆盖前 N 个半步的策略目标平滑范围")
-    parser.add_argument("--policy-smoothing-value", type=float, default=None, help="覆盖策略目标平滑强度")
     parser.add_argument("--selfplay-gumbel-scale", type=float, default=None, help="覆盖 selfplay_gumbel_scale")
     parser.add_argument("--eval-gumbel-scale", type=float, default=None, help="覆盖 eval_gumbel_scale")
     parser.add_argument("--mirror-augmentation-prob", type=float, default=None, help="覆盖 mirror_augmentation_prob")
@@ -185,8 +181,6 @@ def apply_cli_overrides(args):
         "selfplay_temperature": args.selfplay_temperature,
         "selfplay_temperature_steps": args.selfplay_temperature_steps,
         "selfplay_temperature_final": args.selfplay_temperature_final,
-        "policy_smoothing_plies": args.policy_smoothing_plies,
-        "policy_smoothing_value": args.policy_smoothing_value,
         "selfplay_gumbel_scale": args.selfplay_gumbel_scale,
         "eval_gumbel_scale": args.eval_gumbel_scale,
         "mirror_augmentation_prob": args.mirror_augmentation_prob,
@@ -253,15 +247,6 @@ if config.selfplay_temperature <= 0 or config.selfplay_temperature_final <= 0:
 if config.selfplay_temperature_steps < 0:
     raise ValueError(
         f"selfplay_temperature_steps 必须 >= 0，当前值: {config.selfplay_temperature_steps}"
-    )
-if config.policy_smoothing_plies < 0:
-    raise ValueError(
-        f"policy_smoothing_plies 必须 >= 0，当前值: {config.policy_smoothing_plies}"
-    )
-if not 0.0 <= config.policy_smoothing_value <= 1.0:
-    raise ValueError(
-        "policy_smoothing_value 必须在 [0, 1] 内，"
-        f"当前值: {config.policy_smoothing_value}"
     )
 if not 0.0 <= config.mirror_augmentation_prob <= 1.0:
     raise ValueError(
@@ -495,18 +480,6 @@ def selfplay(params, rng_key, batch_size):
             state.legal_action_mask[:, _ROTATED_IDX],
         )
         policy_prob = _masked_normalize(normalized_action_weights, normalized_legal_mask)
-        legal_uniform = _masked_normalize(
-            normalized_legal_mask.astype(jnp.float32),
-            normalized_legal_mask,
-        )
-        smoothing = jnp.where(
-            state.step_count[:, None] < config.policy_smoothing_plies,
-            config.policy_smoothing_value,
-            0.0,
-        ).astype(jnp.float32)
-        policy_prob = (
-            (1.0 - smoothing) * policy_prob + smoothing * legal_uniform
-        ).astype(jnp.float32)
         
         # 根节点 visit 分布熵：-sum(p*log(p))，高熵=探索充分，低熵=决策集中
         p = _masked_normalize(action_weights, state.legal_action_mask)
@@ -539,7 +512,7 @@ def selfplay(params, rng_key, batch_size):
 def compute_targets(data: SelfplayOutput):
     """计算训练目标（与 mctx / Gumbel MuZero 推荐一致）。
 
-    - policy_target：MCTS 的完整 action_weights（策略蒸馏），前若干 ply 混入合法均匀分布做平滑。
+    - policy_target：MCTS 的完整 action_weights（策略蒸馏）。
     - value_tgt：对 **MCTS 根标量 root_value** 做 TD(λ) 备份；损失为 MSE(value, value_tgt)，
       value 由 ValueHead 的 value_logits 经 softmax 得 W−L。
     """
@@ -1767,7 +1740,6 @@ def main():
         f"_td{config.td_lambda}_vw{config.value_loss_weight}"
         f"_sp{config.selfplay_batch_size}"
         f"_t{config.selfplay_temperature:.2f}-{config.selfplay_temperature_final:.2f}"
-        f"_ps{config.policy_smoothing_plies}-{config.policy_smoothing_value:.2f}"
     )
     run_log_dir = os.path.join(config.log_dir, run_name)
     logger.info("[Log] TensorBoard 日志: %s", run_log_dir)
@@ -1845,15 +1817,13 @@ def main():
                 writer.add_scalar("eval/decisive_win_rate", eval_metrics["decisive_win_rate"], iteration)
     
     logger.info(
-        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold), policy_smoothing=%s ply @ %.2f",
+        "[Selfplay] batch_size=%s, gumbel_scale=%s, reuse=%s, temp_decay_steps=%s, temp=%.2f->%.2f(hold)",
         config.selfplay_batch_size,
         config.selfplay_gumbel_scale,
         config.sample_reuse_times,
         config.selfplay_temperature_steps,
         config.selfplay_temperature,
         config.selfplay_temperature_final,
-        config.policy_smoothing_plies,
-        config.policy_smoothing_value,
     )
 
     while True:
